@@ -27,10 +27,10 @@ use datafusion_expr::TypeSignature::*;
 use datafusion_expr::{ColumnarValue, Volatility};
 use datafusion_expr::{ScalarUDFImpl, Signature};
 
-use crate::string::common::*;
+use crate::utils::{make_scalar_function, utf8_to_str_type};
 
 #[derive(Debug)]
-pub(super) struct ReplaceFunc {
+pub struct ReplaceFunc {
     signature: Signature,
 }
 

@@ -33,8 +33,6 @@ pub mod sort_properties;
 pub mod string_expressions;
 pub mod tree_node;
 pub mod udf;
-#[cfg(feature = "unicode_expressions")]
-pub mod unicode_expressions;
 pub mod utils;
 pub mod window;
 
@@ -60,3 +58,5 @@ pub use sort_expr::{
     PhysicalSortRequirement,
 };
 pub use utils::{reverse_order_bys, split_conjunction};
+
+pub use aggregate::first_last::create_first_value_accumulator;

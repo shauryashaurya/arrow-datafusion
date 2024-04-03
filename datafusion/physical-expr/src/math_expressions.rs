@@ -155,11 +155,8 @@ macro_rules! make_function_scalar_inputs_return_type {
     }};
 }
 
-math_unary_function!("sqrt", sqrt);
 math_unary_function!("cbrt", cbrt);
-math_unary_function!("sin", sin);
 math_unary_function!("cos", cos);
-math_unary_function!("sinh", sinh);
 math_unary_function!("cosh", cosh);
 math_unary_function!("asin", asin);
 math_unary_function!("acos", acos);
@@ -169,13 +166,11 @@ math_unary_function!("acosh", acosh);
 math_unary_function!("atanh", atanh);
 math_unary_function!("floor", floor);
 math_unary_function!("ceil", ceil);
-math_unary_function!("signum", signum);
 math_unary_function!("exp", exp);
 math_unary_function!("ln", ln);
 math_unary_function!("log2", log2);
 math_unary_function!("log10", log10);
 math_unary_function!("degrees", to_degrees);
-math_unary_function!("radians", to_radians);
 
 /// Factorial SQL function
 pub fn factorial(args: &[ArrayRef]) -> Result<ArrayRef> {
@@ -492,31 +487,6 @@ pub fn power(args: &[ArrayRef]) -> Result<ArrayRef> {
     }
 }
 
-/// Atan2 SQL function
-pub fn atan2(args: &[ArrayRef]) -> Result<ArrayRef> {
-    match args[0].data_type() {
-        DataType::Float64 => Ok(Arc::new(make_function_inputs2!(
-            &args[0],
-            &args[1],
-            "y",
-            "x",
-            Float64Array,
-            { f64::atan2 }
-        )) as ArrayRef),
-
-        DataType::Float32 => Ok(Arc::new(make_function_inputs2!(
-            &args[0],
-            &args[1],
-            "y",
-            "x",
-            Float32Array,
-            { f32::atan2 }
-        )) as ArrayRef),
-
-        other => exec_err!("Unsupported data type {other:?} for function atan2"),
-    }
-}
-
 /// Log SQL function
 pub fn log(args: &[ArrayRef]) -> Result<ArrayRef> {
     // Support overloaded log(base, x) and log(x) which defaults to log(10, x)
@@ -723,42 +693,6 @@ mod tests {
         assert_eq!(floats.value(1), 4);
         assert_eq!(floats.value(2), 81);
         assert_eq!(floats.value(3), 625);
-    }
-
-    #[test]
-    fn test_atan2_f64() {
-        let args: Vec<ArrayRef> = vec![
-            Arc::new(Float64Array::from(vec![2.0, -3.0, 4.0, -5.0])), // y
-            Arc::new(Float64Array::from(vec![1.0, 2.0, -3.0, -4.0])), // x
-        ];
-
-        let result = atan2(&args).expect("failed to initialize function atan2");
-        let floats =
-            as_float64_array(&result).expect("failed to initialize function atan2");
-
-        assert_eq!(floats.len(), 4);
-        assert_eq!(floats.value(0), (2.0_f64).atan2(1.0));
-        assert_eq!(floats.value(1), (-3.0_f64).atan2(2.0));
-        assert_eq!(floats.value(2), (4.0_f64).atan2(-3.0));
-        assert_eq!(floats.value(3), (-5.0_f64).atan2(-4.0));
-    }
-
-    #[test]
-    fn test_atan2_f32() {
-        let args: Vec<ArrayRef> = vec![
-            Arc::new(Float32Array::from(vec![2.0, -3.0, 4.0, -5.0])), // y
-            Arc::new(Float32Array::from(vec![1.0, 2.0, -3.0, -4.0])), // x
-        ];
-
-        let result = atan2(&args).expect("failed to initialize function atan2");
-        let floats =
-            as_float32_array(&result).expect("failed to initialize function atan2");
-
-        assert_eq!(floats.len(), 4);
-        assert_eq!(floats.value(0), (2.0_f32).atan2(1.0));
-        assert_eq!(floats.value(1), (-3.0_f32).atan2(2.0));
-        assert_eq!(floats.value(2), (4.0_f32).atan2(-3.0));
-        assert_eq!(floats.value(3), (-5.0_f32).atan2(-4.0));
     }
 
     #[test]

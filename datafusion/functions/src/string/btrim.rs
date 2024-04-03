@@ -26,6 +26,7 @@ use datafusion_expr::{ColumnarValue, Volatility};
 use datafusion_expr::{ScalarUDFImpl, Signature};
 
 use crate::string::common::*;
+use crate::utils::{make_scalar_function, utf8_to_str_type};
 
 /// Returns the longest string with leading and trailing characters removed. If the characters are not specified, whitespace is removed.
 /// btrim('xyxtrimyyx', 'xyz') = 'trim'
@@ -34,7 +35,7 @@ fn btrim<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 }
 
 #[derive(Debug)]
-pub(super) struct BTrimFunc {
+pub struct BTrimFunc {
     signature: Signature,
     aliases: Vec<String>,
 }

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::string::common::{handle, utf8_to_str_type};
+use crate::string::common::handle;
+use crate::utils::utf8_to_str_type;
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
 use datafusion_expr::ColumnarValue;
@@ -23,7 +24,7 @@ use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
 use std::any::Any;
 
 #[derive(Debug)]
-pub(super) struct UpperFunc {
+pub struct UpperFunc {
     signature: Signature,
 }
 
