@@ -311,13 +311,13 @@ impl TreeNode for LogicalPlan {
             }
             LogicalPlan::Unnest(Unnest {
                 input,
-                column,
+                columns,
                 schema,
                 options,
             }) => rewrite_arc(input, f)?.update_data(|input| {
                 LogicalPlan::Unnest(Unnest {
                     input,
-                    column,
+                    columns,
                     schema,
                     options,
                 })
@@ -363,7 +363,7 @@ impl TreeNode for LogicalPlan {
 
 /// Converts a `Arc<LogicalPlan>` without copying, if possible. Copies the plan
 /// if there is a shared reference
-fn unwrap_arc(plan: Arc<LogicalPlan>) -> LogicalPlan {
+pub fn unwrap_arc(plan: Arc<LogicalPlan>) -> LogicalPlan {
     Arc::try_unwrap(plan)
         // if None is returned, there is another reference to this
         // LogicalPlan, so we can not own it, and must clone instead
@@ -431,23 +431,6 @@ macro_rules! handle_transform_recursion {
     }};
 }
 
-macro_rules! handle_transform_recursion_down {
-    ($F_DOWN:expr, $F_CHILD:expr) => {{
-        $F_DOWN?
-            .transform_children(|n| n.map_subqueries($F_CHILD))?
-            .transform_sibling(|n| n.map_children($F_CHILD))
-    }};
-}
-
-macro_rules! handle_transform_recursion_up {
-    ($SELF:expr, $F_CHILD:expr, $F_UP:expr) => {{
-        $SELF
-            .map_subqueries($F_CHILD)?
-            .transform_sibling(|n| n.map_children($F_CHILD))?
-            .transform_parent(|n| $F_UP(n))
-    }};
-}
-
 impl LogicalPlan {
     /// Calls `f` on all expressions in the current `LogicalPlan` node.
     ///
@@ -507,8 +490,12 @@ impl LogicalPlan {
             LogicalPlan::TableScan(TableScan { filters, .. }) => {
                 filters.iter().apply_until_stop(f)
             }
-            LogicalPlan::Unnest(Unnest { column, .. }) => {
-                f(&Expr::Column(column.clone()))
+            LogicalPlan::Unnest(Unnest { columns, .. }) => {
+                let exprs = columns
+                    .iter()
+                    .map(|c| Expr::Column(c.clone()))
+                    .collect::<Vec<_>>();
+                exprs.iter().apply_until_stop(f)
             }
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
                 on_expr,
@@ -706,20 +693,6 @@ impl LogicalPlan {
                         fetch,
                     })
                 }),
-            LogicalPlan::Unnest(Unnest {
-                input,
-                column,
-                schema,
-                options,
-            }) => f(Expr::Column(column))?.map_data(|column| match column {
-                Expr::Column(column) => Ok(LogicalPlan::Unnest(Unnest {
-                    input,
-                    column,
-                    schema,
-                    options,
-                })),
-                _ => internal_err!("Transformation should return Column"),
-            })?,
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
                 on_expr,
                 select_expr,
@@ -744,6 +717,7 @@ impl LogicalPlan {
             }),
             // plans without expressions
             LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Unnest(_)
             | LogicalPlan::RecursiveQuery(_)
             | LogicalPlan::Subquery(_)
             | LogicalPlan::SubqueryAlias(_)
@@ -796,19 +770,32 @@ impl LogicalPlan {
     /// ...)`.
     pub fn apply_with_subqueries<F: FnMut(&Self) -> Result<TreeNodeRecursion>>(
         &self,
-        f: &mut F,
+        mut f: F,
     ) -> Result<TreeNodeRecursion> {
-        f(self)?
-            .visit_children(|| self.apply_subqueries(|c| c.apply_with_subqueries(f)))?
-            .visit_sibling(|| self.apply_children(|c| c.apply_with_subqueries(f)))
+        fn apply_with_subqueries_impl<
+            F: FnMut(&LogicalPlan) -> Result<TreeNodeRecursion>,
+        >(
+            node: &LogicalPlan,
+            f: &mut F,
+        ) -> Result<TreeNodeRecursion> {
+            f(node)?
+                .visit_children(|| {
+                    node.apply_subqueries(|c| apply_with_subqueries_impl(c, f))
+                })?
+                .visit_sibling(|| {
+                    node.apply_children(|c| apply_with_subqueries_impl(c, f))
+                })
+        }
+
+        apply_with_subqueries_impl(self, &mut f)
     }
 
     /// Similarly to [`Self::transform`], rewrites this node and its inputs using `f`,
     /// including subqueries that may appear in expressions such as `IN (SELECT
     /// ...)`.
-    pub fn transform_with_subqueries<F: Fn(Self) -> Result<Transformed<Self>>>(
+    pub fn transform_with_subqueries<F: FnMut(Self) -> Result<Transformed<Self>>>(
         self,
-        f: &F,
+        f: F,
     ) -> Result<Transformed<Self>> {
         self.transform_up_with_subqueries(f)
     }
@@ -816,43 +803,49 @@ impl LogicalPlan {
     /// Similarly to [`Self::transform_down`], rewrites this node and its inputs using `f`,
     /// including subqueries that may appear in expressions such as `IN (SELECT
     /// ...)`.
-    pub fn transform_down_with_subqueries<F: Fn(Self) -> Result<Transformed<Self>>>(
+    pub fn transform_down_with_subqueries<F: FnMut(Self) -> Result<Transformed<Self>>>(
         self,
-        f: &F,
+        mut f: F,
     ) -> Result<Transformed<Self>> {
-        handle_transform_recursion_down!(f(self), |c| c.transform_down_with_subqueries(f))
-    }
+        fn transform_down_with_subqueries_impl<
+            F: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
+        >(
+            node: LogicalPlan,
+            f: &mut F,
+        ) -> Result<Transformed<LogicalPlan>> {
+            f(node)?
+                .transform_children(|n| {
+                    n.map_subqueries(|c| transform_down_with_subqueries_impl(c, f))
+                })?
+                .transform_sibling(|n| {
+                    n.map_children(|c| transform_down_with_subqueries_impl(c, f))
+                })
+        }
 
-    /// Similarly to [`Self::transform_down_mut`], rewrites this node and its inputs using `f`,
-    /// including subqueries that may appear in expressions such as `IN (SELECT
-    /// ...)`.
-    pub fn transform_down_mut_with_subqueries<
-        F: FnMut(Self) -> Result<Transformed<Self>>,
-    >(
-        self,
-        f: &mut F,
-    ) -> Result<Transformed<Self>> {
-        handle_transform_recursion_down!(f(self), |c| c
-            .transform_down_mut_with_subqueries(f))
+        transform_down_with_subqueries_impl(self, &mut f)
     }
 
     /// Similarly to [`Self::transform_up`], rewrites this node and its inputs using `f`,
     /// including subqueries that may appear in expressions such as `IN (SELECT
     /// ...)`.
-    pub fn transform_up_with_subqueries<F: Fn(Self) -> Result<Transformed<Self>>>(
+    pub fn transform_up_with_subqueries<F: FnMut(Self) -> Result<Transformed<Self>>>(
         self,
-        f: &F,
+        mut f: F,
     ) -> Result<Transformed<Self>> {
-        handle_transform_recursion_up!(self, |c| c.transform_up_with_subqueries(f), f)
-    }
+        fn transform_up_with_subqueries_impl<
+            F: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
+        >(
+            node: LogicalPlan,
+            f: &mut F,
+        ) -> Result<Transformed<LogicalPlan>> {
+            node.map_subqueries(|c| transform_up_with_subqueries_impl(c, f))?
+                .transform_sibling(|n| {
+                    n.map_children(|c| transform_up_with_subqueries_impl(c, f))
+                })?
+                .transform_parent(f)
+        }
 
-    pub fn transform_up_mut_with_subqueries<
-        F: FnMut(Self) -> Result<Transformed<Self>>,
-    >(
-        self,
-        f: &mut F,
-    ) -> Result<Transformed<Self>> {
-        handle_transform_recursion_up!(self, |c| c.transform_up_mut_with_subqueries(f), f)
+        transform_up_with_subqueries_impl(self, &mut f)
     }
 
     /// Similarly to [`Self::transform_down`], rewrites this node and its inputs using `f`,
@@ -863,14 +856,25 @@ impl LogicalPlan {
         FU: FnMut(Self) -> Result<Transformed<Self>>,
     >(
         self,
-        f_down: &mut FD,
-        f_up: &mut FU,
+        mut f_down: FD,
+        mut f_up: FU,
     ) -> Result<Transformed<Self>> {
-        handle_transform_recursion!(
-            f_down(self),
-            |c| c.transform_down_up_with_subqueries(f_down, f_up),
-            f_up
-        )
+        fn transform_down_up_with_subqueries_impl<
+            FD: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
+            FU: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
+        >(
+            node: LogicalPlan,
+            f_down: &mut FD,
+            f_up: &mut FU,
+        ) -> Result<Transformed<LogicalPlan>> {
+            handle_transform_recursion!(
+                f_down(node),
+                |c| transform_down_up_with_subqueries_impl(c, f_down, f_up),
+                f_up
+            )
+        }
+
+        transform_down_up_with_subqueries_impl(self, &mut f_down, &mut f_up)
     }
 
     /// Similarly to [`Self::apply`], calls `f` on  this node and its inputs
@@ -881,7 +885,7 @@ impl LogicalPlan {
         mut f: F,
     ) -> Result<TreeNodeRecursion> {
         self.apply_expressions(|expr| {
-            expr.apply(&mut |expr| match expr {
+            expr.apply(|expr| match expr {
                 Expr::Exists(Exists { subquery, .. })
                 | Expr::InSubquery(InSubquery { subquery, .. })
                 | Expr::ScalarSubquery(subquery) => {
@@ -904,7 +908,7 @@ impl LogicalPlan {
         mut f: F,
     ) -> Result<Transformed<Self>> {
         self.map_expressions(|expr| {
-            expr.transform_down_mut(&mut |expr| match expr {
+            expr.transform_down(|expr| match expr {
                 Expr::Exists(Exists { subquery, negated }) => {
                     f(LogicalPlan::Subquery(subquery))?.map_data(|s| match s {
                         LogicalPlan::Subquery(subquery) => {

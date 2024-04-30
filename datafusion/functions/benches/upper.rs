@@ -15,31 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+extern crate criterion;
+
 use arrow::util::bench_util::create_string_array_with_len;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use datafusion_common::ScalarValue;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr::string_expressions::concat;
+use datafusion_functions::string;
 use std::sync::Arc;
 
+/// Create an array of args containing a StringArray, where all the values in the
+/// StringArray are ASCII.
+/// * `size` - the length of the StringArray, and
+/// * `str_len` - the length of the strings within the StringArray.
 fn create_args(size: usize, str_len: usize) -> Vec<ColumnarValue> {
     let array = Arc::new(create_string_array_with_len::<i32>(size, 0.2, str_len));
-    let scalar = ScalarValue::Utf8(Some(", ".to_string()));
-    vec![
-        ColumnarValue::Array(array.clone()),
-        ColumnarValue::Scalar(scalar),
-        ColumnarValue::Array(array),
-    ]
+    vec![ColumnarValue::Array(array)]
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let upper = string::upper();
     for size in [1024, 4096, 8192] {
         let args = create_args(size, 32);
-        let mut group = c.benchmark_group("concat function");
-        group.bench_function(BenchmarkId::new("concat", size), |b| {
-            b.iter(|| criterion::black_box(concat(&args).unwrap()))
+        c.bench_function("upper_all_values_are_ascii", |b| {
+            b.iter(|| black_box(upper.invoke(&args)))
         });
-        group.finish();
     }
 }
 

@@ -17,16 +17,16 @@
 
 //! [`OptimizeProjections`] identifies and eliminates unused columns
 
+mod required_indices;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
-use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    get_required_group_by_exprs_indices, internal_err, Column, DFSchema, DFSchemaRef,
-    JoinType, Result,
+    get_required_group_by_exprs_indices, internal_err, Column, JoinType, Result,
 };
 use datafusion_expr::expr::{Alias, ScalarFunction};
 use datafusion_expr::{
@@ -34,9 +34,10 @@ use datafusion_expr::{
     Expr, Projection, TableScan, Window,
 };
 
+use crate::optimize_projections::required_indices::RequiredIndicies;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use hashbrown::HashMap;
-use itertools::{izip, Itertools};
+use itertools::izip;
 
 /// Optimizer rule to prune unnecessary columns from intermediate schemas
 /// inside the [`LogicalPlan`]. This rule:
@@ -70,8 +71,8 @@ impl OptimizerRule for OptimizeProjections {
         config: &dyn OptimizerConfig,
     ) -> Result<Option<LogicalPlan>> {
         // All output fields are necessary:
-        let indices = (0..plan.schema().fields().len()).collect::<Vec<_>>();
-        optimize_projections(plan, config, &indices)
+        let indices = RequiredIndicies::new_for_all_exprs(plan);
+        optimize_projections(plan, config, indices)
     }
 
     fn name(&self) -> &str {
@@ -105,13 +106,9 @@ impl OptimizerRule for OptimizeProjections {
 fn optimize_projections(
     plan: &LogicalPlan,
     config: &dyn OptimizerConfig,
-    indices: &[usize],
+    indices: RequiredIndicies,
 ) -> Result<Option<LogicalPlan>> {
-    // `child_required_indices` stores
-    // - indices of the columns required for each child
-    // - a flag indicating whether putting a projection above children is beneficial for the parent.
-    // As an example LogicalPlan::Filter benefits from small tables. Hence for filter child this flag would be `true`.
-    let child_required_indices: Vec<(Vec<usize>, bool)> = match plan {
+    let child_required_indices: Vec<RequiredIndicies> = match plan {
         LogicalPlan::Sort(_)
         | LogicalPlan::Filter(_)
         | LogicalPlan::Repartition(_)
@@ -123,12 +120,13 @@ fn optimize_projections(
             // that appear in this plan's expressions to its child. All these
             // operators benefit from "small" inputs, so the projection_beneficial
             // flag is `true`.
-            let exprs = plan.expressions();
             plan.inputs()
                 .into_iter()
                 .map(|input| {
-                    get_all_required_indices(indices, input, exprs.iter())
-                        .map(|idxs| (idxs, true))
+                    indices
+                        .clone()
+                        .with_projection_beneficial()
+                        .with_plan_exprs(plan, input.schema())
                 })
                 .collect::<Result<_>>()?
         }
@@ -137,13 +135,9 @@ fn optimize_projections(
             // that appear in this plan's expressions to its child. These operators
             // do not benefit from "small" inputs, so the projection_beneficial
             // flag is `false`.
-            let exprs = plan.expressions();
             plan.inputs()
                 .into_iter()
-                .map(|input| {
-                    get_all_required_indices(indices, input, exprs.iter())
-                        .map(|idxs| (idxs, false))
-                })
+                .map(|input| indices.clone().with_plan_exprs(plan, input.schema()))
                 .collect::<Result<_>>()?
         }
         LogicalPlan::Copy(_)
@@ -159,16 +153,14 @@ fn optimize_projections(
             // TODO: For some subquery variants (e.g. a subquery arising from an
             //       EXISTS expression), we may not need to require all indices.
             plan.inputs()
-                .iter()
-                .map(|input| ((0..input.schema().fields().len()).collect_vec(), false))
-                .collect::<Vec<_>>()
+                .into_iter()
+                .map(RequiredIndicies::new_for_all_exprs)
+                .collect()
         }
         LogicalPlan::Extension(extension) => {
-            let necessary_children_indices = if let Some(necessary_children_indices) =
-                extension.node.necessary_children_exprs(indices)
-            {
-                necessary_children_indices
-            } else {
+            let Some(necessary_children_indices) =
+                extension.node.necessary_children_exprs(indices.indices())
+            else {
                 // Requirements from parent cannot be routed down to user defined logical plan safely
                 return Ok(None);
             };
@@ -178,16 +170,12 @@ fn optimize_projections(
                 Make sure `.necessary_children_exprs` implementation of the `UserDefinedLogicalNode` is \
                 consistent with actual children length for the node.");
             }
-            // Expressions used by node.
-            let exprs = plan.expressions();
             children
                 .into_iter()
                 .zip(necessary_children_indices)
                 .map(|(child, necessary_indices)| {
-                    let child_schema = child.schema();
-                    let child_req_indices =
-                        indices_referred_by_exprs(child_schema, exprs.iter())?;
-                    Ok((merge_slices(&necessary_indices, &child_req_indices), false))
+                    RequiredIndicies::new_from_indices(necessary_indices)
+                        .with_plan_exprs(plan, child.schema())
                 })
                 .collect::<Result<Vec<_>>>()?
         }
@@ -213,13 +201,9 @@ fn optimize_projections(
         LogicalPlan::Aggregate(aggregate) => {
             // Split parent requirements to GROUP BY and aggregate sections:
             let n_group_exprs = aggregate.group_expr_len()?;
-            let (group_by_reqs, mut aggregate_reqs): (Vec<usize>, Vec<usize>) =
-                indices.iter().partition(|&&idx| idx < n_group_exprs);
             // Offset aggregate indices so that they point to valid indices at
             // `aggregate.aggr_expr`:
-            for idx in aggregate_reqs.iter_mut() {
-                *idx -= n_group_exprs;
-            }
+            let (group_by_reqs, aggregate_reqs) = indices.split_off(n_group_exprs);
 
             // Get absolutely necessary GROUP BY fields:
             let group_by_expr_existing = aggregate
@@ -235,16 +219,16 @@ fn optimize_projections(
                 // Some of the fields in the GROUP BY may be required by the
                 // parent even if these fields are unnecessary in terms of
                 // functional dependency.
-                let required_indices =
-                    merge_slices(&simplest_groupby_indices, &group_by_reqs);
-                get_at_indices(&aggregate.group_expr, &required_indices)
+                group_by_reqs
+                    .append(&simplest_groupby_indices)
+                    .get_at_indices(&aggregate.group_expr)
             } else {
                 aggregate.group_expr.clone()
             };
 
             // Only use the absolutely necessary aggregate expressions required
             // by the parent:
-            let mut new_aggr_expr = get_at_indices(&aggregate.aggr_expr, &aggregate_reqs);
+            let mut new_aggr_expr = aggregate_reqs.get_at_indices(&aggregate.aggr_expr);
 
             // Aggregations always need at least one aggregate expression.
             // With a nested count, we don't require any column as input, but
@@ -263,10 +247,12 @@ fn optimize_projections(
 
             let all_exprs_iter = new_group_bys.iter().chain(new_aggr_expr.iter());
             let schema = aggregate.input.schema();
-            let necessary_indices = indices_referred_by_exprs(schema, all_exprs_iter)?;
+            let necessary_indices =
+                RequiredIndicies::new().with_exprs(schema, all_exprs_iter)?;
+            let necessary_exprs = necessary_indices.get_required_exprs(schema);
 
             let aggregate_input = if let Some(input) =
-                optimize_projections(&aggregate.input, config, &necessary_indices)?
+                optimize_projections(&aggregate.input, config, necessary_indices)?
             {
                 input
             } else {
@@ -277,7 +263,6 @@ fn optimize_projections(
             // that its input only contains absolutely necessary columns for
             // the aggregate expressions. Note that necessary_indices refer to
             // fields in `aggregate.input.schema()`.
-            let necessary_exprs = get_required_exprs(schema, &necessary_indices);
             let (aggregate_input, _) =
                 add_projection_on_top_if_helpful(aggregate_input, necessary_exprs)?;
 
@@ -291,29 +276,24 @@ fn optimize_projections(
             .map(|aggregate| Some(LogicalPlan::Aggregate(aggregate)));
         }
         LogicalPlan::Window(window) => {
+            let input_schema = window.input.schema();
             // Split parent requirements to child and window expression sections:
-            let n_input_fields = window.input.schema().fields().len();
-            let (child_reqs, mut window_reqs): (Vec<usize>, Vec<usize>) =
-                indices.iter().partition(|&&idx| idx < n_input_fields);
+            let n_input_fields = input_schema.fields().len();
             // Offset window expression indices so that they point to valid
             // indices at `window.window_expr`:
-            for idx in window_reqs.iter_mut() {
-                *idx -= n_input_fields;
-            }
+            let (child_reqs, window_reqs) = indices.split_off(n_input_fields);
 
             // Only use window expressions that are absolutely necessary according
             // to parent requirements:
-            let new_window_expr = get_at_indices(&window.window_expr, &window_reqs);
+            let new_window_expr = window_reqs.get_at_indices(&window.window_expr);
 
             // Get all the required column indices at the input, either by the
             // parent or window expression requirements.
-            let required_indices = get_all_required_indices(
-                &child_reqs,
-                &window.input,
-                new_window_expr.iter(),
-            )?;
+            let required_indices =
+                child_reqs.with_exprs(input_schema, &new_window_expr)?;
+
             let window_child = if let Some(new_window_child) =
-                optimize_projections(&window.input, config, &required_indices)?
+                optimize_projections(&window.input, config, required_indices.clone())?
             {
                 new_window_child
             } else {
@@ -327,8 +307,7 @@ fn optimize_projections(
                 // Calculate required expressions at the input of the window.
                 // Please note that we use `old_child`, because `required_indices`
                 // refers to `old_child`.
-                let required_exprs =
-                    get_required_exprs(window.input.schema(), &required_indices);
+                let required_exprs = required_indices.get_required_exprs(input_schema);
                 let (window_child, _) =
                     add_projection_on_top_if_helpful(window_child, required_exprs)?;
                 Window::try_new(new_window_expr, Arc::new(window_child))
@@ -339,31 +318,35 @@ fn optimize_projections(
             let left_len = join.left.schema().fields().len();
             let (left_req_indices, right_req_indices) =
                 split_join_requirements(left_len, indices, &join.join_type);
-            let exprs = plan.expressions();
             let left_indices =
-                get_all_required_indices(&left_req_indices, &join.left, exprs.iter())?;
+                left_req_indices.with_plan_exprs(plan, join.left.schema())?;
             let right_indices =
-                get_all_required_indices(&right_req_indices, &join.right, exprs.iter())?;
+                right_req_indices.with_plan_exprs(plan, join.right.schema())?;
             // Joins benefit from "small" input tables (lower memory usage).
             // Therefore, each child benefits from projection:
-            vec![(left_indices, true), (right_indices, true)]
+            vec![
+                left_indices.with_projection_beneficial(),
+                right_indices.with_projection_beneficial(),
+            ]
         }
         LogicalPlan::CrossJoin(cross_join) => {
             let left_len = cross_join.left.schema().fields().len();
-            let (left_child_indices, right_child_indices) =
+            let (left_indices, right_indices) =
                 split_join_requirements(left_len, indices, &JoinType::Inner);
             // Joins benefit from "small" input tables (lower memory usage).
             // Therefore, each child benefits from projection:
-            vec![(left_child_indices, true), (right_child_indices, true)]
+            vec![
+                left_indices.with_projection_beneficial(),
+                right_indices.with_projection_beneficial(),
+            ]
         }
         LogicalPlan::TableScan(table_scan) => {
-            let schema = table_scan.source.schema();
             // Get indices referred to in the original (schema with all fields)
             // given projected indices.
-            let projection = with_indices(&table_scan.projection, schema, |map| {
-                indices.iter().map(|&idx| map[idx]).collect()
-            });
-
+            let projection = match &table_scan.projection {
+                Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
+                None => indices.into_inner(),
+            };
             return TableScan::try_new(
                 table_scan.table_name.clone(),
                 table_scan.source.clone(),
@@ -376,15 +359,16 @@ fn optimize_projections(
     };
 
     let new_inputs = izip!(child_required_indices, plan.inputs().into_iter())
-        .map(|((required_indices, projection_beneficial), child)| {
+        .map(|(required_indices, child)| {
+            let projection_beneficial = required_indices.projection_beneficial();
+            let project_exprs = required_indices.get_required_exprs(child.schema());
             let (input, is_changed) = if let Some(new_input) =
-                optimize_projections(child, config, &required_indices)?
+                optimize_projections(child, config, required_indices)?
             {
                 (new_input, true)
             } else {
                 (child.clone(), false)
             };
-            let project_exprs = get_required_exprs(child.schema(), &required_indices);
             let (input, proj_added) = if projection_beneficial {
                 add_projection_on_top_if_helpful(input, project_exprs)?
             } else {
@@ -405,26 +389,6 @@ fn optimize_projections(
             .collect();
         let exprs = plan.expressions();
         plan.with_new_exprs(exprs, new_inputs).map(Some)
-    }
-}
-
-/// This function applies the given function `f` to the projection indices
-/// `proj_indices` if they exist. Otherwise, applies `f` to a default set
-/// of indices according to `schema`.
-fn with_indices<F>(
-    proj_indices: &Option<Vec<usize>>,
-    schema: SchemaRef,
-    mut f: F,
-) -> Vec<usize>
-where
-    F: FnMut(&[usize]) -> Vec<usize>,
-{
-    match proj_indices {
-        Some(indices) => f(indices.as_slice()),
-        None => {
-            let range: Vec<usize> = (0..schema.fields.len()).collect();
-            f(range.as_slice())
-        }
     }
 }
 
@@ -463,7 +427,7 @@ fn merge_consecutive_projections(proj: &Projection) -> Result<Option<Projection>
 
     // If an expression is non-trivial and appears more than once, consecutive
     // projections will benefit from a compute-once approach. For details, see:
-    // https://github.com/apache/arrow-datafusion/issues/8296
+    // https://github.com/apache/datafusion/issues/8296
     if column_referral_map.into_iter().any(|(col, usage)| {
         usage > 1
             && !is_expr_trivial(
@@ -613,7 +577,7 @@ fn rewrite_expr(expr: &Expr, input: &Projection) -> Result<Option<Expr>> {
 ///   columns are collected.
 fn outer_columns(expr: &Expr, columns: &mut HashSet<Column>) {
     // inspect_expr_pre doesn't handle subquery references, so find them explicitly
-    expr.apply(&mut |expr| {
+    expr.apply(|expr| {
         match expr {
             Expr::OuterReferenceColumn(_, col) => {
                 columns.insert(col.clone());
@@ -653,132 +617,6 @@ fn outer_columns_helper_multi<'a>(
     exprs.into_iter().for_each(|e| outer_columns(e, columns));
 }
 
-/// Generates the required expressions (columns) that reside at `indices` of
-/// the given `input_schema`.
-///
-/// # Arguments
-///
-/// * `input_schema` - A reference to the input schema.
-/// * `indices` - A slice of `usize` indices specifying required columns.
-///
-/// # Returns
-///
-/// A vector of `Expr::Column` expressions residing at `indices` of the `input_schema`.
-fn get_required_exprs(input_schema: &Arc<DFSchema>, indices: &[usize]) -> Vec<Expr> {
-    indices
-        .iter()
-        .map(|&idx| Expr::Column(Column::from(input_schema.qualified_field(idx))))
-        .collect()
-}
-
-/// Get indices of the fields referred to by any expression in `exprs` within
-/// the given schema (`input_schema`).
-///
-/// # Arguments
-///
-/// * `input_schema`: The input schema to analyze for index requirements.
-/// * `exprs`: An iterator of expressions for which we want to find necessary
-///   field indices.
-///
-/// # Returns
-///
-/// A [`Result`] object containing the indices of all required fields in
-/// `input_schema` to calculate all `exprs` successfully.
-fn indices_referred_by_exprs<'a>(
-    input_schema: &DFSchemaRef,
-    exprs: impl Iterator<Item = &'a Expr>,
-) -> Result<Vec<usize>> {
-    let indices = exprs
-        .map(|expr| indices_referred_by_expr(input_schema, expr))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(indices
-        .into_iter()
-        .flatten()
-        // Make sure no duplicate entries exist and indices are ordered:
-        .sorted()
-        .dedup()
-        .collect())
-}
-
-/// Get indices of the fields referred to by the given expression `expr` within
-/// the given schema (`input_schema`).
-///
-/// # Parameters
-///
-/// * `input_schema`: The input schema to analyze for index requirements.
-/// * `expr`: An expression for which we want to find necessary field indices.
-///
-/// # Returns
-///
-/// A [`Result`] object containing the indices of all required fields in
-/// `input_schema` to calculate `expr` successfully.
-fn indices_referred_by_expr(
-    input_schema: &DFSchemaRef,
-    expr: &Expr,
-) -> Result<Vec<usize>> {
-    let mut cols = expr.to_columns()?;
-    // Get outer-referenced (subquery) columns:
-    outer_columns(expr, &mut cols);
-    Ok(cols
-        .iter()
-        .flat_map(|col| input_schema.index_of_column(col))
-        .collect())
-}
-
-/// Gets all required indices for the input; i.e. those required by the parent
-/// and those referred to by `exprs`.
-///
-/// # Parameters
-///
-/// * `parent_required_indices` - A slice of indices required by the parent plan.
-/// * `input` - The input logical plan to analyze for index requirements.
-/// * `exprs` - An iterator of expressions used to determine required indices.
-///
-/// # Returns
-///
-/// A `Result` containing a vector of `usize` indices containing all the required
-/// indices.
-fn get_all_required_indices<'a>(
-    parent_required_indices: &[usize],
-    input: &LogicalPlan,
-    exprs: impl Iterator<Item = &'a Expr>,
-) -> Result<Vec<usize>> {
-    indices_referred_by_exprs(input.schema(), exprs)
-        .map(|indices| merge_slices(parent_required_indices, &indices))
-}
-
-/// Retrieves the expressions at specified indices within the given slice. Ignores
-/// any invalid indices.
-///
-/// # Parameters
-///
-/// * `exprs` - A slice of expressions to index into.
-/// * `indices` - A slice of indices specifying the positions of expressions sought.
-///
-/// # Returns
-///
-/// A vector of expressions corresponding to specified indices.
-fn get_at_indices(exprs: &[Expr], indices: &[usize]) -> Vec<Expr> {
-    indices
-        .iter()
-        // Indices may point to further places than `exprs` len.
-        .filter_map(|&idx| exprs.get(idx).cloned())
-        .collect()
-}
-
-/// Merges two slices into a single vector with sorted (ascending) and
-/// deduplicated elements. For example, merging `[3, 2, 4]` and `[3, 6, 1]`
-/// will produce `[1, 2, 3, 6]`.
-fn merge_slices<T: Clone + Ord>(left: &[T], right: &[T]) -> Vec<T> {
-    // Make sure to sort before deduping, which removes the duplicates:
-    left.iter()
-        .cloned()
-        .chain(right.iter().cloned())
-        .sorted()
-        .dedup()
-        .collect()
-}
-
 /// Splits requirement indices for a join into left and right children based on
 /// the join type.
 ///
@@ -810,26 +648,21 @@ fn merge_slices<T: Clone + Ord>(left: &[T], right: &[T]) -> Vec<T> {
 /// adjusted based on the join type.
 fn split_join_requirements(
     left_len: usize,
-    indices: &[usize],
+    indices: RequiredIndicies,
     join_type: &JoinType,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (RequiredIndicies, RequiredIndicies) {
     match join_type {
         // In these cases requirements are split between left/right children:
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-            let (left_reqs, mut right_reqs): (Vec<usize>, Vec<usize>) =
-                indices.iter().partition(|&&idx| idx < left_len);
             // Decrease right side indices by `left_len` so that they point to valid
             // positions within the right child:
-            for idx in right_reqs.iter_mut() {
-                *idx -= left_len;
-            }
-            (left_reqs, right_reqs)
+            indices.split_off(left_len)
         }
         // All requirements can be re-routed to left child directly.
-        JoinType::LeftAnti | JoinType::LeftSemi => (indices.to_vec(), vec![]),
+        JoinType::LeftAnti | JoinType::LeftSemi => (indices, RequiredIndicies::new()),
         // All requirements can be re-routed to right side directly.
         // No need to change index, join schema is right child schema.
-        JoinType::RightSemi | JoinType::RightAnti => (vec![], indices.to_vec()),
+        JoinType::RightSemi | JoinType::RightAnti => (RequiredIndicies::new(), indices),
     }
 }
 
@@ -885,13 +718,14 @@ fn add_projection_on_top_if_helpful(
 fn rewrite_projection_given_requirements(
     proj: &Projection,
     config: &dyn OptimizerConfig,
-    indices: &[usize],
+    indices: RequiredIndicies,
 ) -> Result<Option<LogicalPlan>> {
-    let exprs_used = get_at_indices(&proj.expr, indices);
+    let exprs_used = indices.get_at_indices(&proj.expr);
+
     let required_indices =
-        indices_referred_by_exprs(proj.input.schema(), exprs_used.iter())?;
+        RequiredIndicies::new().with_exprs(proj.input.schema(), exprs_used.iter())?;
     return if let Some(input) =
-        optimize_projections(&proj.input, config, &required_indices)?
+        optimize_projections(&proj.input, config, required_indices)?
     {
         if is_projection_unnecessary(&input, &exprs_used)? {
             Ok(Some(input))
@@ -925,20 +759,32 @@ fn is_projection_unnecessary(input: &LogicalPlan, proj_exprs: &[Expr]) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fmt::Formatter;
     use std::sync::Arc;
+    use std::vec;
 
     use crate::optimize_projections::OptimizeProjections;
+    use crate::optimizer::Optimizer;
     use crate::test::{
-        assert_optimized_plan_eq, test_table_scan, test_table_scan_with_name,
+        assert_fields_eq, assert_optimized_plan_eq, scan_empty, test_table_scan,
+        test_table_scan_fields, test_table_scan_with_name,
     };
+    use crate::{OptimizerContext, OptimizerRule};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{Column, DFSchemaRef, JoinType, Result, TableReference};
+    use datafusion_common::{
+        Column, DFSchema, DFSchemaRef, JoinType, Result, TableReference,
+    };
     use datafusion_expr::{
-        binary_expr, build_join_schema, col, count, lit,
-        logical_plan::builder::LogicalPlanBuilder, not, table_scan, try_cast, when,
-        BinaryExpr, Expr, Extension, Like, LogicalPlan, Operator,
-        UserDefinedLogicalNodeCore,
+        binary_expr, build_join_schema,
+        builder::table_scan_with_filters,
+        col, count,
+        expr::{self, Cast},
+        lit,
+        logical_plan::{builder::LogicalPlanBuilder, table_scan},
+        max, min, not, try_cast, when, AggregateFunction, BinaryExpr, Expr, Extension,
+        Like, LogicalPlan, Operator, Projection, UserDefinedLogicalNodeCore, WindowFrame,
+        WindowFunctionDefinition,
     };
 
     fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
@@ -1339,7 +1185,7 @@ mod tests {
     }
 
     // Test outer projection isn't discarded despite the same schema as inner
-    // https://github.com/apache/arrow-datafusion/issues/8942
+    // https://github.com/apache/datafusion/issues/8942
     #[test]
     fn test_derived_column() -> Result<()> {
         let table_scan = test_table_scan()?;
@@ -1465,5 +1311,618 @@ mod tests {
         \n    TableScan: l projection=[a, c]\
         \n    TableScan: r projection=[a]";
         assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_no_group_by() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[]], aggr=[[MAX(test.b)]]\
+        \n  TableScan: test projection=[b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_group_by() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("c")], vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[test.c]], aggr=[[MAX(test.b)]]\
+        \n  TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_group_by_with_table_alias() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .alias("a")?
+            .aggregate(vec![col("c")], vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[a.c]], aggr=[[MAX(a.b)]]\
+        \n  SubqueryAlias: a\
+        \n    TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_no_group_by_with_filter() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(col("c").gt(lit(1)))?
+            .aggregate(Vec::<Expr>::new(), vec![max(col("b"))])?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[]], aggr=[[MAX(test.b)]]\
+        \n  Projection: test.b\
+        \n    Filter: test.c > Int32(1)\
+        \n      TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_with_periods() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("tag.one", DataType::Utf8, false)]);
+
+        // Build a plan that looks as follows (note "tag.one" is a column named
+        // "tag.one", not a column named "one" in a table named "tag"):
+        //
+        // Projection: tag.one
+        //   Aggregate: groupBy=[], aggr=[MAX("tag.one") AS "tag.one"]
+        //    TableScan
+        let plan = table_scan(Some("m4"), &schema, None)?
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![max(col(Column::new_unqualified("tag.one"))).alias("tag.one")],
+            )?
+            .project([col(Column::new_unqualified("tag.one"))])?
+            .build()?;
+
+        let expected = "\
+        Aggregate: groupBy=[[]], aggr=[[MAX(m4.tag.one) AS tag.one]]\
+        \n  TableScan: m4 projection=[tag.one]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn redundant_project() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b"), col("c")])?
+            .project(vec![col("a"), col("c"), col("b")])?
+            .build()?;
+        let expected = "Projection: test.a, test.c, test.b\
+        \n  TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn reorder_scan() -> Result<()> {
+        let schema = Schema::new(test_table_scan_fields());
+
+        let plan = table_scan(Some("test"), &schema, Some(vec![1, 0, 2]))?.build()?;
+        let expected = "TableScan: test projection=[b, a, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn reorder_scan_projection() -> Result<()> {
+        let schema = Schema::new(test_table_scan_fields());
+
+        let plan = table_scan(Some("test"), &schema, Some(vec![1, 0, 2]))?
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let expected = "Projection: test.a, test.b\
+        \n  TableScan: test projection=[b, a]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn reorder_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("b"), col("a")])?
+            .build()?;
+        let expected = "Projection: test.c, test.b, test.a\
+        \n  TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn noncontinuous_redundant_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("b"), col("a")])?
+            .filter(col("c").gt(lit(1)))?
+            .project(vec![col("c"), col("a"), col("b")])?
+            .filter(col("b").gt(lit(1)))?
+            .filter(col("a").gt(lit(1)))?
+            .project(vec![col("a"), col("c"), col("b")])?
+            .build()?;
+        let expected = "Projection: test.a, test.c, test.b\
+        \n  Filter: test.a > Int32(1)\
+        \n    Filter: test.b > Int32(1)\
+        \n      Projection: test.c, test.a, test.b\
+        \n        Filter: test.c > Int32(1)\
+        \n          Projection: test.c, test.b, test.a\
+        \n            TableScan: test projection=[a, b, c]";
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn join_schema_trim_full_join_column_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let schema = Schema::new(vec![Field::new("c1", DataType::UInt32, false)]);
+        let table2_scan = scan_empty(Some("test2"), &schema, None)?.build()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .join(table2_scan, JoinType::Left, (vec!["a"], vec!["c1"]), None)?
+            .project(vec![col("a"), col("b"), col("c1")])?
+            .build()?;
+
+        // make sure projections are pushed down to both table scans
+        let expected = "Left Join: test.a = test2.c1\
+        \n  TableScan: test projection=[a, b]\
+        \n  TableScan: test2 projection=[c1]";
+
+        let optimized_plan = optimize(plan)?;
+        let formatted_plan = format!("{optimized_plan:?}");
+        assert_eq!(formatted_plan, expected);
+
+        // make sure schema for join node include both join columns
+        let optimized_join = optimized_plan;
+        assert_eq!(
+            **optimized_join.schema(),
+            DFSchema::new_with_metadata(
+                vec![
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("b", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test2".into()),
+                        Arc::new(Field::new("c1", DataType::UInt32, true))
+                    ),
+                ],
+                HashMap::new()
+            )?,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn join_schema_trim_partial_join_column_projection() -> Result<()> {
+        // test join column push down without explicit column projections
+
+        let table_scan = test_table_scan()?;
+
+        let schema = Schema::new(vec![Field::new("c1", DataType::UInt32, false)]);
+        let table2_scan = scan_empty(Some("test2"), &schema, None)?.build()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .join(table2_scan, JoinType::Left, (vec!["a"], vec!["c1"]), None)?
+            // projecting joined column `a` should push the right side column `c1` projection as
+            // well into test2 table even though `c1` is not referenced in projection.
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+
+        // make sure projections are pushed down to both table scans
+        let expected = "Projection: test.a, test.b\
+        \n  Left Join: test.a = test2.c1\
+        \n    TableScan: test projection=[a, b]\
+        \n    TableScan: test2 projection=[c1]";
+
+        let optimized_plan = optimize(plan)?;
+        let formatted_plan = format!("{optimized_plan:?}");
+        assert_eq!(formatted_plan, expected);
+
+        // make sure schema for join node include both join columns
+        let optimized_join = optimized_plan.inputs()[0];
+        assert_eq!(
+            **optimized_join.schema(),
+            DFSchema::new_with_metadata(
+                vec![
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("b", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test2".into()),
+                        Arc::new(Field::new("c1", DataType::UInt32, true))
+                    ),
+                ],
+                HashMap::new()
+            )?,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn join_schema_trim_using_join() -> Result<()> {
+        // shared join columns from using join should be pushed to both sides
+
+        let table_scan = test_table_scan()?;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+        let table2_scan = scan_empty(Some("test2"), &schema, None)?.build()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .join_using(table2_scan, JoinType::Left, vec!["a"])?
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+
+        // make sure projections are pushed down to table scan
+        let expected = "Projection: test.a, test.b\
+        \n  Left Join: Using test.a = test2.a\
+        \n    TableScan: test projection=[a, b]\
+        \n    TableScan: test2 projection=[a]";
+
+        let optimized_plan = optimize(plan)?;
+        let formatted_plan = format!("{optimized_plan:?}");
+        assert_eq!(formatted_plan, expected);
+
+        // make sure schema for join node include both join columns
+        let optimized_join = optimized_plan.inputs()[0];
+        assert_eq!(
+            **optimized_join.schema(),
+            DFSchema::new_with_metadata(
+                vec![
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test".into()),
+                        Arc::new(Field::new("b", DataType::UInt32, false))
+                    ),
+                    (
+                        Some("test2".into()),
+                        Arc::new(Field::new("a", DataType::UInt32, true))
+                    ),
+                ],
+                HashMap::new()
+            )?,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cast() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let projection = LogicalPlanBuilder::from(table_scan)
+            .project(vec![Expr::Cast(Cast::new(
+                Box::new(col("c")),
+                DataType::Float64,
+            ))])?
+            .build()?;
+
+        let expected = "Projection: CAST(test.c AS Float64)\
+        \n  TableScan: test projection=[c]";
+
+        assert_optimized_plan_equal(projection, expected)
+    }
+
+    #[test]
+    fn table_scan_projected_schema() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+        assert_fields_eq(&plan, vec!["a", "b"]);
+
+        let expected = "TableScan: test projection=[a, b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_scan_projected_schema_non_qualified_relation() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let input_schema = table_scan.schema();
+        assert_eq!(3, input_schema.fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // Build the LogicalPlan directly (don't use PlanBuilder), so
+        // that the Column references are unqualified (e.g. their
+        // relation is `None`). PlanBuilder resolves the expressions
+        let expr = vec![col("test.a"), col("test.b")];
+        let plan =
+            LogicalPlan::Projection(Projection::try_new(expr, Arc::new(table_scan))?);
+
+        assert_fields_eq(&plan, vec!["a", "b"]);
+
+        let expected = "TableScan: test projection=[a, b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_limit() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("a")])?
+            .limit(0, Some(5))?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["c", "a"]);
+
+        let expected = "Limit: skip=0, fetch=5\
+        \n  Projection: test.c, test.a\
+        \n    TableScan: test projection=[a, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_scan_without_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan).build()?;
+        // should expand projection to all columns without projection
+        let expected = "TableScan: test projection=[a, b, c]";
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_scan_with_literal_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![lit(1_i64), lit(2_i64)])?
+            .build()?;
+        let expected = "Projection: Int64(1), Int64(2)\
+                      \n  TableScan: test projection=[]";
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    /// tests that it removes unused columns in projections
+    #[test]
+    fn table_unused_column() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // we never use "b" in the first projection => remove it
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("c"), col("a"), col("b")])?
+            .filter(col("c").gt(lit(1)))?
+            .aggregate(vec![col("c")], vec![max(col("a"))])?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["c", "MAX(test.a)"]);
+
+        let plan = optimize(plan).expect("failed to optimize plan");
+        let expected = "\
+        Aggregate: groupBy=[[test.c]], aggr=[[MAX(test.a)]]\
+        \n  Filter: test.c > Int32(1)\
+        \n    Projection: test.c, test.a\
+        \n      TableScan: test projection=[a, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    /// tests that it removes un-needed projections
+    #[test]
+    fn table_unused_projection() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // there is no need for the first projection
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("b")])?
+            .project(vec![lit(1).alias("a")])?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["a"]);
+
+        let expected = "\
+        Projection: Int32(1) AS a\
+        \n  TableScan: test projection=[]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn table_full_filter_pushdown() -> Result<()> {
+        let schema = Schema::new(test_table_scan_fields());
+
+        let table_scan = table_scan_with_filters(
+            Some("test"),
+            &schema,
+            None,
+            vec![col("b").eq(lit(1))],
+        )?
+        .build()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // there is no need for the first projection
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("b")])?
+            .project(vec![lit(1).alias("a")])?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["a"]);
+
+        let expected = "\
+        Projection: Int32(1) AS a\
+        \n  TableScan: test projection=[], full_filters=[b = Int32(1)]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    /// tests that optimizing twice yields same plan
+    #[test]
+    fn test_double_optimization() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("b")])?
+            .project(vec![lit(1).alias("a")])?
+            .build()?;
+
+        let optimized_plan1 = optimize(plan).expect("failed to optimize plan");
+        let optimized_plan2 =
+            optimize(optimized_plan1.clone()).expect("failed to optimize plan");
+
+        let formatted_plan1 = format!("{optimized_plan1:?}");
+        let formatted_plan2 = format!("{optimized_plan2:?}");
+        assert_eq!(formatted_plan1, formatted_plan2);
+        Ok(())
+    }
+
+    /// tests that it removes an aggregate is never used downstream
+    #[test]
+    fn table_unused_aggregate() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        assert_eq!(3, table_scan.schema().fields().len());
+        assert_fields_eq(&table_scan, vec!["a", "b", "c"]);
+
+        // we never use "min(b)" => remove it
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("a"), col("c")], vec![max(col("b")), min(col("b"))])?
+            .filter(col("c").gt(lit(1)))?
+            .project(vec![col("c"), col("a"), col("MAX(test.b)")])?
+            .build()?;
+
+        assert_fields_eq(&plan, vec!["c", "a", "MAX(test.b)"]);
+
+        let expected = "Projection: test.c, test.a, MAX(test.b)\
+        \n  Filter: test.c > Int32(1)\
+        \n    Aggregate: groupBy=[[test.a, test.c]], aggr=[[MAX(test.b)]]\
+        \n      TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn aggregate_filter_pushdown() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let aggr_with_filter = Expr::AggregateFunction(expr::AggregateFunction::new(
+            AggregateFunction::Count,
+            vec![col("b")],
+            false,
+            Some(Box::new(col("c").gt(lit(42)))),
+            None,
+            None,
+        ));
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(
+                vec![col("a")],
+                vec![count(col("b")), aggr_with_filter.alias("count2")],
+            )?
+            .build()?;
+
+        let expected = "Aggregate: groupBy=[[test.a]], aggr=[[COUNT(test.b), COUNT(test.b) FILTER (WHERE test.c > Int32(42)) AS count2]]\
+        \n  TableScan: test projection=[a, b, c]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn pushdown_through_distinct() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b")])?
+            .distinct()?
+            .project(vec![col("a")])?
+            .build()?;
+
+        let expected = "Projection: test.a\
+        \n  Distinct:\
+        \n    TableScan: test projection=[a, b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    #[test]
+    fn test_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let max1 = Expr::WindowFunction(expr::WindowFunction::new(
+            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            vec![col("test.a")],
+            vec![col("test.b")],
+            vec![],
+            WindowFrame::new(None),
+            None,
+        ));
+
+        let max2 = Expr::WindowFunction(expr::WindowFunction::new(
+            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            vec![col("test.b")],
+            vec![],
+            vec![],
+            WindowFrame::new(None),
+            None,
+        ));
+        let col1 = col(max1.display_name()?);
+        let col2 = col(max2.display_name()?);
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![max1])?
+            .window(vec![max2])?
+            .project(vec![col1, col2])?
+            .build()?;
+
+        let expected = "Projection: MAX(test.a) PARTITION BY [test.b] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MAX(test.b) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n  WindowAggr: windowExpr=[[MAX(test.b) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        \n    Projection: test.b, MAX(test.a) PARTITION BY [test.b] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n      WindowAggr: windowExpr=[[MAX(test.a) PARTITION BY [test.b] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        \n        TableScan: test projection=[a, b]";
+
+        assert_optimized_plan_equal(plan, expected)
+    }
+
+    fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
+
+    fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
+        let optimizer = Optimizer::with_rules(vec![Arc::new(OptimizeProjections::new())]);
+        let optimized_plan =
+            optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
+        Ok(optimized_plan)
     }
 }

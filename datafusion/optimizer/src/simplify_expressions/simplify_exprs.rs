@@ -53,7 +53,7 @@ impl OptimizerRule for SimplifyExpressions {
         _plan: &LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Option<LogicalPlan>> {
-        internal_err!("Should have called SimplifyExpressions::try_optimize_owned")
+        internal_err!("Should have called SimplifyExpressions::rewrite")
     }
 
     fn name(&self) -> &str {
@@ -120,7 +120,7 @@ impl SimplifyExpressions {
         //
         // This is likely related to the fact that order of the columns must
         // match the order of the children. see
-        // https://github.com/apache/arrow-datafusion/pull/8780 for more details
+        // https://github.com/apache/datafusion/pull/8780 for more details
         let simplifier = if let LogicalPlan::Join(_) = plan {
             simplifier.with_canonicalize(false)
         } else {

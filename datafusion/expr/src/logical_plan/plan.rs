@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use super::dml::CopyTo;
 use super::DdlStatement;
-use crate::builder::change_redundant_column;
+use crate::builder::{change_redundant_column, unnest_with_options};
 use crate::expr::{Alias, Placeholder, Sort as SortExpr, WindowFunction};
 use crate::expr_rewriter::{create_col_from_scalar_expr, normalize_cols};
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
@@ -65,7 +65,7 @@ pub use datafusion_common::{JoinConstraint, JoinType};
 /// from leaves up to the root to produce the query result.
 ///
 /// # See also:
-/// * [`tree_node`]: visiting and rewriting API
+/// * [`tree_node`]: To inspect and rewrite `LogicalPlan` trees
 ///
 /// [`tree_node`]: crate::logical_plan::tree_node
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -358,7 +358,7 @@ impl LogicalPlan {
     pub fn using_columns(&self) -> Result<Vec<HashSet<Column>>, DataFusionError> {
         let mut using_columns: Vec<HashSet<Column>> = vec![];
 
-        self.apply_with_subqueries(&mut |plan| {
+        self.apply_with_subqueries(|plan| {
             if let LogicalPlan::Join(Join {
                 join_constraint: JoinConstraint::Using,
                 on,
@@ -554,7 +554,7 @@ impl LogicalPlan {
                 // AND lineitem.l_quantity < Decimal128(Some(2400),15,2)
 
                 let predicate = predicate
-                    .transform_down(&|expr| {
+                    .transform_down(|expr| {
                         match expr {
                             Expr::Exists { .. }
                             | Expr::ScalarSubquery(_)
@@ -807,51 +807,11 @@ impl LogicalPlan {
             }
             LogicalPlan::DescribeTable(_) => Ok(self.clone()),
             LogicalPlan::Unnest(Unnest {
-                column,
-                schema,
-                options,
-                ..
+                columns, options, ..
             }) => {
                 // Update schema with unnested column type.
-                let input = Arc::new(inputs.swap_remove(0));
-                let (nested_qualifier, nested_field) =
-                    input.schema().qualified_field_from_column(column)?;
-                let (unnested_qualifier, unnested_field) =
-                    schema.qualified_field_from_column(column)?;
-                let qualifiers_and_fields = input
-                    .schema()
-                    .iter()
-                    .map(|(qualifier, field)| {
-                        if qualifier.eq(&nested_qualifier)
-                            && field.as_ref() == nested_field
-                        {
-                            (
-                                unnested_qualifier.cloned(),
-                                Arc::new(unnested_field.clone()),
-                            )
-                        } else {
-                            (qualifier.cloned(), field.clone())
-                        }
-                    })
-                    .collect::<Vec<_>>();
-
-                let schema = Arc::new(
-                    DFSchema::new_with_metadata(
-                        qualifiers_and_fields,
-                        input.schema().metadata().clone(),
-                    )?
-                    // We can use the existing functional dependencies as is:
-                    .with_functional_dependencies(
-                        input.schema().functional_dependencies().clone(),
-                    )?,
-                );
-
-                Ok(LogicalPlan::Unnest(Unnest {
-                    input,
-                    column: column.clone(),
-                    schema,
-                    options: options.clone(),
-                }))
+                let input = inputs.swap_remove(0);
+                unnest_with_options(input, columns.clone(), options.clone())
             }
         }
     }
@@ -913,14 +873,19 @@ impl LogicalPlan {
         param_values: impl Into<ParamValues>,
     ) -> Result<LogicalPlan> {
         let param_values = param_values.into();
-        match self {
-            LogicalPlan::Prepare(prepare_lp) => {
-                param_values.verify(&prepare_lp.data_types)?;
-                let input_plan = prepare_lp.input;
-                input_plan.replace_params_with_values(&param_values)
+        let plan_with_values = self.replace_params_with_values(&param_values)?;
+
+        // unwrap Prepare
+        Ok(if let LogicalPlan::Prepare(prepare_lp) = plan_with_values {
+            param_values.verify(&prepare_lp.data_types)?;
+            // try and take ownership of the input if is not shared, clone otherwise
+            match Arc::try_unwrap(prepare_lp.input) {
+                Ok(input) => input,
+                Err(arc_input) => arc_input.as_ref().clone(),
             }
-            _ => self.replace_params_with_values(&param_values),
-        }
+        } else {
+            plan_with_values
+        })
     }
 
     /// Returns the maximum number of rows that this plan can output, if known.
@@ -1046,27 +1011,26 @@ impl LogicalPlan {
     /// ...) replaced with corresponding values provided in
     /// `params_values`
     ///
-    /// See [`Self::with_param_values`] for examples and usage
+    /// See [`Self::with_param_values`] for examples and usage with an owned
+    /// `ParamValues`
     pub fn replace_params_with_values(
-        &self,
+        self,
         param_values: &ParamValues,
     ) -> Result<LogicalPlan> {
-        let new_exprs = self
-            .expressions()
-            .into_iter()
-            .map(|e| {
-                let e = e.infer_placeholder_types(self.schema())?;
-                Self::replace_placeholders_with_values(e, param_values)
+        self.transform_up_with_subqueries(|plan| {
+            let schema = plan.schema().clone();
+            plan.map_expressions(|e| {
+                e.infer_placeholder_types(&schema)?.transform_up(|e| {
+                    if let Expr::Placeholder(Placeholder { id, .. }) = e {
+                        let value = param_values.get_placeholders_with_values(&id)?;
+                        Ok(Transformed::yes(Expr::Literal(value)))
+                    } else {
+                        Ok(Transformed::no(e))
+                    }
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        let new_inputs_with_values = self
-            .inputs()
-            .into_iter()
-            .map(|inp| inp.replace_params_with_values(param_values))
-            .collect::<Result<Vec<_>>>()?;
-
-        self.with_new_exprs(new_exprs, new_inputs_with_values)
+        })
+        .map(|res| res.data)
     }
 
     /// Walk the logical plan, find any `Placeholder` tokens, and return a map of their IDs and DataTypes
@@ -1075,9 +1039,9 @@ impl LogicalPlan {
     ) -> Result<HashMap<String, Option<DataType>>, DataFusionError> {
         let mut param_types: HashMap<String, Option<DataType>> = HashMap::new();
 
-        self.apply_with_subqueries(&mut |plan| {
+        self.apply_with_subqueries(|plan| {
             plan.apply_expressions(|expr| {
-                expr.apply(&mut |expr| {
+                expr.apply(|expr| {
                     if let Expr::Placeholder(Placeholder { id, data_type }) = expr {
                         let prev = param_types.get(id);
                         match (prev, data_type) {
@@ -1097,33 +1061,6 @@ impl LogicalPlan {
             })
         })
         .map(|_| param_types)
-    }
-
-    /// Return an Expr with all placeholders replaced with their
-    /// corresponding values provided in the params_values
-    fn replace_placeholders_with_values(
-        expr: Expr,
-        param_values: &ParamValues,
-    ) -> Result<Expr> {
-        expr.transform(&|expr| {
-            match &expr {
-                Expr::Placeholder(Placeholder { id, .. }) => {
-                    let value = param_values.get_placeholders_with_values(id)?;
-                    // Replace the placeholder with the value
-                    Ok(Transformed::yes(Expr::Literal(value)))
-                }
-                Expr::ScalarSubquery(qry) => {
-                    let subquery =
-                        Arc::new(qry.subquery.replace_params_with_values(param_values)?);
-                    Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
-                        subquery,
-                        outer_ref_columns: qry.outer_ref_columns.clone(),
-                    })))
-                }
-                _ => Ok(Transformed::no(expr)),
-            }
-        })
-        .data()
     }
 
     // ------------
@@ -1604,8 +1541,8 @@ impl LogicalPlan {
                     LogicalPlan::DescribeTable(DescribeTable { .. }) => {
                         write!(f, "DescribeTable")
                     }
-                    LogicalPlan::Unnest(Unnest { column, .. }) => {
-                        write!(f, "Unnest: {column}")
+                    LogicalPlan::Unnest(Unnest { columns, .. }) => {
+                        write!(f, "Unnest: {}", expr_vec_fmt!(columns))
                     }
                 }
             }
@@ -2579,8 +2516,8 @@ pub enum Partitioning {
 pub struct Unnest {
     /// The incoming logical plan
     pub input: Arc<LogicalPlan>,
-    /// The column to unnest
-    pub column: Column,
+    /// The columns to unnest
+    pub columns: Vec<Column>,
     /// The output schema, containing the unnested field column.
     pub schema: DFSchemaRef,
     /// Options
@@ -2589,18 +2526,14 @@ pub struct Unnest {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::builder::LogicalTableSource;
     use crate::logical_plan::table_scan;
     use crate::{col, count, exists, in_subquery, lit, placeholder, GroupingSet};
 
-    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::tree_node::TreeNodeVisitor;
-    use datafusion_common::{
-        not_impl_err, Constraint, DFSchema, ScalarValue, TableReference,
-    };
+    use datafusion_common::{not_impl_err, Constraint, ScalarValue};
 
     fn employee_schema() -> Schema {
         Schema::new(vec![
@@ -3233,7 +3166,7 @@ digraph {
         // after transformation, because plan is not the same anymore,
         // the parent plan is built again with call to LogicalPlan::with_new_inputs -> with_new_exprs
         let plan = plan
-            .transform(&|plan| match plan {
+            .transform(|plan| match plan {
                 LogicalPlan::TableScan(table) => {
                     let filter = Filter::try_new(
                         external_filter.clone(),
