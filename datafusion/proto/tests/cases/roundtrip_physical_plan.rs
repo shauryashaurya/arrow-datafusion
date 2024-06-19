@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow::csv::WriterBuilder;
+use datafusion::functions_aggregate::sum::sum_udaf;
 use prost::Message;
 
 use datafusion::arrow::array::ArrayRef;
@@ -37,7 +38,7 @@ use datafusion::datasource::physical_plan::{
 };
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::{create_udf, JoinType, Operator, Volatility};
-use datafusion::physical_expr::expressions::{Count, Max, NthValueAgg};
+use datafusion::physical_expr::expressions::{Max, NthValueAgg};
 use datafusion::physical_expr::window::SlidingAggregateWindowExpr;
 use datafusion::physical_expr::{PhysicalSortRequirement, ScalarFunctionExpr};
 use datafusion::physical_plan::aggregates::{
@@ -46,8 +47,8 @@ use datafusion::physical_plan::aggregates::{
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::{
-    binary, cast, col, in_list, like, lit, Avg, BinaryExpr, Column, DistinctCount,
-    NotExpr, NthValue, PhysicalSortExpr, StringAgg, Sum,
+    binary, cast, col, in_list, like, lit, Avg, BinaryExpr, Column, NotExpr, NthValue,
+    PhysicalSortExpr,
 };
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::insert::DataSinkExec;
@@ -75,10 +76,10 @@ use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::stats::Precision;
 use datafusion_common::{not_impl_err, plan_err, DataFusionError, Result};
 use datafusion_expr::{
-    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue,
-    ScalarFunctionDefinition, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF,
-    WindowFrame, WindowFrameBound,
+    Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue, ScalarUDF,
+    ScalarUDFImpl, Signature, SimpleAggregateUDF, WindowFrame, WindowFrameBound,
 };
+use datafusion_functions_aggregate::string_agg::StringAgg;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
 };
@@ -254,8 +255,7 @@ fn roundtrip_nested_loop_join() -> Result<()> {
 fn roundtrip_window() -> Result<()> {
     let field_a = Field::new("a", DataType::Int64, false);
     let field_b = Field::new("b", DataType::Int64, false);
-    let field_c = Field::new("FIRST_VALUE(a) PARTITION BY [b] ORDER BY [a ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a, field_b, field_c]));
+    let schema = Arc::new(Schema::new(vec![field_a, field_b]));
 
     let window_frame = WindowFrame::new_bounds(
         datafusion_expr::WindowFrameUnits::Range,
@@ -298,12 +298,21 @@ fn roundtrip_window() -> Result<()> {
         WindowFrameBound::Preceding(ScalarValue::Int64(None)),
     );
 
+    let args = vec![cast(col("a", &schema)?, &schema, DataType::Float64)?];
+    let sum_expr = udaf::create_aggregate_expr(
+        &sum_udaf(),
+        &args,
+        &[],
+        &[],
+        &[],
+        &schema,
+        "SUM(a) RANGE BETWEEN CURRENT ROW AND UNBOUNDED PRECEEDING",
+        false,
+        false,
+    )?;
+
     let sliding_aggr_window_expr = Arc::new(SlidingAggregateWindowExpr::new(
-        Arc::new(Sum::new(
-            cast(col("a", &schema)?, &schema, DataType::Float64)?,
-            "SUM(a) RANGE BETWEEN CURRENT ROW AND UNBOUNDED PRECEEDING",
-            DataType::Float64,
-        )),
+        sum_expr,
         &[],
         &[],
         Arc::new(window_frame),
@@ -349,12 +358,20 @@ fn rountrip_aggregate() -> Result<()> {
             Vec::new(),
         ))],
         // STRING_AGG
-        vec![Arc::new(StringAgg::new(
-            cast(col("b", &schema)?, &schema, DataType::Utf8)?,
-            lit(ScalarValue::Utf8(Some(",".to_string()))),
-            "STRING_AGG(name, ',')".to_string(),
-            DataType::Utf8,
-        ))],
+        vec![udaf::create_aggregate_expr(
+            &AggregateUDF::new_from_impl(StringAgg::new()),
+            &[
+                cast(col("b", &schema)?, &schema, DataType::Utf8)?,
+                lit(ScalarValue::Utf8(Some(",".to_string()))),
+            ],
+            &[],
+            &[],
+            &[],
+            &schema,
+            "STRING_AGG(name, ',')",
+            false,
+            false,
+        )?],
     ];
 
     for aggregates in test_cases {
@@ -370,6 +387,33 @@ fn rountrip_aggregate() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn rountrip_aggregate_with_limit() -> Result<()> {
+    let field_a = Field::new("a", DataType::Int64, false);
+    let field_b = Field::new("b", DataType::Int64, false);
+    let schema = Arc::new(Schema::new(vec![field_a, field_b]));
+
+    let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        vec![(col("a", &schema)?, "unused".to_string())];
+
+    let aggregates: Vec<Arc<dyn AggregateExpr>> = vec![Arc::new(Avg::new(
+        cast(col("b", &schema)?, &schema, DataType::Float64)?,
+        "AVG(b)".to_string(),
+        DataType::Float64,
+    ))];
+
+    let agg = AggregateExec::try_new(
+        AggregateMode::Final,
+        PhysicalGroupBy::new_single(groups.clone()),
+        aggregates.clone(),
+        vec![None],
+        Arc::new(EmptyExec::new(schema.clone())),
+        schema,
+    )?;
+    let agg = agg.with_limit(Some(12));
+    roundtrip_test(Arc::new(agg))
 }
 
 #[test]
@@ -424,8 +468,10 @@ fn roundtrip_aggregate_udaf() -> Result<()> {
         &[col("b", &schema)?],
         &[],
         &[],
+        &[],
         &schema,
         "example_agg",
+        false,
         false,
     )?];
 
@@ -556,12 +602,11 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
         Operator::Eq,
         lit("1"),
     ));
-    roundtrip_test(Arc::new(ParquetExec::new(
-        scan_config,
-        Some(predicate),
-        None,
-        Default::default(),
-    )))
+    roundtrip_test(
+        ParquetExec::builder(scan_config)
+            .with_predicate(predicate)
+            .build_arc(),
+    )
 }
 
 #[tokio::test]
@@ -587,12 +632,7 @@ async fn roundtrip_parquet_exec_with_table_partition_cols() -> Result<()> {
         output_ordering: vec![],
     };
 
-    roundtrip_test(Arc::new(ParquetExec::new(
-        scan_config,
-        None,
-        None,
-        Default::default(),
-    )))
+    roundtrip_test(ParquetExec::builder(scan_config).build_arc())
 }
 
 #[test]
@@ -618,14 +658,13 @@ fn roundtrip_scalar_udf() -> Result<()> {
         scalar_fn.clone(),
     );
 
-    let fun_def = ScalarFunctionDefinition::UDF(Arc::new(udf.clone()));
+    let fun_def = Arc::new(udf.clone());
 
     let expr = ScalarFunctionExpr::new(
         "dummy",
         fun_def,
         vec![col("a", &schema)?],
         DataType::Int64,
-        None,
     );
 
     let project =
@@ -750,10 +789,9 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     let udf = ScalarUDF::from(MyRegexUdf::new(pattern.to_string()));
     let udf_expr = Arc::new(ScalarFunctionExpr::new(
         udf.name(),
-        ScalarFunctionDefinition::UDF(Arc::new(udf.clone())),
+        Arc::new(udf.clone()),
         vec![col("text", &schema)?],
         DataType::Int64,
-        None,
     ));
 
     let filter = Arc::new(FilterExec::try_new(
@@ -779,7 +817,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     let aggregate = Arc::new(AggregateExec::try_new(
         AggregateMode::Final,
         PhysicalGroupBy::new(vec![], vec![], vec![]),
-        vec![Arc::new(Count::new(udf_expr, "count", DataType::Int64))],
+        vec![Arc::new(Max::new(udf_expr, "max", DataType::Int64))],
         vec![None],
         window,
         schema.clone(),
@@ -789,31 +827,6 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     let codec = ScalarUDFExtensionCodec {};
     roundtrip_test_and_return(aggregate, &ctx, &codec)?;
     Ok(())
-}
-
-#[test]
-fn roundtrip_distinct_count() -> Result<()> {
-    let field_a = Field::new("a", DataType::Int64, false);
-    let field_b = Field::new("b", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a, field_b]));
-
-    let aggregates: Vec<Arc<dyn AggregateExpr>> = vec![Arc::new(DistinctCount::new(
-        DataType::Int64,
-        col("b", &schema)?,
-        "COUNT(DISTINCT b)".to_string(),
-    ))];
-
-    let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        vec![(col("a", &schema)?, "unused".to_string())];
-
-    roundtrip_test(Arc::new(AggregateExec::try_new(
-        AggregateMode::Final,
-        PhysicalGroupBy::new_single(groups),
-        aggregates.clone(),
-        vec![None],
-        Arc::new(EmptyExec::new(schema.clone())),
-        schema,
-    )?))
 }
 
 #[test]

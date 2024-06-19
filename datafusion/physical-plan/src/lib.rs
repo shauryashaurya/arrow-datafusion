@@ -30,7 +30,6 @@ use crate::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::utils::DataPtr;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{
@@ -216,7 +215,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// The returned list will be empty for leaf nodes such as scans, will contain
     /// a single value for unary nodes, or two values for binary nodes (such as
     /// joins).
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>>;
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>>;
 
     /// Returns a new `ExecutionPlan` where all existing children were replaced
     /// by the `children`, in order
@@ -684,7 +683,7 @@ pub fn with_new_children_if_necessary(
         || children
             .iter()
             .zip(old_children.iter())
-            .any(|(c1, c2)| !Arc::data_ptr_eq(c1, c2))
+            .any(|(c1, c2)| !Arc::ptr_eq(c1, c2))
     {
         plan.with_new_children(children)
     } else {
@@ -800,10 +799,6 @@ pub fn get_plan_string(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::single_component_path_imports)]
-use rstest_reuse;
-
-#[cfg(test)]
 mod tests {
     use std::any::Any;
     use std::sync::Arc;
@@ -842,7 +837,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 
@@ -901,7 +896,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

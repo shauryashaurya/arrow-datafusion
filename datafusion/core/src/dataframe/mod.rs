@@ -48,10 +48,13 @@ use datafusion_common::config::{CsvOptions, FormatOptions, JsonOptions};
 use datafusion_common::{
     plan_err, Column, DFSchema, DataFusionError, ParamValues, SchemaError, UnnestOptions,
 };
+use datafusion_expr::lit;
 use datafusion_expr::{
-    avg, count, is_null, max, median, min, stddev, utils::COUNT_STAR_EXPANSION,
-    TableProviderFilterPushDown, UNNAMED_TABLE,
+    avg, max, min, utils::COUNT_STAR_EXPANSION, TableProviderFilterPushDown,
+    UNNAMED_TABLE,
 };
+use datafusion_expr::{case, is_null};
+use datafusion_functions_aggregate::expr_fn::{count, median, stddev, sum};
 
 use async_trait::async_trait;
 
@@ -261,7 +264,7 @@ impl DataFrame {
         self.unnest_columns_with_options(&[column], options)
     }
 
-    /// Expand multiple list columns into a set of rows.
+    /// Expand multiple list/struct columns into a set of rows and new columns.
     ///
     /// See also:
     ///
@@ -275,8 +278,8 @@ impl DataFrame {
     /// # #[tokio::main]
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.unnest_columns(&["a", "b"])?;
+    /// let df = ctx.read_json("tests/data/unnest.json", NdJsonReadOptions::default()).await?;
+    /// let df = df.unnest_columns(&["b","c","d"])?;
     /// # Ok(())
     /// # }
     /// ```
@@ -534,7 +537,13 @@ impl DataFrame {
                 vec![],
                 original_schema_fields
                     .clone()
-                    .map(|f| count(is_null(col(f.name()))).alias(f.name()))
+                    .map(|f| {
+                        sum(case(is_null(col(f.name())))
+                            .when(lit(true), lit(1))
+                            .otherwise(lit(0))
+                            .unwrap())
+                        .alias(f.name())
+                    })
                     .collect::<Vec<_>>(),
             ),
             // mean aggregation
@@ -844,10 +853,7 @@ impl DataFrame {
     /// ```
     pub async fn count(self) -> Result<usize> {
         let rows = self
-            .aggregate(
-                vec![],
-                vec![datafusion_expr::count(Expr::Literal(COUNT_STAR_EXPANSION))],
-            )?
+            .aggregate(vec![], vec![count(Expr::Literal(COUNT_STAR_EXPANSION))])?
             .collect()
             .await?;
         let len = *rows
@@ -1026,7 +1032,9 @@ impl DataFrame {
     }
 
     /// Return a reference to the unoptimized [`LogicalPlan`] that comprises
-    /// this DataFrame. See [`Self::into_unoptimized_plan`] for more details.
+    /// this DataFrame.
+    ///
+    /// See [`Self::into_unoptimized_plan`] for more details.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.plan
     }
@@ -1043,6 +1051,9 @@ impl DataFrame {
     /// snapshot of the [`SessionState`] attached to this [`DataFrame`] and
     /// consequently subsequent operations may take place against a different
     /// state (e.g. a different value of `now()`)
+    ///
+    /// See [`Self::into_parts`] to retrieve the owned [`LogicalPlan`] and
+    /// corresponding [`SessionState`].
     pub fn into_unoptimized_plan(self) -> LogicalPlan {
         self.plan
     }
@@ -1579,9 +1590,10 @@ mod tests {
     use datafusion_common::{Constraint, Constraints};
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_expr::{
-        cast, count_distinct, create_udf, expr, lit, sum, BuiltInWindowFunction,
+        array_agg, cast, create_udf, expr, lit, BuiltInWindowFunction,
         ScalarFunctionImplementation, Volatility, WindowFrame, WindowFunctionDefinition,
     };
+    use datafusion_functions_aggregate::expr_fn::count_distinct;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_plan::{get_plan_string, ExecutionPlanProperties};
 
@@ -1805,7 +1817,7 @@ mod tests {
 
         assert_batches_sorted_eq!(
             ["+----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+",
-                "| c1 | MIN(aggregate_test_100.c12) | MAX(aggregate_test_100.c12) | AVG(aggregate_test_100.c12) | SUM(aggregate_test_100.c12) | COUNT(aggregate_test_100.c12) | COUNT(DISTINCT aggregate_test_100.c12) |",
+                "| c1 | MIN(aggregate_test_100.c12) | MAX(aggregate_test_100.c12) | AVG(aggregate_test_100.c12) | sum(aggregate_test_100.c12) | COUNT(aggregate_test_100.c12) | COUNT(DISTINCT aggregate_test_100.c12) |",
                 "+----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+",
                 "| a  | 0.02182578039211991         | 0.9800193410444061          | 0.48754517466109415         | 10.238448667882977          | 21                            | 21                                     |",
                 "| b  | 0.04893135681998029         | 0.9185813970744787          | 0.41040709263815384         | 7.797734760124923           | 19                            | 19                                     |",
@@ -2032,6 +2044,85 @@ mod tests {
             ],
             &df_results
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_subexpr() -> Result<()> {
+        let df = test_table().await?;
+
+        let group_expr = col("c2") + lit(1);
+        let aggr_expr = sum(col("c3") + lit(2));
+
+        let df = df
+            // GROUP BY `c2 + 1`
+            .aggregate(vec![group_expr.clone()], vec![aggr_expr.clone()])?
+            // SELECT `c2 + 1` as c2 + 10, sum(c3 + 2) + 20
+            // SELECT expressions contain aggr_expr and group_expr as subexpressions
+            .select(vec![
+                group_expr.alias("c2") + lit(10),
+                (aggr_expr + lit(20)).alias("sum"),
+            ])?;
+
+        let df_results = df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_sorted_eq!([
+                "+----------------+------+",
+                "| c2 + Int32(10) | sum  |",
+                "+----------------+------+",
+                "| 12             | 431  |",
+                "| 13             | 248  |",
+                "| 14             | 453  |",
+                "| 15             | 95   |",
+                "| 16             | -146 |",
+                "+----------------+------+",
+            ],
+            &df_results
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_name_collision() -> Result<()> {
+        let df = test_table().await?;
+
+        let collided_alias = "aggregate_test_100.c2 + aggregate_test_100.c3";
+        let group_expr = lit(1).alias(collided_alias);
+
+        let df = df
+            // GROUP BY 1
+            .aggregate(vec![group_expr], vec![])?
+            // SELECT `aggregate_test_100.c2 + aggregate_test_100.c3`
+            .select(vec![
+                (col("aggregate_test_100.c2") + col("aggregate_test_100.c3")),
+            ])
+            // The select expr has the same display_name as the group_expr,
+            // but since they are different expressions, it should fail.
+            .expect_err("Expected error");
+        let expected = "Schema error: No field named aggregate_test_100.c2. \
+            Valid fields are \"aggregate_test_100.c2 + aggregate_test_100.c3\".";
+        assert_eq!(df.strip_backtrace(), expected);
+
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/10346
+    #[tokio::test]
+    async fn test_select_over_aggregate_schema() -> Result<()> {
+        let df = test_table()
+            .await?
+            .with_column("c", col("c1"))?
+            .aggregate(vec![], vec![array_agg(col("c")).alias("c")])?
+            .select(vec![col("c")])?;
+
+        assert_eq!(df.schema().fields().len(), 1);
+        let field = df.schema().field(0);
+        // There are two columns named 'c', one from the input of the aggregate and the other from the output.
+        // Select should return the column from the output of the aggregate, which is a list.
+        assert!(matches!(field.data_type(), DataType::List(_)));
 
         Ok(())
     }
@@ -2301,7 +2392,7 @@ mod tests {
         assert_batches_sorted_eq!(
             [
                 "+----+-----------------------------+",
-                "| c1 | SUM(aggregate_test_100.c12) |",
+                "| c1 | sum(aggregate_test_100.c12) |",
                 "+----+-----------------------------+",
                 "| a  | 10.238448667882977          |",
                 "| b  | 7.797734760124923           |",
@@ -2317,7 +2408,7 @@ mod tests {
         assert_batches_sorted_eq!(
             [
                 "+----+---------------------+",
-                "| c1 | SUM(test_table.c12) |",
+                "| c1 | sum(test_table.c12) |",
                 "+----+---------------------+",
                 "| a  | 10.238448667882977  |",
                 "| b  | 7.797734760124923   |",
@@ -3009,10 +3100,7 @@ mod tests {
             let join_schema = physical_plan.schema();
 
             match join_type {
-                JoinType::Inner
-                | JoinType::Left
-                | JoinType::LeftSemi
-                | JoinType::LeftAnti => {
+                JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => {
                     let left_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
                         Arc::new(Column::new_with_schema("c1", &join_schema)?),
                         Arc::new(Column::new_with_schema("c2", &join_schema)?),
@@ -3022,7 +3110,10 @@ mod tests {
                         &Partitioning::Hash(left_exprs, default_partition_count)
                     );
                 }
-                JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => {
+                JoinType::Inner
+                | JoinType::Right
+                | JoinType::RightSemi
+                | JoinType::RightAnti => {
                     let right_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
                         Arc::new(Column::new_with_schema("c2_c1", &join_schema)?),
                         Arc::new(Column::new_with_schema("c2_c2", &join_schema)?),
@@ -3042,6 +3133,7 @@ mod tests {
 
         Ok(())
     }
+
     #[tokio::test]
     async fn nested_explain_should_fail() -> Result<()> {
         let ctx = SessionContext::new();

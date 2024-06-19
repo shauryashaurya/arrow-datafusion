@@ -57,7 +57,7 @@ See instructions at https://infra.apache.org/release-signing.html#generate for g
 
 Committers can add signing keys in Subversion client with their ASF account. e.g.:
 
-```bash
+```shell
 $ svn co https://dist.apache.org/repos/dist/dev/datafusion
 $ cd datafusion
 $ editor KEYS
@@ -66,7 +66,7 @@ $ svn ci KEYS
 
 Follow the instructions in the header of the KEYS file to append your key. Here is an example:
 
-```bash
+```shell
 (gpg --list-sigs "John Doe" && gpg --armor --export "John Doe") >> KEYS
 svn commit KEYS -m "Add key for John Doe"
 ```
@@ -89,36 +89,26 @@ to generate one if you do not already have one.
 
 The changelog is generated using a Python script. There is a dependency on `PyGitHub`, which can be installed using pip:
 
-```bash
+```shell
 pip3 install PyGitHub
 ```
 
-Run the following command to generate the changelog content.
+To generate the changelog, set the `GITHUB_TOKEN` environment variable to a valid token and then run the script
+providing two commit ids or tags followed by the version number of the release being created. The following
+example generates a change log of all changes between the first commit and the current HEAD revision.
 
-```bash
-$ GITHUB_TOKEN=<TOKEN> ./dev/release/generate-changelog.py apache/datafusion 24.0.0 HEAD > dev/changelog/25.0.0.md
+```shell
+export GITHUB_TOKEN=<your-token-here>
+./dev/release/generate-changelog.py 24.0.0 HEAD 25.0.0 > dev/changelog/25.0.0.md
 ```
 
 This script creates a changelog from GitHub PRs based on the labels associated with them as well as looking for
-titles starting with `feat:`, `fix:`, or `docs:` . The script will produce output similar to:
+titles starting with `feat:`, `fix:`, or `docs:`.
 
-```
-Fetching list of commits between 24.0.0 and HEAD
-Fetching pull requests
-Categorizing pull requests
-Generating changelog content
-```
+Once the change log is generated, run `prettier` to format the document:
 
-This process is not fully automated, so there are some additional manual steps:
-
-- Add the ASF header to the generated file
-- Add a link to this changelog from the top-level `/datafusion/CHANGELOG.md`
-- Add the following content (copy from the previous version's changelog and update as appropriate:
-
-```
-## [24.0.0](https://github.com/apache/datafusion/tree/24.0.0) (2023-05-06)
-
-[Full Changelog](https://github.com/apache/datafusion/compare/23.0.0...24.0.0)
+```shell
+prettier -w dev/changelog/25.0.0md
 ```
 
 ## Prepare release commits and PR
@@ -195,37 +185,7 @@ The `create-tarball.sh` script
 
 ### Vote on Release Candidate artifacts
 
-Send the email output from the script to dev@datafusion.apache.org. The email should look like
-
-```
-To: dev@datafusion.apache.org
-Subject: [VOTE] Release Apache DataFusion 38.0.0 RC1
-
-Hi,
-
-I would like to propose a release of Apache DataFusion version 38.0.0.
-
-This release candidate is based on commit: a5dd428f57e62db20a945e8b1895de91405958c4 [1]
-The proposed release artifacts and signatures are hosted at [2].
-The changelog is located at [3].
-
-Please download, verify checksums and signatures, run the unit tests,
-and vote on the release.
-
-The vote will be open for at least 72 hours.
-
-[ ] +1 Release this as Apache DataFusion 38.0.0
-[ ] +0
-[ ] -1 Do not release this as Apache DataFusion 38.0.0 because...
-
-Here is my vote:
-
-+1
-
-[1]: https://github.com/apache/datafusion/tree/a5dd428f57e62db20a945e8b1895de91405958c4
-[2]: https://dist.apache.org/repos/dist/dev/datafusion/apache-datafusion-38.0.0
-[3]: https://github.com/apache/datafusion/blob/a5dd428f57e62db20a945e8b1895de91405958c4/CHANGELOG.md
-```
+Send the email output from the script to dev@datafusion.apache.org.
 
 For the release to become "official" it needs at least three PMC members to vote +1 on it.
 
@@ -280,22 +240,7 @@ been made to crates.io using the following instructions.
 Follow [these
 instructions](https://doc.rust-lang.org/cargo/reference/publishing.html) to
 create an account and login to crates.io before asking to be added as an owner
-of the following crates:
-
-- [datafusion-common](https://crates.io/crates/datafusion-common)
-- [datafusion-expr](https://crates.io/crates/datafusion-expr)
-- [datafusion-execution](https://crates.io/crates/datafusion-execution)
-- [datafusion-physical-expr](https://crates.io/crates/datafusion-physical-expr)
-- [datafusion-functions](https://crates.io/crates/datafusion-functions)
-- [datafusion-functions-array](https://crates.io/crates/datafusion-functions-array)
-- [datafusion-sql](https://crates.io/crates/datafusion-sql)
-- [datafusion-optimizer](https://crates.io/crates/datafusion-optimizer)
-- [datafusion-common-runtime](https://crates.io/crates/datafusion-common-runtime)
-- [datafusion-physical-plan](https://crates.io/crates/datafusion-physical-plan)
-- [datafusion](https://crates.io/crates/datafusion)
-- [datafusion-proto](https://crates.io/crates/datafusion-proto)
-- [datafusion-substrait](https://crates.io/crates/datafusion-substrait)
-- [datafusion-cli](https://crates.io/crates/datafusion-cli)
+to all of the DataFusion crates.
 
 Download and unpack the official release tarball
 
@@ -311,7 +256,7 @@ published in the correct order as shown in this diagram.
 
 _To update this diagram, manually edit the dependencies in [crate-deps.dot](crate-deps.dot) and then run:_
 
-```bash
+```shell
 dot -Tsvg dev/release/crate-deps.dot > dev/release/crate-deps.svg
 ```
 
@@ -319,6 +264,8 @@ dot -Tsvg dev/release/crate-deps.dot > dev/release/crate-deps.svg
 (cd datafusion/common && cargo publish)
 (cd datafusion/expr && cargo publish)
 (cd datafusion/execution && cargo publish)
+(cd datafusion/physical-expr-common && cargo publish)
+(cd datafusion/functions-aggregate && cargo publish)
 (cd datafusion/physical-expr && cargo publish)
 (cd datafusion/functions && cargo publish)
 (cd datafusion/functions-array && cargo publish)
@@ -327,6 +274,7 @@ dot -Tsvg dev/release/crate-deps.dot > dev/release/crate-deps.svg
 (cd datafusion/common-runtime && cargo publish)
 (cd datafusion/physical-plan && cargo publish)
 (cd datafusion/core && cargo publish)
+(cd datafusion/proto-common && cargo publish)
 (cd datafusion/proto && cargo publish)
 (cd datafusion/substrait && cargo publish)
 ```
@@ -354,7 +302,7 @@ Please visit https://brew.sh/ to obtain Homebrew. In addition to that please che
 Before running the script make sure that you can run the following command in your bash to make sure
 that `brew` has been installed and configured properly:
 
-```bash
+```shell
 brew --version
 ```
 
@@ -369,7 +317,7 @@ To create a Github Personal Access Token, please visit https://docs.github.com/e
 
 After all of the above is complete execute the following command:
 
-```bash
+```shell
 dev/release/publish_homebrew.sh <version> <github-user> <github-token> <homebrew-default-branch-name>
 ```
 
@@ -394,23 +342,6 @@ The vote has passed with <NUMBER> +1 votes. Thank you to all who helped
 with the release verification.
 ```
 
-You can include mention crates.io and PyPI version URLs in the email if applicable.
-
-```
-We have published new versions of DataFusion to crates.io:
-
-https://crates.io/crates/datafusion/28.0.0
-https://crates.io/crates/datafusion-cli/28.0.0
-https://crates.io/crates/datafusion-common/28.0.0
-https://crates.io/crates/datafusion-expr/28.0.0
-https://crates.io/crates/datafusion-optimizer/28.0.0
-https://crates.io/crates/datafusion-physical-expr/28.0.0
-https://crates.io/crates/datafusion-proto/28.0.0
-https://crates.io/crates/datafusion-sql/28.0.0
-https://crates.io/crates/datafusion-execution/28.0.0
-https://crates.io/crates/datafusion-substrait/28.0.0
-```
-
 ### Add the release to Apache Reporter
 
 Add the release to https://reporter.apache.org/addrelease.html?datafusion using the version number e.g. 38.0.0.
@@ -429,13 +360,13 @@ Release candidates should be deleted once the release is published.
 
 Get a list of DataFusion release candidates:
 
-```bash
+```shell
 svn ls https://dist.apache.org/repos/dist/dev/datafusion
 ```
 
 Delete a release candidate:
 
-```bash
+```shell
 svn delete -m "delete old DataFusion RC" https://dist.apache.org/repos/dist/dev/datafusion/apache-datafusion-38.0.0-rc1/
 ```
 
@@ -445,13 +376,13 @@ Only the latest release should be available. Delete old releases after publishin
 
 Get a list of DataFusion releases:
 
-```bash
+```shell
 svn ls https://dist.apache.org/repos/dist/release/datafusion
 ```
 
 Delete a release:
 
-```bash
+```shell
 svn delete -m "delete old DataFusion release" https://dist.apache.org/repos/dist/release/datafusion/datafusion-37.0.0
 ```
 
@@ -462,7 +393,7 @@ with a copy of the previous release announcement.
 
 Run the following commands to get the number of commits and number of unique contributors for inclusion in the blog post.
 
-```bash
+```shell
 git log --pretty=oneline 37.0.0..38.0.0 datafusion datafusion-cli datafusion-examples | wc -l
 git shortlog -sn 37.0.0..38.0.0 datafusion datafusion-cli datafusion-examples | wc -l
 ```

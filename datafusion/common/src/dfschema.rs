@@ -125,6 +125,20 @@ impl DFSchema {
         }
     }
 
+    /// Return a reference to the inner Arrow [`Schema`]
+    ///
+    /// Note this does not have the qualifier information
+    pub fn as_arrow(&self) -> &Schema {
+        self.inner.as_ref()
+    }
+
+    /// Return a reference to the inner Arrow [`SchemaRef`]
+    ///
+    /// Note this does not have the qualifier information
+    pub fn inner(&self) -> &SchemaRef {
+        &self.inner
+    }
+
     /// Create a `DFSchema` from an Arrow schema where all the fields have a given qualifier
     pub fn new_with_metadata(
         qualified_fields: Vec<(Option<TableReference>, Arc<Field>)>,
@@ -652,7 +666,7 @@ impl DFSchema {
     /// than datatype_is_semantically_equal in that a Dictionary<K,V> type is logically
     /// equal to a plain V type, but not semantically equal. Dictionary<K1, V1> is also
     /// logically equal to Dictionary<K2, V1>.
-    fn datatype_is_logically_equal(dt1: &DataType, dt2: &DataType) -> bool {
+    pub fn datatype_is_logically_equal(dt1: &DataType, dt2: &DataType) -> bool {
         // check nested fields
         match (dt1, dt2) {
             (DataType::Dictionary(_, v1), DataType::Dictionary(_, v2)) => {
@@ -803,6 +817,21 @@ impl From<&DFSchema> for Schema {
     fn from(df_schema: &DFSchema) -> Self {
         let fields: Fields = df_schema.inner.fields.clone();
         Schema::new_with_metadata(fields, df_schema.inner.metadata.clone())
+    }
+}
+
+/// Allow DFSchema to be converted into an Arrow `&Schema`
+impl AsRef<Schema> for DFSchema {
+    fn as_ref(&self) -> &Schema {
+        self.as_arrow()
+    }
+}
+
+/// Allow DFSchema to be converted into an Arrow `&SchemaRef` (to clone, for
+/// example)
+impl AsRef<SchemaRef> for DFSchema {
+    fn as_ref(&self) -> &SchemaRef {
+        self.inner()
     }
 }
 

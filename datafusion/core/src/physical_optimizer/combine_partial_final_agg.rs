@@ -203,10 +203,13 @@ mod tests {
     use crate::datasource::physical_plan::{FileScanConfig, ParquetExec};
     use crate::physical_plan::expressions::lit;
     use crate::physical_plan::repartition::RepartitionExec;
-    use crate::physical_plan::{displayable, Partitioning, Statistics};
+    use crate::physical_plan::{displayable, Partitioning};
 
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_physical_expr::expressions::{col, Count, Sum};
+    use datafusion_functions_aggregate::count::count_udaf;
+    use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_plan::udaf::create_aggregate_expr;
 
     /// Runs the CombinePartialFinalAggregate optimizer and asserts the plan against the expected
     macro_rules! assert_optimized {
@@ -245,21 +248,14 @@ mod tests {
     }
 
     fn parquet_exec(schema: &SchemaRef) -> Arc<ParquetExec> {
-        Arc::new(ParquetExec::new(
-            FileScanConfig {
-                object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-                file_schema: schema.clone(),
-                file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
-                statistics: Statistics::new_unknown(schema),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-                output_ordering: vec![],
-            },
-            None,
-            None,
-            Default::default(),
-        ))
+        ParquetExec::builder(
+            FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
+                schema.clone(),
+            )
+            .with_file(PartitionedFile::new("x".to_string(), 100)),
+        )
+        .build_arc()
     }
 
     fn partial_aggregate_exec(
@@ -308,15 +304,32 @@ mod tests {
         )
     }
 
+    // Return appropriate expr depending if COUNT is for col or table (*)
+    fn count_expr(
+        expr: Arc<dyn PhysicalExpr>,
+        name: &str,
+        schema: &Schema,
+    ) -> Arc<dyn AggregateExpr> {
+        create_aggregate_expr(
+            &count_udaf(),
+            &[expr],
+            &[],
+            &[],
+            &[],
+            schema,
+            name,
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn aggregations_not_combined() -> Result<()> {
         let schema = schema();
 
-        let aggr_expr = vec![Arc::new(Count::new(
-            lit(1i8),
-            "COUNT(1)".to_string(),
-            DataType::Int64,
-        )) as _];
+        let aggr_expr = vec![count_expr(lit(1i8), "COUNT(1)", &schema)];
+
         let plan = final_aggregate_exec(
             repartition_exec(partial_aggregate_exec(
                 parquet_exec(&schema),
@@ -335,16 +348,8 @@ mod tests {
         ];
         assert_optimized!(expected, plan);
 
-        let aggr_expr1 = vec![Arc::new(Count::new(
-            lit(1i8),
-            "COUNT(1)".to_string(),
-            DataType::Int64,
-        )) as _];
-        let aggr_expr2 = vec![Arc::new(Count::new(
-            lit(1i8),
-            "COUNT(2)".to_string(),
-            DataType::Int64,
-        )) as _];
+        let aggr_expr1 = vec![count_expr(lit(1i8), "COUNT(1)", &schema)];
+        let aggr_expr2 = vec![count_expr(lit(1i8), "COUNT(2)", &schema)];
 
         let plan = final_aggregate_exec(
             partial_aggregate_exec(
@@ -370,11 +375,7 @@ mod tests {
     #[test]
     fn aggregations_combined() -> Result<()> {
         let schema = schema();
-        let aggr_expr = vec![Arc::new(Count::new(
-            lit(1i8),
-            "COUNT(1)".to_string(),
-            DataType::Int64,
-        )) as _];
+        let aggr_expr = vec![count_expr(lit(1i8), "COUNT(1)", &schema)];
 
         let plan = final_aggregate_exec(
             partial_aggregate_exec(
@@ -398,12 +399,18 @@ mod tests {
     #[test]
     fn aggregations_with_group_combined() -> Result<()> {
         let schema = schema();
-        let aggr_expr = vec![Arc::new(Sum::new(
-            col("b", &schema)?,
-            "Sum(b)".to_string(),
-            DataType::Int64,
-        )) as _];
 
+        let aggr_expr = vec![create_aggregate_expr(
+            &sum_udaf(),
+            &[col("b", &schema)?],
+            &[],
+            &[],
+            &[],
+            &schema,
+            "Sum(b)",
+            false,
+            false,
+        )?];
         let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
             vec![(col("c", &schema)?, "c".to_string())];
 

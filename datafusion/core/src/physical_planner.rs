@@ -49,7 +49,7 @@ use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGro
 use crate::physical_plan::analyze::AnalyzeExec;
 use crate::physical_plan::empty::EmptyExec;
 use crate::physical_plan::explain::ExplainExec;
-use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
+use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::filter::FilterExec;
 use crate::physical_plan::joins::utils as join_utils;
 use crate::physical_plan::joins::{
@@ -83,15 +83,14 @@ use datafusion_common::{
 use datafusion_expr::dml::CopyTo;
 use datafusion_expr::expr::{
     self, AggregateFunction, AggregateFunctionDefinition, Alias, Between, BinaryExpr,
-    Cast, GetFieldAccess, GetIndexedField, GroupingSet, InList, Like, TryCast,
-    WindowFunction,
+    Cast, GroupingSet, InList, Like, TryCast, WindowFunction,
 };
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::expr_vec_fmt;
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
 use datafusion_expr::{
-    DescribeTable, DmlStatement, Extension, Filter, RecursiveQuery,
-    ScalarFunctionDefinition, StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
+    DescribeTable, DmlStatement, Extension, Filter, RecursiveQuery, StringifiedPlan,
+    WindowFrame, WindowFrameBound, WriteOp,
 };
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::LexOrdering;
@@ -216,37 +215,7 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             let expr = create_physical_name(expr, false)?;
             Ok(format!("{expr} IS NOT UNKNOWN"))
         }
-        Expr::GetIndexedField(GetIndexedField { expr: _, field }) => {
-            match field {
-                GetFieldAccess::NamedStructField { name: _ } => {
-                    unreachable!(
-                        "NamedStructField should have been rewritten in OperatorToFunction"
-                    )
-                }
-                GetFieldAccess::ListIndex { key: _ } => {
-                    unreachable!(
-                        "ListIndex should have been rewritten in OperatorToFunction"
-                    )
-                }
-                GetFieldAccess::ListRange {
-                    start: _,
-                    stop: _,
-                    stride: _,
-                } => {
-                    unreachable!(
-                        "ListRange should have been rewritten in OperatorToFunction"
-                    )
-                }
-            };
-        }
-        Expr::ScalarFunction(fun) => {
-            // function should be resolved during `AnalyzerRule`s
-            if let ScalarFunctionDefinition::Name(_) = fun.func_def {
-                return internal_err!("Function `Expr` with name should be resolved.");
-            }
-
-            create_function_physical_name(fun.name(), false, &fun.args, None)
-        }
+        Expr::ScalarFunction(fun) => fun.func.display_name(&fun.args),
         Expr::WindowFunction(WindowFunction {
             fun,
             args,
@@ -259,34 +228,15 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             func_def,
             distinct,
             args,
-            filter,
+            filter: _,
             order_by,
             null_treatment: _,
-        }) => match func_def {
-            AggregateFunctionDefinition::BuiltIn(..) => create_function_physical_name(
-                func_def.name(),
-                *distinct,
-                args,
-                order_by.as_ref(),
-            ),
-            AggregateFunctionDefinition::UDF(fun) => {
-                // TODO: Add support for filter by in AggregateUDF
-                if filter.is_some() {
-                    return exec_err!(
-                        "aggregate expression with filter is not supported"
-                    );
-                }
-
-                let names = args
-                    .iter()
-                    .map(|e| create_physical_name(e, false))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(format!("{}({})", fun.name(), names.join(",")))
-            }
-            AggregateFunctionDefinition::Name(_) => {
-                internal_err!("Aggregate function `Expr` with name should be resolved.")
-            }
-        },
+        }) => create_function_physical_name(
+            func_def.name(),
+            *distinct,
+            args,
+            order_by.as_ref(),
+        ),
         Expr::GroupingSet(grouping_set) => match grouping_set {
             GroupingSet::Rollup(exprs) => Ok(format!(
                 "ROLLUP ({})",
@@ -496,6 +446,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
                 let plan = self
                     .create_initial_plan(logical_plan, session_state)
                     .await?;
+
                 self.optimize_internal(plan, session_state, |_, _| {})
             }
         }
@@ -1161,24 +1112,18 @@ impl DefaultPhysicalPlanner {
                 Arc::new(GlobalLimitExec::new(input, *skip, *fetch))
             }
             LogicalPlan::Unnest(Unnest {
-                columns,
+                list_type_columns,
+                struct_type_columns,
                 schema,
                 options,
                 ..
             }) => {
                 let input = children.one()?;
-                let column_execs = columns
-                    .iter()
-                    .map(|column| {
-                        schema
-                            .index_of_column(column)
-                            .map(|idx| Column::new(&column.name, idx))
-                    })
-                    .collect::<Result<_>>()?;
                 let schema = SchemaRef::new(schema.as_ref().to_owned().into());
                 Arc::new(UnnestExec::new(
                     input,
-                    column_execs,
+                    list_type_columns.clone(),
+                    struct_type_columns.clone(),
                     schema,
                     options.clone(),
                 ))
@@ -1821,7 +1766,8 @@ pub fn create_window_expr_with_name(
             window_frame,
             null_treatment,
         }) => {
-            let args = create_physical_exprs(args, logical_schema, execution_props)?;
+            let physical_args =
+                create_physical_exprs(args, logical_schema, execution_props)?;
             let partition_by =
                 create_physical_exprs(partition_by, logical_schema, execution_props)?;
             let order_by =
@@ -1835,13 +1781,13 @@ pub fn create_window_expr_with_name(
             }
 
             let window_frame = Arc::new(window_frame.clone());
-            let ignore_nulls = null_treatment
-                .unwrap_or(sqlparser::ast::NullTreatment::RespectNulls)
+            let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
                 == NullTreatment::IgnoreNulls;
             windows::create_window_expr(
                 fun,
                 name,
-                &args,
+                &physical_args,
+                args,
                 &partition_by,
                 &order_by,
                 window_frame,
@@ -1892,7 +1838,7 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
             order_by,
             null_treatment,
         }) => {
-            let args =
+            let physical_args =
                 create_physical_exprs(args, logical_input_schema, execution_props)?;
             let filter = match filter {
                 Some(e) => Some(create_physical_expr(
@@ -1906,6 +1852,7 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
             let ignore_nulls = null_treatment
                 .unwrap_or(sqlparser::ast::NullTreatment::RespectNulls)
                 == NullTreatment::IgnoreNulls;
+
             let (agg_expr, filter, order_by) = match func_def {
                 AggregateFunctionDefinition::BuiltIn(fun) => {
                     let physical_sort_exprs = match order_by {
@@ -1921,7 +1868,7 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
                     let agg_expr = aggregates::create_aggregate_expr(
                         fun,
                         *distinct,
-                        &args,
+                        &physical_args,
                         &ordering_reqs,
                         physical_input_schema,
                         name,
@@ -1943,19 +1890,16 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
                         physical_sort_exprs.clone().unwrap_or(vec![]);
                     let agg_expr = udaf::create_aggregate_expr(
                         fun,
-                        &args,
+                        &physical_args,
+                        args,
                         &sort_exprs,
                         &ordering_reqs,
                         physical_input_schema,
                         name,
                         ignore_nulls,
+                        *distinct,
                     )?;
                     (agg_expr, filter, physical_sort_exprs)
-                }
-                AggregateFunctionDefinition::Name(_) => {
-                    return internal_err!(
-                        "Aggregate function name should have been resolved"
-                    )
                 }
             };
             Ok((agg_expr, filter, order_by))
@@ -2040,7 +1984,7 @@ impl DefaultPhysicalPlanner {
             let config = &session_state.config_options().explain;
 
             if !config.physical_plan_only {
-                stringified_plans = e.stringified_plans.clone();
+                stringified_plans.clone_from(&e.stringified_plans);
                 if e.logical_optimization_succeeded {
                     stringified_plans.push(e.plan.to_stringified(FinalLogicalPlan));
                 }
@@ -2239,7 +2183,6 @@ impl DefaultPhysicalPlanner {
         expr: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_schema = input.as_ref().schema();
-
         let physical_exprs = expr
             .iter()
             .map(|e| {
@@ -2315,9 +2258,8 @@ mod tests {
     use datafusion_common::{assert_contains, DFSchemaRef, TableReference};
     use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_execution::TaskContext;
-    use datafusion_expr::{
-        col, lit, sum, LogicalPlanBuilder, UserDefinedLogicalNodeCore,
-    };
+    use datafusion_expr::{col, lit, LogicalPlanBuilder, UserDefinedLogicalNodeCore};
+    use datafusion_functions_aggregate::expr_fn::sum;
     use datafusion_physical_expr::EquivalenceProperties;
 
     fn make_session_state() -> SessionState {
@@ -2645,7 +2587,7 @@ mod tests {
             .downcast_ref::<AggregateExec>()
             .expect("hash aggregate");
         assert_eq!(
-            "SUM(aggregate_test_100.c2)",
+            "sum(aggregate_test_100.c2)",
             final_hash_agg.schema().field(1).name()
         );
         // we need access to the input to the partial aggregate so that other projects can
@@ -2673,7 +2615,7 @@ mod tests {
             .downcast_ref::<AggregateExec>()
             .expect("hash aggregate");
         assert_eq!(
-            "SUM(aggregate_test_100.c3)",
+            "sum(aggregate_test_100.c3)",
             final_hash_agg.schema().field(2).name()
         );
         // we need access to the input to the partial aggregate so that other projects can
@@ -2871,7 +2813,11 @@ mod tests {
             write!(f, "NoOp")
         }
 
-        fn from_template(&self, _exprs: &[Expr], _inputs: &[LogicalPlan]) -> Self {
+        fn with_exprs_and_inputs(
+            &self,
+            _exprs: Vec<Expr>,
+            _inputs: Vec<LogicalPlan>,
+        ) -> Result<Self> {
             unimplemented!("NoOp");
         }
     }
@@ -2924,7 +2870,7 @@ mod tests {
             &self.cache
         }
 
-        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
 

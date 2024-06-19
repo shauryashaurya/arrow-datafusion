@@ -22,7 +22,7 @@ use std::vec;
 
 use arrow_schema::*;
 use datafusion_common::{
-    field_not_found, internal_err, plan_datafusion_err, SchemaError,
+    field_not_found, internal_err, plan_datafusion_err, DFSchemaRef, SchemaError,
 };
 use datafusion_expr::WindowUDF;
 use sqlparser::ast::TimezoneInfo;
@@ -46,10 +46,6 @@ use crate::utils::make_decimal_type;
 /// The ContextProvider trait allows the query planner to obtain meta-data about tables and
 /// functions referenced in SQL statements
 pub trait ContextProvider {
-    #[deprecated(since = "32.0.0", note = "please use `get_table_source` instead")]
-    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
-        self.get_table_source(name)
-    }
     /// Getter for a datasource
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
     /// Getter for a table function
@@ -86,9 +82,14 @@ pub trait ContextProvider {
     /// Get configuration options
     fn options(&self) -> &ConfigOptions;
 
-    fn udfs_names(&self) -> Vec<String>;
-    fn udafs_names(&self) -> Vec<String>;
-    fn udwfs_names(&self) -> Vec<String>;
+    /// Get all user defined scalar function names
+    fn udf_names(&self) -> Vec<String>;
+
+    /// Get all user defined aggregate function names
+    fn udaf_names(&self) -> Vec<String>;
+
+    /// Get all user defined window function names
+    fn udwf_names(&self) -> Vec<String>;
 }
 
 /// SQL parser options
@@ -138,16 +139,23 @@ impl IdentNormalizer {
 /// Common Table Expression (CTE) provided with WITH clause and
 /// Parameter Data Types provided with PREPARE statement and the query schema of the
 /// outer query plan
+///
+/// # Cloning
+///
+/// Only the `ctes` are truly cloned when the `PlannerContext` is cloned. This helps resolve
+/// scoping issues of CTEs. By using cloning, a subquery can inherit CTEs from the outer query
+/// and can also define its own private CTEs without affecting the outer query.
+///
 #[derive(Debug, Clone)]
 pub struct PlannerContext {
     /// Data types for numbered parameters ($1, $2, etc), if supplied
     /// in `PREPARE` statement
-    prepare_param_data_types: Vec<DataType>,
+    prepare_param_data_types: Arc<Vec<DataType>>,
     /// Map of CTE name to logical plan of the WITH clause.
     /// Use `Arc<LogicalPlan>` to allow cheap cloning
     ctes: HashMap<String, Arc<LogicalPlan>>,
     /// The query schema of the outer query plan, used to resolve the columns in subquery
-    outer_query_schema: Option<DFSchema>,
+    outer_query_schema: Option<DFSchemaRef>,
 }
 
 impl Default for PlannerContext {
@@ -160,7 +168,7 @@ impl PlannerContext {
     /// Create an empty PlannerContext
     pub fn new() -> Self {
         Self {
-            prepare_param_data_types: vec![],
+            prepare_param_data_types: Arc::new(vec![]),
             ctes: HashMap::new(),
             outer_query_schema: None,
         }
@@ -171,21 +179,21 @@ impl PlannerContext {
         mut self,
         prepare_param_data_types: Vec<DataType>,
     ) -> Self {
-        self.prepare_param_data_types = prepare_param_data_types;
+        self.prepare_param_data_types = prepare_param_data_types.into();
         self
     }
 
     // return a reference to the outer queries schema
     pub fn outer_query_schema(&self) -> Option<&DFSchema> {
-        self.outer_query_schema.as_ref()
+        self.outer_query_schema.as_ref().map(|s| s.as_ref())
     }
 
     /// sets the outer query schema, returning the existing one, if
     /// any
     pub fn set_outer_query_schema(
         &mut self,
-        mut schema: Option<DFSchema>,
-    ) -> Option<DFSchema> {
+        mut schema: Option<DFSchemaRef>,
+    ) -> Option<DFSchemaRef> {
         std::mem::swap(&mut self.outer_query_schema, &mut schema);
         schema
     }
@@ -366,7 +374,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     pub(crate) fn convert_data_type(&self, sql_type: &SQLDataType) -> Result<DataType> {
         match sql_type {
             SQLDataType::Array(ArrayElemTypeDef::AngleBracket(inner_sql_type))
-            | SQLDataType::Array(ArrayElemTypeDef::SquareBracket(inner_sql_type)) => {
+            | SQLDataType::Array(ArrayElemTypeDef::SquareBracket(inner_sql_type, _)) => {
                 // Arrays may be multi-dimensional.
                 let inner_data_type = self.convert_data_type(inner_sql_type)?;
                 Ok(DataType::new_list(inner_data_type, true))
@@ -438,6 +446,25 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+            SQLDataType::Struct(fields) => {
+                let fields = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        let data_type = self.convert_data_type(&field.field_type)?;
+                        let field_name = match &field.field_name{
+                            Some(ident) => ident.clone(),
+                            None => Ident::new(format!("c{idx}"))
+                        };
+                        Ok(Arc::new(Field::new(
+                            self.normalizer.normalize(field_name),
+                            data_type,
+                            true,
+                        )))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(DataType::Struct(Fields::from(fields)))
+            }
             // Explicitly list all other types so that if sqlparser
             // adds/changes the `SQLDataType` the compiler will tell us on upgrade
             // and avoid bugs like https://github.com/apache/datafusion/issues/3059
@@ -471,7 +498,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Bytes(_)
             | SQLDataType::Int64
             | SQLDataType::Float64
-            | SQLDataType::Struct(_)
             | SQLDataType::JSONB
             | SQLDataType::Unspecified
             => not_impl_err!(

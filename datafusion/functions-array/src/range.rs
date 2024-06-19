@@ -22,20 +22,20 @@ use arrow::array::{Array, ArrayRef, Int64Array, ListArray};
 use arrow::datatypes::{DataType, Field};
 use arrow_array::types::{Date32Type, IntervalMonthDayNanoType};
 use arrow_array::{Date32Array, NullArray};
-use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer};
+use arrow_buffer::{
+    BooleanBufferBuilder, IntervalMonthDayNano, NullBuffer, OffsetBuffer,
+};
 use arrow_schema::DataType::{Date32, Int64, Interval, List};
 use arrow_schema::IntervalUnit::MonthDayNano;
 use datafusion_common::cast::{as_date32_array, as_int64_array, as_interval_mdn_array};
 use datafusion_common::{exec_err, not_impl_datafusion_err, Result};
-use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::Expr;
 use datafusion_expr::{
     ColumnarValue, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use std::any::Any;
 use std::sync::Arc;
 
-make_udf_function!(
+make_udf_expr_and_func!(
     Range,
     range,
     start stop step,
@@ -60,7 +60,7 @@ impl Range {
                 ],
                 Volatility::Immutable,
             ),
-            aliases: vec![String::from("range")],
+            aliases: vec![],
         }
     }
 }
@@ -106,7 +106,7 @@ impl ScalarUDFImpl for Range {
     }
 }
 
-make_udf_function!(
+make_udf_expr_and_func!(
     GenSeries,
     gen_series,
     start stop step,
@@ -131,7 +131,7 @@ impl GenSeries {
                 ],
                 Volatility::Immutable,
             ),
-            aliases: vec![String::from("generate_series")],
+            aliases: vec![],
         }
     }
 }
@@ -316,7 +316,13 @@ fn gen_range_date(args: &[ArrayRef], include_upper: bool) -> Result<ArrayRef> {
     for (idx, stop) in stop_array.iter().enumerate() {
         let mut stop = stop.unwrap_or(0);
         let start = start_array.as_ref().map(|x| x.value(idx)).unwrap_or(0);
-        let step = step_array.as_ref().map(|arr| arr.value(idx)).unwrap_or(1);
+        let step = step_array.as_ref().map(|arr| arr.value(idx)).unwrap_or(
+            IntervalMonthDayNano {
+                months: 0,
+                days: 0,
+                nanoseconds: 1,
+            },
+        );
         let (months, days, _) = IntervalMonthDayNanoType::to_parts(step);
         let neg = months < 0 || days < 0;
         if !include_upper {

@@ -24,17 +24,16 @@ use arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::DFSchema;
 use datafusion::error::Result;
+use datafusion::functions_aggregate::first_last::first_value_udaf;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
-use datafusion::physical_expr::{
-    analyze, create_physical_expr, AnalysisContext, ExprBoundaries, PhysicalExpr,
-};
+use datafusion::physical_expr::{analyze, AnalysisContext, ExprBoundaries};
 use datafusion::prelude::*;
 use datafusion_common::{ScalarValue, ToDFSchema};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr::BinaryExpr;
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::simplify::SimplifyContext;
-use datafusion_expr::{ColumnarValue, ExprSchemable, Operator};
+use datafusion_expr::{AggregateExt, ColumnarValue, ExprSchemable, Operator};
 
 /// This example demonstrates the DataFusion [`Expr`] API.
 ///
@@ -46,11 +45,12 @@ use datafusion_expr::{ColumnarValue, ExprSchemable, Operator};
 /// also comes with APIs for evaluation, simplification, and analysis.
 ///
 /// The code in this example shows how to:
-/// 1. Create [`Exprs`] using different APIs: [`main`]`
-/// 2. Evaluate [`Exprs`] against data: [`evaluate_demo`]
-/// 3. Simplify expressions: [`simplify_demo`]
-/// 4. Analyze predicates for boundary ranges: [`range_analysis_demo`]
-/// 5. Get the types of the expressions: [`expression_type_demo`]
+/// 1. Create [`Expr`]s using different APIs: [`main`]`
+/// 2. Use the fluent API to easly create complex [`Expr`]s:  [`expr_fn_demo`]
+/// 3. Evaluate [`Expr`]s against data: [`evaluate_demo`]
+/// 4. Simplify expressions: [`simplify_demo`]
+/// 5. Analyze predicates for boundary ranges: [`range_analysis_demo`]
+/// 6. Get the types of the expressions: [`expression_type_demo`]
 #[tokio::main]
 async fn main() -> Result<()> {
     // The easiest way to do create expressions is to use the
@@ -64,6 +64,9 @@ async fn main() -> Result<()> {
         Box::new(Expr::Literal(ScalarValue::Int32(Some(5)))),
     ));
     assert_eq!(expr, expr2);
+
+    // See how to build aggregate functions with the expr_fn API
+    expr_fn_demo()?;
 
     // See how to evaluate expressions
     evaluate_demo()?;
@@ -80,6 +83,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Datafusion's `expr_fn` API makes it easy to create [`Expr`]s for the
+/// full range of expression types such as aggregates and window functions.
+fn expr_fn_demo() -> Result<()> {
+    // Let's say you want to call the "first_value" aggregate function
+    let first_value = first_value_udaf();
+
+    // For example, to create the expression `FIRST_VALUE(price)`
+    // These expressions can be passed to `DataFrame::aggregate` and other
+    // APIs that take aggregate expressions.
+    let agg = first_value.call(vec![col("price")]);
+    assert_eq!(agg.to_string(), "first_value(price)");
+
+    // You can use the AggregateExt trait to create more complex aggregates
+    // such as `FIRST_VALUE(price FILTER quantity > 100 ORDER BY ts )
+    let agg = first_value
+        .call(vec![col("price")])
+        .order_by(vec![col("ts").sort(false, false)])
+        .filter(col("quantity").gt(lit(100)))
+        .build()?; // build the aggregate
+    assert_eq!(
+        agg.to_string(),
+        "first_value(price) FILTER (WHERE quantity > Int32(100)) ORDER BY [ts DESC NULLS LAST]"
+    );
+
+    Ok(())
+}
+
 /// DataFusion can also evaluate arbitrary expressions on Arrow arrays.
 fn evaluate_demo() -> Result<()> {
     // For example, let's say you have some integers in an array
@@ -92,7 +122,8 @@ fn evaluate_demo() -> Result<()> {
     let expr = col("a").lt(lit(5)).or(col("a").eq(lit(8)));
 
     // First, you make a "physical expression" from the logical `Expr`
-    let physical_expr = physical_expr(&batch.schema(), expr)?;
+    let df_schema = DFSchema::try_from(batch.schema())?;
+    let physical_expr = SessionContext::new().create_physical_expr(expr, &df_schema)?;
 
     // Now, you can evaluate the expression against the RecordBatch
     let result = physical_expr.evaluate(&batch)?;
@@ -213,7 +244,7 @@ fn range_analysis_demo() -> Result<()> {
     // `date < '2020-10-01' AND date > '2020-09-01'`
 
     // As always, we need to tell DataFusion the type of column "date"
-    let schema = Schema::new(vec![make_field("date", DataType::Date32)]);
+    let schema = Arc::new(Schema::new(vec![make_field("date", DataType::Date32)]));
 
     // You can provide DataFusion any known boundaries on the values of `date`
     // (for example, maybe you know you only have data up to `2020-09-15`), but
@@ -222,9 +253,13 @@ fn range_analysis_demo() -> Result<()> {
     let boundaries = ExprBoundaries::try_new_unbounded(&schema)?;
 
     // Now, we invoke the analysis code to perform the range analysis
-    let physical_expr = physical_expr(&schema, expr)?;
-    let analysis_result =
-        analyze(&physical_expr, AnalysisContext::new(boundaries), &schema)?;
+    let df_schema = DFSchema::try_from(schema)?;
+    let physical_expr = SessionContext::new().create_physical_expr(expr, &df_schema)?;
+    let analysis_result = analyze(
+        &physical_expr,
+        AnalysisContext::new(boundaries),
+        df_schema.as_ref(),
+    )?;
 
     // The results of the analysis is an range, encoded as an `Interval`,  for
     // each column in the schema, that must be true in order for the predicate
@@ -246,21 +281,6 @@ fn make_field(name: &str, data_type: DataType) -> Field {
 fn make_ts_field(name: &str) -> Field {
     let tz = None;
     make_field(name, DataType::Timestamp(TimeUnit::Nanosecond, tz))
-}
-
-/// Build a physical expression from a logical one, after applying simplification and type coercion
-pub fn physical_expr(schema: &Schema, expr: Expr) -> Result<Arc<dyn PhysicalExpr>> {
-    let df_schema = schema.clone().to_dfschema_ref()?;
-
-    // Simplify
-    let props = ExecutionProps::new();
-    let simplifier =
-        ExprSimplifier::new(SimplifyContext::new(&props).with_schema(df_schema.clone()));
-
-    // apply type coercion here to ensure types match
-    let expr = simplifier.coerce(expr, df_schema.clone())?;
-
-    create_physical_expr(&expr, df_schema.as_ref(), &props)
 }
 
 /// This function shows how to use `Expr::get_type` to retrieve the DataType

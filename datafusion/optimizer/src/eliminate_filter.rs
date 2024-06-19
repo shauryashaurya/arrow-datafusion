@@ -17,13 +17,12 @@
 
 //! [`EliminateFilter`] replaces `where false` or `where null` with an empty relation.
 
-use crate::optimizer::ApplyOrder;
-use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::{
-    logical_plan::{EmptyRelation, LogicalPlan},
-    Expr, Filter,
-};
+use datafusion_common::tree_node::Transformed;
+use datafusion_common::{internal_err, Result, ScalarValue};
+use datafusion_expr::logical_plan::tree_node::unwrap_arc;
+use datafusion_expr::{EmptyRelation, Expr, Filter, LogicalPlan};
 
+use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
 /// Optimization rule that eliminate the scalar value (true/false/null) filter
@@ -44,31 +43,10 @@ impl EliminateFilter {
 impl OptimizerRule for EliminateFilter {
     fn try_optimize(
         &self,
-        plan: &LogicalPlan,
+        _plan: &LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Option<LogicalPlan>> {
-        match plan {
-            LogicalPlan::Filter(Filter {
-                predicate: Expr::Literal(ScalarValue::Boolean(v)),
-                input,
-                ..
-            }) => {
-                match *v {
-                    // input also can be filter, apply again
-                    Some(true) => Ok(Some(
-                        self.try_optimize(input, _config)?
-                            .unwrap_or_else(|| input.as_ref().clone()),
-                    )),
-                    Some(false) | None => {
-                        Ok(Some(LogicalPlan::EmptyRelation(EmptyRelation {
-                            produce_one_row: false,
-                            schema: input.schema().clone(),
-                        })))
-                    }
-                }
-            }
-            _ => Ok(None),
-        }
+        internal_err!("Should have called EliminateFilter::rewrite")
     }
 
     fn name(&self) -> &str {
@@ -78,18 +56,47 @@ impl OptimizerRule for EliminateFilter {
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
     }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        match plan {
+            LogicalPlan::Filter(Filter {
+                predicate: Expr::Literal(ScalarValue::Boolean(v)),
+                input,
+                ..
+            }) => match v {
+                Some(true) => Ok(Transformed::yes(unwrap_arc(input))),
+                Some(false) | None => Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                    EmptyRelation {
+                        produce_one_row: false,
+                        schema: input.schema().clone(),
+                    },
+                ))),
+            },
+            _ => Ok(Transformed::no(plan)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::eliminate_filter::EliminateFilter;
-    use datafusion_common::{Result, ScalarValue};
-    use datafusion_expr::{
-        col, lit, logical_plan::builder::LogicalPlanBuilder, sum, Expr, LogicalPlan,
-    };
     use std::sync::Arc;
 
+    use datafusion_common::{Result, ScalarValue};
+    use datafusion_expr::{
+        col, lit, logical_plan::builder::LogicalPlanBuilder, Expr, LogicalPlan,
+    };
+
+    use crate::eliminate_filter::EliminateFilter;
     use crate::test::*;
+    use datafusion_expr::test::function_stub::sum;
 
     fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
         assert_optimized_plan_eq(Arc::new(EliminateFilter::new()), plan, expected)
@@ -142,7 +149,7 @@ mod tests {
         // Left side is removed
         let expected = "Union\
             \n  EmptyRelation\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+            \n  Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n    TableScan: test";
         assert_optimized_plan_equal(plan, expected)
     }
@@ -157,7 +164,7 @@ mod tests {
             .filter(filter_expr)?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+        let expected = "Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
         \n  TableScan: test";
         assert_optimized_plan_equal(plan, expected)
     }
@@ -178,9 +185,9 @@ mod tests {
 
         // Filter is removed
         let expected = "Union\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+            \n  Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n    TableScan: test\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+            \n  Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n    TableScan: test";
         assert_optimized_plan_equal(plan, expected)
     }
