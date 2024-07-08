@@ -32,7 +32,7 @@ use crate::{
 use arrow_array::cast::AsArray;
 use arrow_array::{new_empty_array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
-use datafusion_common::utils::{array_into_list_array, get_row_at_idx};
+use datafusion_common::utils::{array_into_list_array_nullable, get_row_at_idx};
 use datafusion_common::{exec_err, internal_err, Result, ScalarValue};
 use datafusion_expr::utils::AggregateOrderSensitivity;
 use datafusion_expr::Accumulator;
@@ -119,7 +119,7 @@ impl AggregateExpr for NthValueAgg {
 
     fn expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
         let n = Arc::new(Literal::new(ScalarValue::Int64(Some(self.n)))) as _;
-        vec![self.expr.clone(), n]
+        vec![Arc::clone(&self.expr), n]
     }
 
     fn order_bys(&self) -> Option<&[PhysicalSortExpr]> {
@@ -138,7 +138,7 @@ impl AggregateExpr for NthValueAgg {
         Some(Arc::new(Self {
             name: self.name.to_string(),
             input_data_type: self.input_data_type.clone(),
-            expr: self.expr.clone(),
+            expr: Arc::clone(&self.expr),
             // index should be from the opposite side
             n: -self.n,
             nullable: self.nullable,
@@ -393,7 +393,7 @@ impl NthValueAccumulator {
             None,
         )?;
 
-        Ok(ScalarValue::List(Arc::new(array_into_list_array(
+        Ok(ScalarValue::List(Arc::new(array_into_list_array_nullable(
             Arc::new(ordering_array),
         ))))
     }
@@ -401,7 +401,10 @@ impl NthValueAccumulator {
     fn evaluate_values(&self) -> ScalarValue {
         let mut values_cloned = self.values.clone();
         let values_slice = values_cloned.make_contiguous();
-        ScalarValue::List(ScalarValue::new_list(values_slice, &self.datatypes[0]))
+        ScalarValue::List(ScalarValue::new_list_nullable(
+            values_slice,
+            &self.datatypes[0],
+        ))
     }
 
     /// Updates state, with the `values`. Fetch contains missing number of entries for state to be complete
