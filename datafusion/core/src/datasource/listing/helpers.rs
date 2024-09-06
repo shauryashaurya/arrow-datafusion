@@ -18,13 +18,14 @@
 //! Helper functions for the table implementation
 
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
+use super::ListingTableUrl;
 use super::PartitionedFile;
-use crate::datasource::listing::ListingTableUrl;
 use crate::execution::context::SessionState;
-use crate::logical_expr::{BinaryExpr, Operator};
-use crate::{error::Result, scalar::ScalarValue};
+use datafusion_common::{Result, ScalarValue};
+use datafusion_expr::{BinaryExpr, Operator};
 
 use arrow::{
     array::{Array, ArrayRef, AsArray, StringBuilder},
@@ -49,13 +50,13 @@ use object_store::{ObjectMeta, ObjectStore};
 /// This means that if this function returns true:
 /// - the table provider can filter the table partition values with this expression
 /// - the expression can be marked as `TableProviderFilterPushDown::Exact` once this filtering
-/// was performed
-pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
+///   was performed
+pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
     let mut is_applicable = true;
     expr.apply(|expr| {
         match expr {
             Expr::Column(Column { ref name, .. }) => {
-                is_applicable &= col_names.contains(name);
+                is_applicable &= col_names.contains(&name.as_str());
                 if is_applicable {
                     Ok(TreeNodeRecursion::Jump)
                 } else {
@@ -101,11 +102,10 @@ pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
             }
 
             // TODO other expressions are not handled yet:
-            // - AGGREGATE, WINDOW and SORT should not end up in filter conditions, except maybe in some edge cases
+            // - AGGREGATE and WINDOW should not end up in filter conditions, except maybe in some edge cases
             // - Can `Wildcard` be considered as a `Literal`?
             // - ScalarVariable could be `applicable`, but that would require access to the context
             Expr::AggregateFunction { .. }
-            | Expr::Sort { .. }
             | Expr::WindowFunction { .. }
             | Expr::Wildcard { .. }
             | Expr::Unnest { .. }
@@ -138,10 +138,22 @@ pub fn split_files(
 
     // effectively this is div with rounding up instead of truncating
     let chunk_size = (partitioned_files.len() + n - 1) / n;
-    partitioned_files
-        .chunks(chunk_size)
-        .map(|c| c.to_vec())
-        .collect()
+    let mut chunks = Vec::with_capacity(n);
+    let mut current_chunk = Vec::with_capacity(chunk_size);
+    for file in partitioned_files.drain(..) {
+        current_chunk.push(file);
+        if current_chunk.len() == chunk_size {
+            let full_chunk =
+                mem::replace(&mut current_chunk, Vec::with_capacity(chunk_size));
+            chunks.push(full_chunk);
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk)
+    }
+
+    chunks
 }
 
 struct Partition {
@@ -269,7 +281,7 @@ async fn prune_partitions(
         Default::default(),
     )?;
 
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let batch = RecordBatch::try_new(schema, arrays)?;
 
     // TODO: Plumb this down
     let props = ExecutionProps::new();
@@ -505,8 +517,8 @@ mod tests {
 
     use futures::StreamExt;
 
-    use crate::logical_expr::{case, col, lit, Expr};
     use crate::test::object_store::make_test_store_and_state;
+    use datafusion_expr::{case, col, lit, Expr};
 
     use super::*;
 
@@ -733,33 +745,33 @@ mod tests {
     #[test]
     fn test_expr_applicable_for_cols() {
         assert!(expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c1"), lit("value"))
         ));
         assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c2"), lit("value"))
         ));
         assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c1"), col("c2"))
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &Expr::eq(col("c1"), col("c2"))
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &(Expr::eq(col("c1"), col("c2").alias("c2_alias"))).not()
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &(case(col("c1"))
                 .when(lit("v1"), lit(true))
                 .otherwise(lit(false))
                 .expect("valid case expr"))
         ));
-        // static expression not relvant in this context but we
+        // static expression not relevant in this context but we
         // test it as an edge case anyway in case we want to generalize
         // this helper function
         assert!(expr_applicable_for_cols(&[], &lit(true)));

@@ -31,7 +31,6 @@ use crate::datasource::{
 };
 use crate::error::Result;
 use crate::execution::context::{SessionConfig, SessionState};
-use crate::logical_expr::Expr;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::config::TableOptions;
@@ -41,6 +40,7 @@ use datafusion_common::{
 };
 
 use async_trait::async_trait;
+use datafusion_expr::SortExpr;
 
 /// Options that control the reading of CSV files.
 ///
@@ -59,10 +59,20 @@ pub struct CsvReadOptions<'a> {
     pub delimiter: u8,
     /// An optional quote character. Defaults to `b'"'`.
     pub quote: u8,
+    /// An optional terminator character. Defaults to None (CRLF).
+    pub terminator: Option<u8>,
     /// An optional escape character. Defaults to None.
     pub escape: Option<u8>,
     /// If enabled, lines beginning with this byte are ignored.
     pub comment: Option<u8>,
+    /// Specifies whether newlines in (quoted) values are supported.
+    ///
+    /// Parsing newlines in quoted values may be affected by execution behaviour such as
+    /// parallel file scanning. Setting this to `true` ensures that newlines in values are
+    /// parsed successfully, which may reduce performance.
+    ///
+    /// The default behaviour depends on the `datafusion.catalog.newlines_in_values` setting.
+    pub newlines_in_values: bool,
     /// An optional schema representing the CSV files. If None, CSV reader will try to infer it
     /// based on data in file.
     pub schema: Option<&'a Schema>,
@@ -76,7 +86,7 @@ pub struct CsvReadOptions<'a> {
     /// File compression type
     pub file_compression_type: FileCompressionType,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for CsvReadOptions<'a> {
@@ -94,7 +104,9 @@ impl<'a> CsvReadOptions<'a> {
             schema_infer_max_records: DEFAULT_SCHEMA_INFER_MAX_RECORD,
             delimiter: b',',
             quote: b'"',
+            terminator: None,
             escape: None,
+            newlines_in_values: false,
             file_extension: DEFAULT_CSV_EXTENSION,
             table_partition_cols: vec![],
             file_compression_type: FileCompressionType::UNCOMPRESSED,
@@ -127,9 +139,27 @@ impl<'a> CsvReadOptions<'a> {
         self
     }
 
+    /// Specify terminator to use for CSV read
+    pub fn terminator(mut self, terminator: Option<u8>) -> Self {
+        self.terminator = terminator;
+        self
+    }
+
     /// Specify delimiter to use for CSV read
     pub fn escape(mut self, escape: u8) -> Self {
         self.escape = Some(escape);
+        self
+    }
+
+    /// Specifies whether newlines in (quoted) values are supported.
+    ///
+    /// Parsing newlines in quoted values may be affected by execution behaviour such as
+    /// parallel file scanning. Setting this to `true` ensures that newlines in values are
+    /// parsed successfully, which may reduce performance.
+    ///
+    /// The default behaviour depends on the `datafusion.catalog.newlines_in_values` setting.
+    pub fn newlines_in_values(mut self, newlines_in_values: bool) -> Self {
+        self.newlines_in_values = newlines_in_values;
         self
     }
 
@@ -178,7 +208,7 @@ impl<'a> CsvReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
         self
     }
@@ -210,7 +240,7 @@ pub struct ParquetReadOptions<'a> {
     /// based on data in file.
     pub schema: Option<&'a Schema>,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for ParquetReadOptions<'a> {
@@ -257,7 +287,7 @@ impl<'a> ParquetReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
         self
     }
@@ -376,7 +406,7 @@ pub struct NdJsonReadOptions<'a> {
     /// Flag indicating whether this file may be unbounded (as in a FIFO file).
     pub infinite: bool,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for NdJsonReadOptions<'a> {
@@ -431,7 +461,7 @@ impl<'a> NdJsonReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
         self
     }
@@ -490,6 +520,8 @@ impl ReadOptions<'_> for CsvReadOptions<'_> {
             .with_delimiter(self.delimiter)
             .with_quote(self.quote)
             .with_escape(self.escape)
+            .with_terminator(self.terminator)
+            .with_newlines_in_values(self.newlines_in_values)
             .with_schema_infer_max_rec(self.schema_infer_max_records)
             .with_file_compression_type(self.file_compression_type.to_owned());
 

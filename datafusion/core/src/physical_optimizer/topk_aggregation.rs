@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use crate::physical_optimizer::PhysicalOptimizerRule;
 use crate::physical_plan::aggregates::AggregateExec;
 use crate::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use crate::physical_plan::filter::FilterExec;
@@ -34,6 +33,7 @@ use datafusion_common::Result;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalSortExpr;
 
+use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use itertools::Itertools;
 
 /// An optimizer rule that passes a `limit` hint to aggregations if the whole result is not needed
@@ -84,7 +84,7 @@ impl TopKAggregation {
         Some(Arc::new(new_aggr))
     }
 
-    fn transform_sort(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    fn transform_sort(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         let sort = plan.as_any().downcast_ref::<SortExec>()?;
 
         let children = sort.children();
@@ -142,13 +142,11 @@ impl PhysicalOptimizerRule for TopKAggregation {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if config.optimizer.enable_topk_aggregation {
             plan.transform_down(|plan| {
-                Ok(
-                    if let Some(plan) = TopKAggregation::transform_sort(plan.clone()) {
-                        Transformed::yes(plan)
-                    } else {
-                        Transformed::no(plan)
-                    },
-                )
+                Ok(if let Some(plan) = TopKAggregation::transform_sort(&plan) {
+                    Transformed::yes(plan)
+                } else {
+                    Transformed::no(plan)
+                })
             })
             .data()
         } else {

@@ -32,9 +32,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_common::{internal_err, DFSchema, DataFusionError, Result, ScalarValue};
-use datafusion_expr::expr::{
-    AggregateFunctionDefinition, InList, InSubquery, WindowFunction,
-};
+use datafusion_expr::expr::{InList, InSubquery, WindowFunction};
 use datafusion_expr::simplify::ExprSimplifyResult;
 use datafusion_expr::{
     and, lit, or, BinaryExpr, Case, ColumnarValue, Expr, Like, Operator, Volatility,
@@ -289,7 +287,7 @@ impl<S: SimplifyInfo> ExprSimplifier<S> {
         self
     }
 
-    /// Should [`Canonicalizer`] be applied before simplification?
+    /// Should `Canonicalizer` be applied before simplification?
     ///
     /// If true (the default), the expression will be rewritten to canonical
     /// form before simplification. This is useful to ensure that the simplifier
@@ -478,7 +476,7 @@ struct ConstEvaluator<'a> {
 #[allow(dead_code)]
 /// The simplify result of ConstEvaluator
 enum ConstSimplifyResult {
-    // Expr was simplifed and contains the new expression
+    // Expr was simplified and contains the new expression
     Simplified(ScalarValue),
     // Expr was not simplified and original value is returned
     NotSimplified(ScalarValue),
@@ -519,7 +517,7 @@ impl<'a> TreeNodeRewriter for ConstEvaluator<'a> {
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match self.can_evaluate.pop() {
             // Certain expressions such as `CASE` and `COALESCE` are short circuiting
-            // and may not evalute all their sub expressions. Thus if
+            // and may not evaluate all their sub expressions. Thus if
             // if any error is countered during simplification, return the original
             // so that normal evaluation can occur
             Some(true) => {
@@ -593,7 +591,6 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)
             | Expr::WindowFunction { .. }
-            | Expr::Sort { .. }
             | Expr::GroupingSet(_)
             | Expr::Wildcard { .. }
             | Expr::Placeholder(_) => false,
@@ -656,12 +653,35 @@ impl<'a> ConstEvaluator<'a> {
                 } else {
                     // Non-ListArray
                     match ScalarValue::try_from_array(&a, 0) {
-                        Ok(s) => ConstSimplifyResult::Simplified(s),
+                        Ok(s) => {
+                            // TODO: support the optimization for `Map` type after support impl hash for it
+                            if matches!(&s, ScalarValue::Map(_)) {
+                                ConstSimplifyResult::SimplifyRuntimeError(
+                                    DataFusionError::NotImplemented("Const evaluate for Map type is still not supported".to_string()),
+                                    expr,
+                                )
+                            } else {
+                                ConstSimplifyResult::Simplified(s)
+                            }
+                        }
                         Err(err) => ConstSimplifyResult::SimplifyRuntimeError(err, expr),
                     }
                 }
             }
-            ColumnarValue::Scalar(s) => ConstSimplifyResult::Simplified(s),
+            ColumnarValue::Scalar(s) => {
+                // TODO: support the optimization for `Map` type after support impl hash for it
+                if matches!(&s, ScalarValue::Map(_)) {
+                    ConstSimplifyResult::SimplifyRuntimeError(
+                        DataFusionError::NotImplemented(
+                            "Const evaluate for Map type is still not supported"
+                                .to_string(),
+                        ),
+                        expr,
+                    )
+                } else {
+                    ConstSimplifyResult::Simplified(s)
+                }
+            }
         }
     }
 }
@@ -710,7 +730,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: Eq,
                 right,
             }) if is_bool_lit(&left) && info.is_boolean_type(&right)? => {
-                Transformed::yes(match as_bool_lit(*left)? {
+                Transformed::yes(match as_bool_lit(&left)? {
                     Some(true) => *right,
                     Some(false) => Expr::Not(right),
                     None => lit_bool_null(),
@@ -724,7 +744,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: Eq,
                 right,
             }) if is_bool_lit(&right) && info.is_boolean_type(&left)? => {
-                Transformed::yes(match as_bool_lit(*right)? {
+                Transformed::yes(match as_bool_lit(&right)? {
                     Some(true) => *left,
                     Some(false) => Expr::Not(left),
                     None => lit_bool_null(),
@@ -741,7 +761,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: NotEq,
                 right,
             }) if is_bool_lit(&left) && info.is_boolean_type(&right)? => {
-                Transformed::yes(match as_bool_lit(*left)? {
+                Transformed::yes(match as_bool_lit(&left)? {
                     Some(true) => Expr::Not(right),
                     Some(false) => *right,
                     None => lit_bool_null(),
@@ -755,7 +775,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: NotEq,
                 right,
             }) if is_bool_lit(&right) && info.is_boolean_type(&left)? => {
-                Transformed::yes(match as_bool_lit(*right)? {
+                Transformed::yes(match as_bool_lit(&right)? {
                     Some(true) => Expr::Not(left),
                     Some(false) => *left,
                     None => lit_bool_null(),
@@ -796,7 +816,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: Or,
                 right,
             }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(Expr::Literal(ScalarValue::Boolean(Some(true))))
+                Transformed::yes(lit(true))
             }
             // !A OR A ---> true (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -804,7 +824,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: Or,
                 right,
             }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(Expr::Literal(ScalarValue::Boolean(Some(true))))
+                Transformed::yes(lit(true))
             }
             // (..A..) OR A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
@@ -869,7 +889,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: And,
                 right,
             }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(Expr::Literal(ScalarValue::Boolean(Some(false))))
+                Transformed::yes(lit(false))
             }
             // !A AND A ---> false (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -877,7 +897,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
                 op: And,
                 right,
             }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(Expr::Literal(ScalarValue::Boolean(Some(false))))
+                Transformed::yes(lit(false))
             }
             // (..A..) AND A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
@@ -1385,9 +1405,9 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             }
 
             Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
-                func_def: AggregateFunctionDefinition::UDF(ref udaf),
+                ref func,
                 ..
-            }) => match (udaf.simplify(), expr) {
+            }) => match (func.simplify(), expr) {
                 (Some(simplify_function), Expr::AggregateFunction(af)) => {
                     Transformed::yes(simplify_function(af, info)?)
                 }
@@ -1549,7 +1569,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             {
                 match (*left, *right) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_intersection(l1, l2, false).map(Transformed::yes);
+                        return inlist_intersection(l1, &l2, false).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1589,7 +1609,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             {
                 match (*left, *right) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_except(l1, l2).map(Transformed::yes);
+                        return inlist_except(l1, &l2).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1609,7 +1629,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             {
                 match (*left, *right) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_except(l2, l1).map(Transformed::yes);
+                        return inlist_except(l2, &l1).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1629,7 +1649,7 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             {
                 match (*left, *right) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_intersection(l1, l2, true).map(Transformed::yes);
+                        return inlist_intersection(l1, &l2, true).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1739,7 +1759,7 @@ fn inlist_union(mut l1: InList, l2: InList, negated: bool) -> Result<Expr> {
 
 /// Return the intersection of two inlist expressions
 /// maintaining the order of the elements in the two lists
-fn inlist_intersection(mut l1: InList, l2: InList, negated: bool) -> Result<Expr> {
+fn inlist_intersection(mut l1: InList, l2: &InList, negated: bool) -> Result<Expr> {
     let l2_items = l2.list.iter().collect::<HashSet<_>>();
 
     // remove all items from l1 that are not in l2
@@ -1755,7 +1775,7 @@ fn inlist_intersection(mut l1: InList, l2: InList, negated: bool) -> Result<Expr
 
 /// Return the all items in l1 that are not in l2
 /// maintaining the order of the elements in the two lists
-fn inlist_except(mut l1: InList, l2: InList) -> Result<Expr> {
+fn inlist_except(mut l1: InList, l2: &InList) -> Result<Expr> {
     let l2_items = l2.list.iter().collect::<HashSet<_>>();
 
     // keep only items from l1 that are not in l2
@@ -1807,8 +1827,9 @@ mod tests {
     fn basic_coercion() {
         let schema = test_schema();
         let props = ExecutionProps::new();
-        let simplifier =
-            ExprSimplifier::new(SimplifyContext::new(&props).with_schema(schema.clone()));
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::new(&props).with_schema(Arc::clone(&schema)),
+        );
 
         // Note expr type is int32 (not int64)
         // (1i64 + 2i32) < i
@@ -3340,15 +3361,15 @@ mod tests {
         assert_eq!(
             simplify(in_list(
                 col("c1"),
-                vec![scalar_subquery(subquery.clone())],
+                vec![scalar_subquery(Arc::clone(&subquery))],
                 false
             )),
-            in_subquery(col("c1"), subquery.clone())
+            in_subquery(col("c1"), Arc::clone(&subquery))
         );
         assert_eq!(
             simplify(in_list(
                 col("c1"),
-                vec![scalar_subquery(subquery.clone())],
+                vec![scalar_subquery(Arc::clone(&subquery))],
                 true
             )),
             not_in_subquery(col("c1"), subquery)
@@ -3385,32 +3406,32 @@ mod tests {
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], false).and(
             in_list(col("c1"), vec![lit(5), lit(6), lit(7), lit(8)], false),
         );
-        assert_eq!(simplify(expr.clone()), lit(false));
+        assert_eq!(simplify(expr), lit(false));
 
         // 2. c1 IN (1,2,3,4) AND c1 IN (4,5,6,7) -> c1 = 4
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], false).and(
             in_list(col("c1"), vec![lit(4), lit(5), lit(6), lit(7)], false),
         );
-        assert_eq!(simplify(expr.clone()), col("c1").eq(lit(4)));
+        assert_eq!(simplify(expr), col("c1").eq(lit(4)));
 
         // 3. c1 NOT IN (1, 2, 3, 4) OR c1 NOT IN (5, 6, 7, 8) -> true
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], true).or(
             in_list(col("c1"), vec![lit(5), lit(6), lit(7), lit(8)], true),
         );
-        assert_eq!(simplify(expr.clone()), lit(true));
+        assert_eq!(simplify(expr), lit(true));
 
         // 3.5 c1 NOT IN (1, 2, 3, 4) OR c1 NOT IN (4, 5, 6, 7) -> c1 != 4 (4 overlaps)
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], true).or(
             in_list(col("c1"), vec![lit(4), lit(5), lit(6), lit(7)], true),
         );
-        assert_eq!(simplify(expr.clone()), col("c1").not_eq(lit(4)));
+        assert_eq!(simplify(expr), col("c1").not_eq(lit(4)));
 
         // 4. c1 NOT IN (1,2,3,4) AND c1 NOT IN (4,5,6,7) -> c1 NOT IN (1,2,3,4,5,6,7)
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], true).and(
             in_list(col("c1"), vec![lit(4), lit(5), lit(6), lit(7)], true),
         );
         assert_eq!(
-            simplify(expr.clone()),
+            simplify(expr),
             in_list(
                 col("c1"),
                 vec![lit(1), lit(2), lit(3), lit(4), lit(5), lit(6), lit(7)],
@@ -3423,7 +3444,7 @@ mod tests {
             in_list(col("c1"), vec![lit(2), lit(3), lit(4), lit(5)], false),
         );
         assert_eq!(
-            simplify(expr.clone()),
+            simplify(expr),
             in_list(
                 col("c1"),
                 vec![lit(1), lit(2), lit(3), lit(4), lit(5)],
@@ -3437,7 +3458,7 @@ mod tests {
             vec![lit(1), lit(2), lit(3), lit(4), lit(5)],
             true,
         ));
-        assert_eq!(simplify(expr.clone()), lit(false));
+        assert_eq!(simplify(expr), lit(false));
 
         // 7. c1 NOT IN (1,2,3,4) AND c1 IN (1,2,3,4,5) -> c1 = 5
         let expr =
@@ -3446,14 +3467,14 @@ mod tests {
                 vec![lit(1), lit(2), lit(3), lit(4), lit(5)],
                 false,
             ));
-        assert_eq!(simplify(expr.clone()), col("c1").eq(lit(5)));
+        assert_eq!(simplify(expr), col("c1").eq(lit(5)));
 
         // 8. c1 IN (1,2,3,4) AND c1 NOT IN (5,6,7,8) -> c1 IN (1,2,3,4)
         let expr = in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], false).and(
             in_list(col("c1"), vec![lit(5), lit(6), lit(7), lit(8)], true),
         );
         assert_eq!(
-            simplify(expr.clone()),
+            simplify(expr),
             in_list(col("c1"), vec![lit(1), lit(2), lit(3), lit(4)], false)
         );
 
@@ -3471,7 +3492,7 @@ mod tests {
         ))
         .and(in_list(col("c1"), vec![lit(3), lit(6)], false));
         assert_eq!(
-            simplify(expr.clone()),
+            simplify(expr),
             col("c1").eq(lit(3)).or(col("c1").eq(lit(6)))
         );
 
@@ -3485,7 +3506,7 @@ mod tests {
                 ))
                 .and(in_list(col("c1"), vec![lit(8), lit(9), lit(10)], false)),
         );
-        assert_eq!(simplify(expr.clone()), col("c1").eq(lit(8)));
+        assert_eq!(simplify(expr), col("c1").eq(lit(8)));
 
         // Contains non-InList expression
         // c1 NOT IN (1,2,3,4) OR c1 != 5 OR c1 NOT IN (6,7,8,9) -> c1 NOT IN (1,2,3,4) OR c1 != 5 OR c1 NOT IN (6,7,8,9)
@@ -3600,7 +3621,7 @@ mod tests {
         let expr_x = col("c3").gt(lit(3_i64));
         let expr_y = (col("c4") + lit(2_u32)).lt(lit(10_u32));
         let expr_z = col("c1").in_list(vec![lit("a"), lit("b")], true);
-        let expr = expr_x.clone().and(expr_y.clone().or(expr_z));
+        let expr = expr_x.clone().and(expr_y.or(expr_z));
 
         // All guaranteed null
         let guarantees = vec![
@@ -3676,7 +3697,7 @@ mod tests {
             col("c4"),
             NullableInterval::from(ScalarValue::UInt32(Some(3))),
         )];
-        let output = simplify_with_guarantee(expr.clone(), guarantees);
+        let output = simplify_with_guarantee(expr, guarantees);
         assert_eq!(&output, &expr_x);
     }
 
@@ -3831,15 +3852,9 @@ mod tests {
         let udwf = WindowFunctionDefinition::WindowUDF(
             WindowUDF::new_from_impl(SimplifyMockUdwf::new_with_simplify()).into(),
         );
-        let window_function_expr =
-            Expr::WindowFunction(datafusion_expr::expr::WindowFunction::new(
-                udwf,
-                vec![],
-                vec![],
-                vec![],
-                WindowFrame::new(None),
-                None,
-            ));
+        let window_function_expr = Expr::WindowFunction(
+            datafusion_expr::expr::WindowFunction::new(udwf, vec![]),
+        );
 
         let expected = col("result_column");
         assert_eq!(simplify(window_function_expr), expected);
@@ -3847,15 +3862,9 @@ mod tests {
         let udwf = WindowFunctionDefinition::WindowUDF(
             WindowUDF::new_from_impl(SimplifyMockUdwf::new_without_simplify()).into(),
         );
-        let window_function_expr =
-            Expr::WindowFunction(datafusion_expr::expr::WindowFunction::new(
-                udwf,
-                vec![],
-                vec![],
-                vec![],
-                WindowFrame::new(None),
-                None,
-            ));
+        let window_function_expr = Expr::WindowFunction(
+            datafusion_expr::expr::WindowFunction::new(udwf, vec![]),
+        );
 
         let expected = window_function_expr.clone();
         assert_eq!(simplify(window_function_expr), expected);

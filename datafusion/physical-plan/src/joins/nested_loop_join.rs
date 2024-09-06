@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use super::utils::{asymmetric_join_output_partitioning, need_produce_result_in_final};
-use crate::coalesce_batches::concat_batches;
 use crate::coalesce_partitions::CoalescePartitionsExec;
 use crate::joins::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
@@ -41,13 +40,13 @@ use crate::{
     RecordBatchStream, SendableRecordBatchStream,
 };
 
-use arrow::array::{
-    BooleanBufferBuilder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
-};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{BooleanBufferBuilder, UInt32Array, UInt64Array};
+use arrow::compute::concat_batches;
+use arrow::datatypes::{Schema, SchemaRef, UInt64Type};
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use datafusion_common::{exec_err, JoinSide, Result, Statistics};
+use arrow_array::PrimitiveArray;
+use datafusion_common::{exec_datafusion_err, JoinSide, Result, Statistics};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::JoinType;
@@ -160,7 +159,7 @@ pub struct NestedLoopJoinExec {
 }
 
 impl NestedLoopJoinExec {
-    /// Try to create a nwe [`NestedLoopJoinExec`]
+    /// Try to create a new [`NestedLoopJoinExec`]
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -173,7 +172,8 @@ impl NestedLoopJoinExec {
         let (schema, column_indices) =
             build_join_schema(&left_schema, &right_schema, join_type);
         let schema = Arc::new(schema);
-        let cache = Self::compute_properties(&left, &right, schema.clone(), *join_type);
+        let cache =
+            Self::compute_properties(&left, &right, Arc::clone(&schema), *join_type);
 
         Ok(NestedLoopJoinExec {
             left,
@@ -287,8 +287,8 @@ impl ExecutionPlan for NestedLoopJoinExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(NestedLoopJoinExec::try_new(
-            children[0].clone(),
-            children[1].clone(),
+            Arc::clone(&children[0]),
+            Arc::clone(&children[1]),
             self.filter.clone(),
             &self.join_type,
         )?))
@@ -308,8 +308,8 @@ impl ExecutionPlan for NestedLoopJoinExec {
 
         let inner_table = self.inner_table.once(|| {
             collect_left_input(
-                self.left.clone(),
-                context.clone(),
+                Arc::clone(&self.left),
+                Arc::clone(&context),
                 join_metrics.clone(),
                 load_reservation,
                 need_produce_result_in_final(self.join_type),
@@ -319,7 +319,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
         let outer_table = self.right.execute(partition, context)?;
 
         Ok(Box::pin(NestedLoopJoinStream {
-            schema: self.schema.clone(),
+            schema: Arc::clone(&self.schema),
             filter: self.filter.clone(),
             join_type: self.join_type,
             outer_table,
@@ -336,8 +336,8 @@ impl ExecutionPlan for NestedLoopJoinExec {
 
     fn statistics(&self) -> Result<Statistics> {
         estimate_join_statistics(
-            self.left.clone(),
-            self.right.clone(),
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
             vec![],
             &self.join_type,
             &self.schema,
@@ -363,19 +363,17 @@ async fn collect_left_input(
     let stream = merge.execute(0, context)?;
 
     // Load all batches and count the rows
-    let (batches, num_rows, metrics, mut reservation) = stream
+    let (batches, metrics, mut reservation) = stream
         .try_fold(
-            (Vec::new(), 0usize, join_metrics, reservation),
+            (Vec::new(), join_metrics, reservation),
             |mut acc, batch| async {
                 let batch_size = batch.get_array_memory_size();
                 // Reserve memory for incoming batch
-                acc.3.try_grow(batch_size)?;
+                acc.2.try_grow(batch_size)?;
                 // Update metrics
-                acc.2.build_mem_used.add(batch_size);
-                acc.2.build_input_batches.add(1);
-                acc.2.build_input_rows.add(batch.num_rows());
-                // Update rowcount
-                acc.1 += batch.num_rows();
+                acc.1.build_mem_used.add(batch_size);
+                acc.1.build_input_batches.add(1);
+                acc.1.build_input_rows.add(batch.num_rows());
                 // Push batch to output
                 acc.0.push(batch);
                 Ok(acc)
@@ -383,7 +381,7 @@ async fn collect_left_input(
         )
         .await?;
 
-    let merged_batch = concat_batches(&schema, &batches, num_rows)?;
+    let merged_batch = concat_batches(&schema, &batches)?;
 
     // Reserve memory for visited_left_side bitmap if required by join type
     let visited_left_side = if with_visited_left_side {
@@ -563,62 +561,52 @@ fn join_left_and_right_batch(
     schema: &Schema,
     visited_left_side: &SharedBitmapBuilder,
 ) -> Result<RecordBatch> {
-    let indices_result = (0..left_batch.num_rows())
+    let indices = (0..left_batch.num_rows())
         .map(|left_row_index| {
             build_join_indices(left_row_index, right_batch, left_batch, filter)
         })
-        .collect::<Result<Vec<(UInt64Array, UInt32Array)>>>();
-
-    let mut left_indices_builder = UInt64Builder::new();
-    let mut right_indices_builder = UInt32Builder::new();
-    let left_right_indices = match indices_result {
-        Err(err) => {
-            exec_err!("Fail to build join indices in NestedLoopJoinExec, error:{err}")
-        }
-        Ok(indices) => {
-            for (left_side, right_side) in indices {
-                left_indices_builder
-                    .append_values(left_side.values(), &vec![true; left_side.len()]);
-                right_indices_builder
-                    .append_values(right_side.values(), &vec![true; right_side.len()]);
-            }
-            Ok((
-                left_indices_builder.finish(),
-                right_indices_builder.finish(),
-            ))
-        }
-    };
-    match left_right_indices {
-        Ok((left_side, right_side)) => {
-            // set the left bitmap
-            // and only full join need the left bitmap
-            if need_produce_result_in_final(join_type) {
-                let mut bitmap = visited_left_side.lock();
-                left_side.iter().flatten().for_each(|x| {
-                    bitmap.set_bit(x as usize, true);
-                });
-            }
-            // adjust the two side indices base on the join type
-            let (left_side, right_side) = adjust_indices_by_join_type(
-                left_side,
-                right_side,
-                0..right_batch.num_rows(),
-                join_type,
-                false,
-            );
-
-            build_batch_from_indices(
-                schema,
-                left_batch,
-                right_batch,
-                &left_side,
-                &right_side,
-                column_indices,
-                JoinSide::Left,
+        .collect::<Result<Vec<(UInt64Array, UInt32Array)>>>()
+        .map_err(|e| {
+            exec_datafusion_err!(
+                "Fail to build join indices in NestedLoopJoinExec, error:{e}"
             )
-        }
-        Err(e) => Err(e),
+        })?;
+
+    let mut left_indices_builder: Vec<u64> = vec![];
+    let mut right_indices_builder: Vec<u32> = vec![];
+    for (left_side, right_side) in indices {
+        left_indices_builder.extend(left_side.values());
+        right_indices_builder.extend(right_side.values());
     }
+
+    let left_side: PrimitiveArray<UInt64Type> = left_indices_builder.into();
+    let right_side = right_indices_builder.into();
+    // set the left bitmap
+    // and only full join need the left bitmap
+    if need_produce_result_in_final(join_type) {
+        let mut bitmap = visited_left_side.lock();
+        left_side.values().iter().for_each(|x| {
+            bitmap.set_bit(*x as usize, true);
+        });
+    }
+    // adjust the two side indices base on the join type
+    let (left_side, right_side) = adjust_indices_by_join_type(
+        left_side,
+        right_side,
+        0..right_batch.num_rows(),
+        join_type,
+        false,
+    );
+
+    build_batch_from_indices(
+        schema,
+        left_batch,
+        right_batch,
+        &left_side,
+        &right_side,
+        column_indices,
+        JoinSide::Left,
+    )
 }
 
 fn get_final_indices_from_shared_bitmap(
@@ -642,7 +630,7 @@ impl Stream for NestedLoopJoinStream {
 
 impl RecordBatchStream for NestedLoopJoinStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -656,7 +644,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::{assert_batches_sorted_eq, assert_contains, ScalarValue};
-    use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
     use datafusion_physical_expr::{Partitioning, PhysicalExpr};
@@ -752,7 +740,7 @@ mod tests {
         let columns = columns(&nested_loop_join.schema());
         let mut batches = vec![];
         for i in 0..partition_count {
-            let stream = nested_loop_join.execute(i, context.clone())?;
+            let stream = nested_loop_join.execute(i, Arc::clone(&context))?;
             let more_batches = common::collect(stream).await?;
             batches.extend(
                 more_batches
@@ -1031,14 +1019,15 @@ mod tests {
         ];
 
         for join_type in join_types {
-            let runtime_config = RuntimeConfig::new().with_memory_limit(100, 1.0);
-            let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_limit(100, 1.0)
+                .build_arc()?;
             let task_ctx = TaskContext::default().with_runtime(runtime);
             let task_ctx = Arc::new(task_ctx);
 
             let err = multi_partitioned_join_collect(
-                left.clone(),
-                right.clone(),
+                Arc::clone(&left),
+                Arc::clone(&right),
                 &join_type,
                 Some(filter.clone()),
                 task_ctx,
@@ -1048,9 +1037,8 @@ mod tests {
 
             assert_contains!(
                 err.to_string(),
-                "External error: Resources exhausted: Failed to allocate additional"
+                "External error: Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: NestedLoopJoinLoad[0]"
             );
-            assert_contains!(err.to_string(), "NestedLoopJoinLoad[0]");
         }
 
         Ok(())

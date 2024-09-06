@@ -42,6 +42,8 @@ use datafusion_execution::TaskContext;
 use datafusion_physical_plan::metrics::MetricsSet;
 
 use async_trait::async_trait;
+use datafusion_catalog::Session;
+use datafusion_expr::SortExpr;
 use futures::StreamExt;
 use log::debug;
 use parking_lot::Mutex;
@@ -63,7 +65,7 @@ pub struct MemTable {
     column_defaults: HashMap<String, Expr>,
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     /// inserting data into this table removes the order
-    pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
+    pub sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
 }
 
 impl MemTable {
@@ -117,7 +119,7 @@ impl MemTable {
     ///
     /// Note that multiple sort orders are supported, if some are known to be
     /// equivalent,
-    pub fn with_sort_order(self, mut sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn with_sort_order(self, mut sort_order: Vec<Vec<SortExpr>>) -> Self {
         std::mem::swap(self.sort_order.lock().as_mut(), &mut sort_order);
         self
     }
@@ -206,7 +208,7 @@ impl TableProvider for MemTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -258,7 +260,7 @@ impl TableProvider for MemTable {
     /// * A plan that returns the number of rows written.
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -644,7 +646,7 @@ mod tests {
         Ok(partitions)
     }
 
-    /// Returns the value of results. For example, returns 6 given the follwing
+    /// Returns the value of results. For example, returns 6 given the following
     ///
     /// ```text
     /// +-------+,

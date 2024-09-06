@@ -30,7 +30,9 @@ mod properties;
 pub use class::{ConstExpr, EquivalenceClass, EquivalenceGroup};
 pub use ordering::OrderingEquivalenceClass;
 pub use projection::ProjectionMapping;
-pub use properties::{join_equivalence_properties, EquivalenceProperties};
+pub use properties::{
+    calculate_union, join_equivalence_properties, EquivalenceProperties,
+};
 
 /// This function constructs a duplicate-free `LexOrderingReq` by filtering out
 /// duplicate entries that have same physical expression inside. For example,
@@ -237,7 +239,7 @@ mod tests {
     // Convert each tuple to PhysicalSortRequirement
     pub fn convert_to_sort_reqs(
         in_data: &[(&Arc<dyn PhysicalExpr>, Option<SortOptions>)],
-    ) -> Vec<PhysicalSortRequirement> {
+    ) -> LexRequirement {
         in_data
             .iter()
             .map(|(expr, options)| {

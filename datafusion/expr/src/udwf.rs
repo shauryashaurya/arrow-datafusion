@@ -17,16 +17,22 @@
 
 //! [`WindowUDF`]: User Defined Window Functions
 
-use crate::{
-    function::WindowFunctionSimplification, Expr, PartitionEvaluator,
-    PartitionEvaluatorFactory, ReturnTypeFunction, Signature, WindowFrame,
-};
-use arrow::datatypes::DataType;
-use datafusion_common::Result;
+use arrow::compute::SortOptions;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{
     any::Any,
     fmt::{self, Debug, Display, Formatter},
     sync::Arc,
+};
+
+use arrow::datatypes::DataType;
+
+use datafusion_common::{not_impl_err, Result};
+
+use crate::expr::WindowFunction;
+use crate::{
+    function::WindowFunctionSimplification, Expr, PartitionEvaluator,
+    PartitionEvaluatorFactory, ReturnTypeFunction, Signature,
 };
 
 /// Logical representation of a user-defined window function (UDWF)
@@ -35,10 +41,10 @@ use std::{
 /// See the documentation on [`PartitionEvaluator`] for more details
 ///
 /// 1. For simple use cases, use [`create_udwf`] (examples in
-/// [`simple_udwf.rs`]).
+///    [`simple_udwf.rs`]).
 ///
 /// 2. For advanced use cases, use [`WindowUDFImpl`] which provides full API
-/// access (examples in [`advanced_udwf.rs`]).
+///    access (examples in [`advanced_udwf.rs`]).
 ///
 /// # API Note
 /// This is a separate struct from `WindowUDFImpl` to maintain backwards
@@ -62,16 +68,15 @@ impl Display for WindowUDF {
 
 impl PartialEq for WindowUDF {
     fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name() && self.signature() == other.signature()
+        self.inner.equals(other.inner.as_ref())
     }
 }
 
 impl Eq for WindowUDF {}
 
-impl std::hash::Hash for WindowUDF {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name().hash(state);
-        self.signature().hash(state);
+impl Hash for WindowUDF {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash_value().hash(state)
     }
 }
 
@@ -120,28 +125,19 @@ impl WindowUDF {
         Self::new_from_impl(AliasedWindowUDFImpl::new(Arc::clone(&self.inner), aliases))
     }
 
-    /// creates a [`Expr`] that calls the window function given
-    /// the `partition_by`, `order_by`, and `window_frame` definition
+    /// creates a [`Expr`] that calls the window function with default
+    /// values for `order_by`, `partition_by`, `window_frame`.
     ///
-    /// This utility allows using the UDWF without requiring access to
-    /// the registry, such as with the DataFrame API.
-    pub fn call(
-        &self,
-        args: Vec<Expr>,
-        partition_by: Vec<Expr>,
-        order_by: Vec<Expr>,
-        window_frame: WindowFrame,
-    ) -> Expr {
+    /// See [`ExprFunctionExt`] for details on setting these values.
+    ///
+    /// This utility allows using a user defined window function without
+    /// requiring access to the registry, such as with the DataFrame API.
+    ///
+    /// [`ExprFunctionExt`]: crate::expr_fn::ExprFunctionExt
+    pub fn call(&self, args: Vec<Expr>) -> Expr {
         let fun = crate::WindowFunctionDefinition::WindowUDF(Arc::new(self.clone()));
 
-        Expr::WindowFunction(crate::expr::WindowFunction {
-            fun,
-            args,
-            partition_by,
-            order_by,
-            window_frame,
-            null_treatment: None,
-        })
+        Expr::WindowFunction(WindowFunction::new(fun, args))
     }
 
     /// Returns this function's name
@@ -181,6 +177,26 @@ impl WindowUDF {
     pub fn partition_evaluator_factory(&self) -> Result<Box<dyn PartitionEvaluator>> {
         self.inner.partition_evaluator()
     }
+
+    /// Returns if column values are nullable for this window function.
+    ///
+    /// See [`WindowUDFImpl::nullable`] for more details.
+    pub fn nullable(&self) -> bool {
+        self.inner.nullable()
+    }
+
+    /// Returns custom result ordering introduced by this window function
+    /// which is used to update ordering equivalences.
+    ///
+    /// See [`WindowUDFImpl::sort_options`] for more details.
+    pub fn sort_options(&self) -> Option<SortOptions> {
+        self.inner.sort_options()
+    }
+
+    /// See [`WindowUDFImpl::coerce_types`] for more details.
+    pub fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        self.inner.coerce_types(arg_types)
+    }
 }
 
 impl<F> From<F> for WindowUDF
@@ -207,12 +223,12 @@ where
 /// # use std::any::Any;
 /// # use arrow::datatypes::DataType;
 /// # use datafusion_common::{DataFusionError, plan_err, Result};
-/// # use datafusion_expr::{col, Signature, Volatility, PartitionEvaluator, WindowFrame};
+/// # use datafusion_expr::{col, Signature, Volatility, PartitionEvaluator, WindowFrame, ExprFunctionExt};
 /// # use datafusion_expr::{WindowUDFImpl, WindowUDF};
 /// #[derive(Debug, Clone)]
 /// struct SmoothIt {
 ///   signature: Signature
-/// };
+/// }
 ///
 /// impl SmoothIt {
 ///   fn new() -> Self {
@@ -241,14 +257,18 @@ where
 /// let smooth_it = WindowUDF::from(SmoothIt::new());
 ///
 /// // Call the function `add_one(col)`
-/// let expr = smooth_it.call(
-///     vec![col("speed")],                 // smooth_it(speed)
-///     vec![col("car")],                   // PARTITION BY car
-///     vec![col("time").sort(true, true)], // ORDER BY time ASC
-///     WindowFrame::new(None),
-/// );
+/// // smooth_it(speed) OVER (PARTITION BY car ORDER BY time ASC)
+/// let expr = smooth_it.call(vec![col("speed")])
+///     .partition_by(vec![col("car")])
+///     .order_by(vec![col("time").sort(true, true)])
+///     .window_frame(WindowFrame::new(None))
+///     .build()
+///     .unwrap();
 /// ```
 pub trait WindowUDFImpl: Debug + Send + Sync {
+    // Note: When adding any methods (with default implementations), remember to add them also
+    // into the AliasedWindowUDFImpl below!
+
     /// Returns this object as an [`Any`] trait object
     fn as_any(&self) -> &dyn Any;
 
@@ -296,6 +316,74 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     fn simplify(&self) -> Option<WindowFunctionSimplification> {
         None
     }
+
+    /// Return true if this window UDF is equal to the other.
+    ///
+    /// Allows customizing the equality of window UDFs.
+    /// Must be consistent with [`Self::hash_value`] and follow the same rules as [`Eq`]:
+    ///
+    /// - reflexive: `a.equals(a)`;
+    /// - symmetric: `a.equals(b)` implies `b.equals(a)`;
+    /// - transitive: `a.equals(b)` and `b.equals(c)` implies `a.equals(c)`.
+    ///
+    /// By default, compares [`Self::name`] and [`Self::signature`].
+    fn equals(&self, other: &dyn WindowUDFImpl) -> bool {
+        self.name() == other.name() && self.signature() == other.signature()
+    }
+
+    /// Returns a hash value for this window UDF.
+    ///
+    /// Allows customizing the hash code of window UDFs. Similarly to [`Hash`] and [`Eq`],
+    /// if [`Self::equals`] returns true for two UDFs, their `hash_value`s must be the same.
+    ///
+    /// By default, hashes [`Self::name`] and [`Self::signature`].
+    fn hash_value(&self) -> u64 {
+        let hasher = &mut DefaultHasher::new();
+        self.name().hash(hasher);
+        self.signature().hash(hasher);
+        hasher.finish()
+    }
+
+    /// Allows customizing nullable of column for this window UDF.
+    ///
+    /// By default, the final result of evaluating the window UDF is
+    /// allowed to have null values. But if that is not the case then
+    /// it can be customized in the window UDF implementation.
+    fn nullable(&self) -> bool {
+        true
+    }
+
+    /// Allows the window UDF to define a custom result ordering.
+    ///
+    /// By default, a window UDF doesn't introduce an ordering.
+    /// But when specified by a window UDF this is used to update
+    /// ordering equivalences.
+    fn sort_options(&self) -> Option<SortOptions> {
+        None
+    }
+
+    /// Coerce arguments of a function call to types that the function can evaluate.
+    ///
+    /// This function is only called if [`WindowUDFImpl::signature`] returns [`crate::TypeSignature::UserDefined`]. Most
+    /// UDWFs should return one of the other variants of `TypeSignature` which handle common
+    /// cases
+    ///
+    /// See the [type coercion module](crate::type_coercion)
+    /// documentation for more details on type coercion
+    ///
+    /// For example, if your function requires a floating point arguments, but the user calls
+    /// it like `my_func(1::int)` (aka with `1` as an integer), coerce_types could return `[DataType::Float64]`
+    /// to ensure the argument was cast to `1::double`
+    ///
+    /// # Parameters
+    /// * `arg_types`: The argument types of the arguments  this function with
+    ///
+    /// # Return value
+    /// A Vec the same length as `arg_types`. DataFusion will `CAST` the function call
+    /// arguments to these specific types.
+    fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        not_impl_err!("Function {} does not implement coerce_types", self.name())
+    }
 }
 
 /// WindowUDF that adds an alias to the underlying function. It is better to
@@ -341,6 +429,37 @@ impl WindowUDFImpl for AliasedWindowUDFImpl {
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn simplify(&self) -> Option<WindowFunctionSimplification> {
+        self.inner.simplify()
+    }
+
+    fn equals(&self, other: &dyn WindowUDFImpl) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<AliasedWindowUDFImpl>() {
+            self.inner.equals(other.inner.as_ref()) && self.aliases == other.aliases
+        } else {
+            false
+        }
+    }
+
+    fn hash_value(&self) -> u64 {
+        let hasher = &mut DefaultHasher::new();
+        self.inner.hash_value().hash(hasher);
+        self.aliases.hash(hasher);
+        hasher.finish()
+    }
+
+    fn nullable(&self) -> bool {
+        self.inner.nullable()
+    }
+
+    fn sort_options(&self) -> Option<SortOptions> {
+        self.inner.sort_options()
+    }
+
+    fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
+        self.inner.coerce_types(arg_types)
     }
 }
 

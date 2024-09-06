@@ -46,18 +46,20 @@ use datafusion_common::config::{ConfigField, ConfigFileType, JsonOptions};
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
 use datafusion_common::{not_impl_err, GetExt, DEFAULT_JSON_EXTENSION};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::ExecutionPlan;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
 #[derive(Default)]
 /// Factory struct used to create [JsonFormat]
 pub struct JsonFormatFactory {
-    options: Option<JsonOptions>,
+    /// the options carried by format factory
+    pub options: Option<JsonOptions>,
 }
 
 impl JsonFormatFactory {
@@ -102,12 +104,24 @@ impl FileFormatFactory for JsonFormatFactory {
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(JsonFormat::default())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl GetExt for JsonFormatFactory {
     fn get_ext(&self) -> String {
         // Removes the dot, i.e. ".parquet" -> "parquet"
         DEFAULT_JSON_EXTENSION[1..].to_string()
+    }
+}
+
+impl fmt::Debug for JsonFormatFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JsonFormatFactory")
+            .field("options", &self.options)
+            .finish()
     }
 }
 
@@ -236,7 +250,7 @@ impl FileFormat for JsonFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for Json");

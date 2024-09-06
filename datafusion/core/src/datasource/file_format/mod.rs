@@ -42,18 +42,21 @@ use crate::error::Result;
 use crate::execution::context::SessionState;
 use crate::physical_plan::{ExecutionPlan, Statistics};
 
+use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{internal_err, not_impl_err, GetExt};
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_physical_expr::PhysicalExpr;
 
 use async_trait::async_trait;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use file_compression_type::FileCompressionType;
 use object_store::{ObjectMeta, ObjectStore};
+use std::fmt::Debug;
 
 /// Factory for creating [`FileFormat`] instances based on session and command level options
 ///
 /// Users can provide their own `FileFormatFactory` to support arbitrary file formats
-pub trait FileFormatFactory: Sync + Send + GetExt {
+pub trait FileFormatFactory: Sync + Send + GetExt + Debug {
     /// Initialize a [FileFormat] and configure based on session and command level options
     fn create(
         &self,
@@ -63,13 +66,17 @@ pub trait FileFormatFactory: Sync + Send + GetExt {
 
     /// Initialize a [FileFormat] with all options set to default values
     fn default(&self) -> Arc<dyn FileFormat>;
+
+    /// Returns the table source as [`Any`] so that it can be
+    /// downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// This trait abstracts all the file format specific implementations
 /// from the [`TableProvider`]. This helps code re-utilization across
 /// providers that support the same file formats.
 ///
-/// [`TableProvider`]: crate::datasource::provider::TableProvider
+/// [`TableProvider`]: crate::catalog::TableProvider
 #[async_trait]
 pub trait FileFormat: Send + Sync + fmt::Debug {
     /// Returns the table provider as [`Any`](std::any::Any) so that it can be
@@ -127,7 +134,7 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         _input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         _conf: FileSinkConfig,
-        _order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        _order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!("Writer not implemented for this format")
     }
@@ -138,6 +145,7 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
 /// The former trait is a superset of the latter trait, which includes execution time
 /// relevant methods. [FileType] is only used in logical planning and only implements
 /// the subset of methods required during logical planning.
+#[derive(Debug)]
 pub struct DefaultFileType {
     file_format_factory: Arc<dyn FileFormatFactory>,
 }
@@ -149,6 +157,11 @@ impl DefaultFileType {
             file_format_factory,
         }
     }
+
+    /// get a reference to the inner [FileFormatFactory] struct
+    pub fn as_format_factory(&self) -> &Arc<dyn FileFormatFactory> {
+        &self.file_format_factory
+    }
 }
 
 impl FileType for DefaultFileType {
@@ -159,7 +172,7 @@ impl FileType for DefaultFileType {
 
 impl Display for DefaultFileType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.file_format_factory.default().fmt(f)
+        write!(f, "{:?}", self.file_format_factory)
     }
 }
 
@@ -192,6 +205,28 @@ pub fn file_type_to_format(
         Some(source) => Ok(source.file_format_factory.clone()),
         _ => internal_err!("FileType was not DefaultFileType"),
     }
+}
+
+/// Transform a schema to use view types for Utf8 and Binary
+pub fn transform_schema_to_view(schema: &Schema) -> Schema {
+    let transformed_fields: Vec<Arc<Field>> = schema
+        .fields
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => Arc::new(Field::new(
+                field.name(),
+                DataType::Utf8View,
+                field.is_nullable(),
+            )),
+            DataType::Binary | DataType::LargeBinary => Arc::new(Field::new(
+                field.name(),
+                DataType::BinaryView,
+                field.is_nullable(),
+            )),
+            _ => field.clone(),
+        })
+        .collect();
+    Schema::new_with_metadata(transformed_fields, schema.metadata.clone())
 }
 
 #[cfg(test)]

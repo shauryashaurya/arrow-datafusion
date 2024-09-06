@@ -24,17 +24,17 @@ use crate::{
     config::SessionConfig,
     memory_pool::MemoryPool,
     registry::FunctionRegistry,
-    runtime_env::{RuntimeConfig, RuntimeEnv},
+    runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
 use datafusion_common::{plan_datafusion_err, DataFusionError, Result};
-use datafusion_expr::planner::UserDefinedSQLPlanner;
+use datafusion_expr::planner::ExprPlanner;
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 
 /// Task Execution Context
 ///
-/// A [`TaskContext`] contains the state required during a single
-/// query's execution. Please see [`SessionContext`] for a user level
-/// multi-query API.
+/// A [`TaskContext`] contains the state required during a single query's
+/// execution. Please see the documentation on [`SessionContext`] for more
+/// information.
 ///
 /// [`SessionContext`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
 #[derive(Debug)]
@@ -57,7 +57,8 @@ pub struct TaskContext {
 
 impl Default for TaskContext {
     fn default() -> Self {
-        let runtime = RuntimeEnv::new(RuntimeConfig::new())
+        let runtime = RuntimeEnvBuilder::new()
+            .build_arc()
             .expect("default runtime created successfully");
 
         // Create a default task context, mostly useful for testing
@@ -68,7 +69,7 @@ impl Default for TaskContext {
             scalar_functions: HashMap::new(),
             aggregate_functions: HashMap::new(),
             window_functions: HashMap::new(),
-            runtime: Arc::new(runtime),
+            runtime,
         }
     }
 }
@@ -192,7 +193,7 @@ impl FunctionRegistry for TaskContext {
         Ok(self.scalar_functions.insert(udf.name().into(), udf))
     }
 
-    fn expr_planners(&self) -> Vec<Arc<dyn UserDefinedSQLPlanner>> {
+    fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {
         vec![]
     }
 }

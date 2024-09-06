@@ -20,8 +20,7 @@ use std::sync::{Arc, Weak};
 
 use crate::object_storage::{get_object_store, AwsOptions, GcpOptions};
 
-use datafusion::catalog::schema::SchemaProvider;
-use datafusion::catalog::{CatalogProvider, CatalogProviderList};
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::common::plan_datafusion_err;
 use datafusion::datasource::listing::{
     ListingTable, ListingTableConfig, ListingTableUrl,
@@ -29,6 +28,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::session_state::SessionStateBuilder;
 
 use async_trait::async_trait;
 use dirs::home_dir;
@@ -162,6 +162,7 @@ impl SchemaProvider for DynamicFileSchemaProvider {
             .ok_or_else(|| plan_datafusion_err!("locking error"))?
             .read()
             .clone();
+        let mut builder = SessionStateBuilder::from(state.clone());
         let optimized_name = substitute_tilde(name.to_owned());
         let table_url = ListingTableUrl::parse(optimized_name.as_str())?;
         let scheme = table_url.scheme();
@@ -178,13 +179,18 @@ impl SchemaProvider for DynamicFileSchemaProvider {
                 // to any command options so the only choice is to use an empty collection
                 match scheme {
                     "s3" | "oss" | "cos" => {
-                        state = state.add_table_options_extension(AwsOptions::default());
+                        if let Some(table_options) = builder.table_options() {
+                            table_options.extensions.insert(AwsOptions::default())
+                        }
                     }
                     "gs" | "gcs" => {
-                        state = state.add_table_options_extension(GcpOptions::default())
+                        if let Some(table_options) = builder.table_options() {
+                            table_options.extensions.insert(GcpOptions::default())
+                        }
                     }
                     _ => {}
                 };
+                state = builder.build();
                 let store = get_object_store(
                     &state,
                     table_url.scheme(),
@@ -230,11 +236,11 @@ fn substitute_tilde(cur: String) -> String {
 mod tests {
     use super::*;
 
-    use datafusion::catalog::schema::SchemaProvider;
+    use datafusion::catalog::SchemaProvider;
     use datafusion::prelude::SessionContext;
 
     fn setup_context() -> (SessionContext, Arc<dyn SchemaProvider>) {
-        let mut ctx = SessionContext::new();
+        let ctx = SessionContext::new();
         ctx.register_catalog_list(Arc::new(DynamicFileCatalog::new(
             ctx.state().catalog_list().clone(),
             ctx.state_weak_ref(),

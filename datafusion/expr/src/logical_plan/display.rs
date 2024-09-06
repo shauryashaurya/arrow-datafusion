@@ -338,9 +338,9 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                let elipse = if values.len() > 5 { "..." } else { "" };
+                let eclipse = if values.len() > 5 { "..." } else { "" };
 
-                let values_str = format!("{}{}", str_values, elipse);
+                let values_str = format!("{}{}", str_values, eclipse);
                 json!({
                     "Node Type": "Values",
                     "Values": values_str
@@ -387,19 +387,16 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     }
 
                     if !full_filter.is_empty() {
-                        object["Full Filters"] = serde_json::Value::String(
-                            expr_vec_fmt!(full_filter).to_string(),
-                        );
+                        object["Full Filters"] =
+                            serde_json::Value::String(expr_vec_fmt!(full_filter));
                     };
                     if !partial_filter.is_empty() {
-                        object["Partial Filters"] = serde_json::Value::String(
-                            expr_vec_fmt!(partial_filter).to_string(),
-                        );
+                        object["Partial Filters"] =
+                            serde_json::Value::String(expr_vec_fmt!(partial_filter));
                     }
                     if !unsupported_filters.is_empty() {
-                        object["Unsupported Filters"] = serde_json::Value::String(
-                            expr_vec_fmt!(unsupported_filters).to_string(),
-                        );
+                        object["Unsupported Filters"] =
+                            serde_json::Value::String(expr_vec_fmt!(unsupported_filters));
                     }
                 }
 
@@ -595,9 +592,8 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                         "Select": expr_vec_fmt!(select_expr),
                     });
                     if let Some(sort_expr) = sort_expr {
-                        object["Sort"] = serde_json::Value::String(
-                            expr_vec_fmt!(sort_expr).to_string(),
-                        );
+                        object["Sort"] =
+                            serde_json::Value::String(expr_vec_fmt!(sort_expr));
                     }
 
                     object

@@ -21,12 +21,12 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::expr::{Alias, Sort, WindowFunction};
+use crate::expr::{Alias, Sort, WildcardOptions, WindowFunction};
 use crate::expr_rewriter::strip_outer_reference;
-use crate::signature::{Signature, TypeSignature};
 use crate::{
     and, BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator,
 };
+use datafusion_expr_common::signature::{Signature, TypeSignature};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion_common::tree_node::{
@@ -34,15 +34,17 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::utils::get_at_indices;
 use datafusion_common::{
-    internal_err, plan_datafusion_err, plan_err, Column, DFSchema, DFSchemaRef, Result,
-    ScalarValue, TableReference,
+    internal_err, plan_datafusion_err, plan_err, Column, DFSchema, DFSchemaRef,
+    DataFusionError, Result, TableReference,
 };
 
-use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem, WildcardAdditionalOptions};
+use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem};
+
+pub use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
 
 ///  The value to which `COUNT(*)` is expanded to in
 ///  `COUNT(<constant>)` expressions
-pub const COUNT_STAR_EXPANSION: ScalarValue = ScalarValue::Int64(Some(1));
+pub use datafusion_common::utils::expr::COUNT_STAR_EXPANSION;
 
 /// Recursively walk a list of expression trees, collecting the unique set of columns
 /// referenced in the expression
@@ -294,7 +296,6 @@ pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
             | Expr::Case { .. }
             | Expr::Cast { .. }
             | Expr::TryCast { .. }
-            | Expr::Sort { .. }
             | Expr::ScalarFunction(..)
             | Expr::WindowFunction { .. }
             | Expr::AggregateFunction { .. }
@@ -375,7 +376,7 @@ fn get_exprs_except_skipped(
 pub fn expand_wildcard(
     schema: &DFSchema,
     plan: &LogicalPlan,
-    wildcard_options: Option<&WildcardAdditionalOptions>,
+    wildcard_options: Option<&WildcardOptions>,
 ) -> Result<Vec<Expr>> {
     let using_columns = plan.using_columns()?;
     let mut columns_to_skip = using_columns
@@ -399,9 +400,9 @@ pub fn expand_wildcard(
                 .collect::<Vec<_>>()
         })
         .collect::<HashSet<_>>();
-    let excluded_columns = if let Some(WildcardAdditionalOptions {
-        opt_exclude,
-        opt_except,
+    let excluded_columns = if let Some(WildcardOptions {
+        exclude: opt_exclude,
+        except: opt_except,
         ..
     }) = wildcard_options
     {
@@ -418,7 +419,7 @@ pub fn expand_wildcard(
 pub fn expand_qualified_wildcard(
     qualifier: &TableReference,
     schema: &DFSchema,
-    wildcard_options: Option<&WildcardAdditionalOptions>,
+    wildcard_options: Option<&WildcardOptions>,
 ) -> Result<Vec<Expr>> {
     let qualified_indices = schema.fields_indices_with_qualified(qualifier);
     let projected_func_dependencies = schema
@@ -433,9 +434,9 @@ pub fn expand_qualified_wildcard(
     let qualified_dfschema =
         DFSchema::try_from_qualified_schema(qualifier.clone(), &qualified_schema)?
             .with_functional_dependencies(projected_func_dependencies)?;
-    let excluded_columns = if let Some(WildcardAdditionalOptions {
-        opt_exclude,
-        opt_except,
+    let excluded_columns = if let Some(WildcardOptions {
+        exclude: opt_exclude,
+        except: opt_except,
         ..
     }) = wildcard_options
     {
@@ -459,22 +460,20 @@ pub fn expand_qualified_wildcard(
 
 /// (expr, "is the SortExpr for window (either comes from PARTITION BY or ORDER BY columns)")
 /// if bool is true SortExpr comes from `PARTITION BY` column, if false comes from `ORDER BY` column
-type WindowSortKey = Vec<(Expr, bool)>;
+type WindowSortKey = Vec<(Sort, bool)>;
 
-/// Generate a sort key for a given window expr's partition_by and order_bu expr
+/// Generate a sort key for a given window expr's partition_by and order_by expr
 pub fn generate_sort_key(
     partition_by: &[Expr],
-    order_by: &[Expr],
+    order_by: &[Sort],
 ) -> Result<WindowSortKey> {
     let normalized_order_by_keys = order_by
         .iter()
-        .map(|e| match e {
-            Expr::Sort(Sort { expr, .. }) => {
-                Ok(Expr::Sort(Sort::new(expr.clone(), true, false)))
-            }
-            _ => plan_err!("Order by only accepts sort expressions"),
+        .map(|e| {
+            let Sort { expr, .. } = e;
+            Sort::new(expr.clone(), true, false)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
 
     let mut final_sort_keys = vec![];
     let mut is_partition_flag = vec![];
@@ -510,65 +509,61 @@ pub fn generate_sort_key(
 /// Compare the sort expr as PostgreSQL's common_prefix_cmp():
 /// <https://github.com/postgres/postgres/blob/master/src/backend/optimizer/plan/planner.c>
 pub fn compare_sort_expr(
-    sort_expr_a: &Expr,
-    sort_expr_b: &Expr,
+    sort_expr_a: &Sort,
+    sort_expr_b: &Sort,
     schema: &DFSchemaRef,
 ) -> Ordering {
-    match (sort_expr_a, sort_expr_b) {
-        (
-            Expr::Sort(Sort {
-                expr: expr_a,
-                asc: asc_a,
-                nulls_first: nulls_first_a,
-            }),
-            Expr::Sort(Sort {
-                expr: expr_b,
-                asc: asc_b,
-                nulls_first: nulls_first_b,
-            }),
-        ) => {
-            let ref_indexes_a = find_column_indexes_referenced_by_expr(expr_a, schema);
-            let ref_indexes_b = find_column_indexes_referenced_by_expr(expr_b, schema);
-            for (idx_a, idx_b) in ref_indexes_a.iter().zip(ref_indexes_b.iter()) {
-                match idx_a.cmp(idx_b) {
-                    Ordering::Less => {
-                        return Ordering::Less;
-                    }
-                    Ordering::Greater => {
-                        return Ordering::Greater;
-                    }
-                    Ordering::Equal => {}
-                }
+    let Sort {
+        expr: expr_a,
+        asc: asc_a,
+        nulls_first: nulls_first_a,
+    } = sort_expr_a;
+
+    let Sort {
+        expr: expr_b,
+        asc: asc_b,
+        nulls_first: nulls_first_b,
+    } = sort_expr_b;
+
+    let ref_indexes_a = find_column_indexes_referenced_by_expr(expr_a, schema);
+    let ref_indexes_b = find_column_indexes_referenced_by_expr(expr_b, schema);
+    for (idx_a, idx_b) in ref_indexes_a.iter().zip(ref_indexes_b.iter()) {
+        match idx_a.cmp(idx_b) {
+            Ordering::Less => {
+                return Ordering::Less;
             }
-            match ref_indexes_a.len().cmp(&ref_indexes_b.len()) {
-                Ordering::Less => return Ordering::Greater,
-                Ordering::Greater => {
-                    return Ordering::Less;
-                }
-                Ordering::Equal => {}
+            Ordering::Greater => {
+                return Ordering::Greater;
             }
-            match (asc_a, asc_b) {
-                (true, false) => {
-                    return Ordering::Greater;
-                }
-                (false, true) => {
-                    return Ordering::Less;
-                }
-                _ => {}
-            }
-            match (nulls_first_a, nulls_first_b) {
-                (true, false) => {
-                    return Ordering::Less;
-                }
-                (false, true) => {
-                    return Ordering::Greater;
-                }
-                _ => {}
-            }
-            Ordering::Equal
+            Ordering::Equal => {}
         }
-        _ => Ordering::Equal,
     }
+    match ref_indexes_a.len().cmp(&ref_indexes_b.len()) {
+        Ordering::Less => return Ordering::Greater,
+        Ordering::Greater => {
+            return Ordering::Less;
+        }
+        Ordering::Equal => {}
+    }
+    match (asc_a, asc_b) {
+        (true, false) => {
+            return Ordering::Greater;
+        }
+        (false, true) => {
+            return Ordering::Less;
+        }
+        _ => {}
+    }
+    match (nulls_first_a, nulls_first_b) {
+        (true, false) => {
+            return Ordering::Less;
+        }
+        (false, true) => {
+            return Ordering::Greater;
+        }
+        _ => {}
+    }
+    Ordering::Equal
 }
 
 /// group a slice of window expression expr by their order by expressions
@@ -601,14 +596,6 @@ pub fn group_window_expr_by_sort_keys(
 pub fn find_aggregate_exprs(exprs: &[Expr]) -> Vec<Expr> {
     find_exprs_in_exprs(exprs, &|nested_expr| {
         matches!(nested_expr, Expr::AggregateFunction { .. })
-    })
-}
-
-/// Collect all deeply nested `Expr::Sort`. They are returned in order of occurrence
-/// (depth first), with duplicates omitted.
-pub fn find_sort_exprs(exprs: &[Expr]) -> Vec<Expr> {
-    find_exprs_in_exprs(exprs, &|nested_expr| {
-        matches!(nested_expr, Expr::Sort { .. })
     })
 }
 
@@ -692,48 +679,166 @@ where
     err
 }
 
-/// Returns a new logical plan based on the original one with inputs
-/// and expressions replaced.
-///
-/// The exprs correspond to the same order of expressions returned by
-/// `LogicalPlan::expressions`. This function is used in optimizers in
-/// the following way:
-///
-/// ```text
-/// let new_inputs = optimize_children(..., plan, props);
-///
-/// // get the plans expressions to optimize
-/// let exprs = plan.expressions();
-///
-/// // potentially rewrite plan expressions
-/// let rewritten_exprs = rewrite_exprs(exprs);
-///
-/// // create new plan using rewritten_exprs in same position
-/// let new_plan = from_plan(&plan, rewritten_exprs, new_inputs);
-/// ```
-///
-/// Notice: sometimes [from_plan] will use schema of original plan, it don't change schema!
-/// Such as `Projection/Aggregate/Window`
-#[deprecated(since = "31.0.0", note = "use LogicalPlan::with_new_exprs instead")]
-pub fn from_plan(
-    plan: &LogicalPlan,
-    expr: &[Expr],
-    inputs: &[LogicalPlan],
-) -> Result<LogicalPlan> {
-    plan.with_new_exprs(expr.to_vec(), inputs.to_vec())
-}
-
 /// Create field meta-data from an expression, for use in a result set schema
 pub fn exprlist_to_fields<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
 ) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
     // look for exact match in plan's output schema
-    let input_schema = &plan.schema();
-    exprs
+    let wildcard_schema = find_base_plan(plan).schema();
+    let input_schema = plan.schema();
+    let result = exprs
         .into_iter()
-        .map(|e| e.to_field(input_schema))
-        .collect()
+        .map(|e| match e {
+            Expr::Wildcard { qualifier, options } => match qualifier {
+                None => {
+                    let excluded: Vec<String> = get_excluded_columns(
+                        options.exclude.as_ref(),
+                        options.except.as_ref(),
+                        wildcard_schema,
+                        None,
+                    )?
+                    .into_iter()
+                    .map(|c| c.flat_name())
+                    .collect();
+                    Ok::<_, DataFusionError>(
+                        wildcard_schema
+                            .field_names()
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| !excluded.contains(s))
+                            .map(|(i, _)| wildcard_schema.qualified_field(i))
+                            .map(|(qualifier, f)| {
+                                (qualifier.cloned(), Arc::new(f.to_owned()))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                Some(qualifier) => {
+                    let excluded: Vec<String> = get_excluded_columns(
+                        options.exclude.as_ref(),
+                        options.except.as_ref(),
+                        wildcard_schema,
+                        Some(qualifier),
+                    )?
+                    .into_iter()
+                    .map(|c| c.flat_name())
+                    .collect();
+                    Ok(wildcard_schema
+                        .fields_with_qualified(qualifier)
+                        .into_iter()
+                        .filter_map(|field| {
+                            let flat_name = format!("{}.{}", qualifier, field.name());
+                            if excluded.contains(&flat_name) {
+                                None
+                            } else {
+                                Some((
+                                    Some(qualifier.clone()),
+                                    Arc::new(field.to_owned()),
+                                ))
+                            }
+                        })
+                        .collect::<Vec<_>>())
+                }
+            },
+            _ => Ok(vec![e.to_field(input_schema)?]),
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok(result)
+}
+
+/// Find the suitable base plan to expand the wildcard expression recursively.
+/// When planning [LogicalPlan::Window] and [LogicalPlan::Aggregate], we will generate
+/// an intermediate plan based on the relation plan (e.g. [LogicalPlan::TableScan], [LogicalPlan::Subquery], ...).
+/// If we expand a wildcard expression basing the intermediate plan, we could get some duplicate fields.
+pub fn find_base_plan(input: &LogicalPlan) -> &LogicalPlan {
+    match input {
+        LogicalPlan::Window(window) => find_base_plan(&window.input),
+        LogicalPlan::Aggregate(agg) => find_base_plan(&agg.input),
+        LogicalPlan::Filter(filter) => {
+            if filter.having {
+                // If a filter is used for a having clause, its input plan is an aggregation.
+                // We should expand the wildcard expression based on the aggregation's input plan.
+                find_base_plan(&filter.input)
+            } else {
+                input
+            }
+        }
+        _ => input,
+    }
+}
+
+/// Count the number of real fields. We should expand the wildcard expression to get the actual number.
+pub fn exprlist_len(
+    exprs: &[Expr],
+    schema: &DFSchemaRef,
+    wildcard_schema: Option<&DFSchemaRef>,
+) -> Result<usize> {
+    exprs
+        .iter()
+        .map(|e| match e {
+            Expr::Wildcard {
+                qualifier: None,
+                options,
+            } => {
+                let excluded = get_excluded_columns(
+                    options.exclude.as_ref(),
+                    options.except.as_ref(),
+                    wildcard_schema.unwrap_or(schema),
+                    None,
+                )?
+                .into_iter()
+                .collect::<HashSet<Column>>();
+                Ok(
+                    get_exprs_except_skipped(wildcard_schema.unwrap_or(schema), excluded)
+                        .len(),
+                )
+            }
+            Expr::Wildcard {
+                qualifier: Some(qualifier),
+                options,
+            } => {
+                let related_wildcard_schema = wildcard_schema.as_ref().map_or_else(
+                    || Ok(Arc::clone(schema)),
+                    |schema| {
+                        // Eliminate the fields coming from other tables.
+                        let qualified_fields = schema
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, field)| {
+                                let (maybe_table_ref, _) = schema.qualified_field(idx);
+                                if maybe_table_ref.map_or(true, |q| q == qualifier) {
+                                    Some((maybe_table_ref.cloned(), Arc::clone(field)))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let metadata = schema.metadata().clone();
+                        DFSchema::new_with_metadata(qualified_fields, metadata)
+                            .map(Arc::new)
+                    },
+                )?;
+                let excluded = get_excluded_columns(
+                    options.exclude.as_ref(),
+                    options.except.as_ref(),
+                    related_wildcard_schema.as_ref(),
+                    Some(qualifier),
+                )?
+                .into_iter()
+                .collect::<HashSet<Column>>();
+                Ok(
+                    get_exprs_except_skipped(related_wildcard_schema.as_ref(), excluded)
+                        .len(),
+                )
+            }
+            _ => Ok(1),
+        })
+        .sum()
 }
 
 /// Convert an expression into Column expression if it's already provided as input plan.
@@ -798,7 +903,9 @@ pub fn expr_as_column_expr(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {
             let (qualifier, field) = plan.schema().qualified_field_from_column(col)?;
             Ok(Expr::from(Column::from((qualifier, field))))
         }
-        _ => Ok(Expr::Column(Column::from_name(expr.display_name()?))),
+        _ => Ok(Expr::Column(Column::from_name(
+            expr.schema_name().to_string(),
+        ))),
     }
 }
 
@@ -997,7 +1104,7 @@ fn split_conjunction_impl<'a>(expr: &'a Expr, mut exprs: Vec<&'a Expr>) -> Vec<&
 /// assert_eq!(split_conjunction_owned(expr), split);
 /// ```
 pub fn split_conjunction_owned(expr: Expr) -> Vec<Expr> {
-    split_binary_owned(expr, &Operator::And)
+    split_binary_owned(expr, Operator::And)
 }
 
 /// Splits an owned binary operator tree [`Expr`] such as `A <OP> B <OP> C` => `[A, B, C]`
@@ -1020,19 +1127,19 @@ pub fn split_conjunction_owned(expr: Expr) -> Vec<Expr> {
 /// ];
 ///
 /// // use split_binary_owned to split them
-/// assert_eq!(split_binary_owned(expr, &Operator::Plus), split);
+/// assert_eq!(split_binary_owned(expr, Operator::Plus), split);
 /// ```
-pub fn split_binary_owned(expr: Expr, op: &Operator) -> Vec<Expr> {
+pub fn split_binary_owned(expr: Expr, op: Operator) -> Vec<Expr> {
     split_binary_owned_impl(expr, op, vec![])
 }
 
 fn split_binary_owned_impl(
     expr: Expr,
-    operator: &Operator,
+    operator: Operator,
     mut exprs: Vec<Expr>,
 ) -> Vec<Expr> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { right, op, left }) if &op == operator => {
+        Expr::BinaryExpr(BinaryExpr { right, op, left }) if op == operator => {
             let exprs = split_binary_owned_impl(*left, operator, exprs);
             split_binary_owned_impl(*right, operator, exprs)
         }
@@ -1049,17 +1156,17 @@ fn split_binary_owned_impl(
 /// Splits an binary operator tree [`Expr`] such as `A <OP> B <OP> C` => `[A, B, C]`
 ///
 /// See [`split_binary_owned`] for more details and an example.
-pub fn split_binary<'a>(expr: &'a Expr, op: &Operator) -> Vec<&'a Expr> {
+pub fn split_binary(expr: &Expr, op: Operator) -> Vec<&Expr> {
     split_binary_impl(expr, op, vec![])
 }
 
 fn split_binary_impl<'a>(
     expr: &'a Expr,
-    operator: &Operator,
+    operator: Operator,
     mut exprs: Vec<&'a Expr>,
 ) -> Vec<&'a Expr> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { right, op, left }) if op == operator => {
+        Expr::BinaryExpr(BinaryExpr { right, op, left }) if *op == operator => {
             let exprs = split_binary_impl(left, operator, exprs);
             split_binary_impl(right, operator, exprs)
         }
@@ -1198,7 +1305,7 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 }
 
 /// merge inputs schema into a single schema.
-pub fn merge_schema(inputs: Vec<&LogicalPlan>) -> DFSchema {
+pub fn merge_schema(inputs: &[&LogicalPlan]) -> DFSchema {
     if inputs.len() == 1 {
         inputs[0].schema().as_ref().clone()
     } else {
@@ -1212,40 +1319,9 @@ pub fn merge_schema(inputs: Vec<&LogicalPlan>) -> DFSchema {
     }
 }
 
-/// Build state name. State is the intermidiate state of the aggregate function.
+/// Build state name. State is the intermediate state of the aggregate function.
 pub fn format_state_name(name: &str, state_name: &str) -> String {
     format!("{name}[{state_name}]")
-}
-
-/// Represents the sensitivity of an aggregate expression to ordering.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum AggregateOrderSensitivity {
-    /// Indicates that the aggregate expression is insensitive to ordering.
-    /// Ordering at the input is not important for the result of the aggregator.
-    Insensitive,
-    /// Indicates that the aggregate expression has a hard requirement on ordering.
-    /// The aggregator can not produce a correct result unless its ordering
-    /// requirement is satisfied.
-    HardRequirement,
-    /// Indicates that ordering is beneficial for the aggregate expression in terms
-    /// of evaluation efficiency. The aggregator can produce its result efficiently
-    /// when its required ordering is satisfied; however, it can still produce the
-    /// correct result (albeit less efficiently) when its required ordering is not met.
-    Beneficial,
-}
-
-impl AggregateOrderSensitivity {
-    pub fn is_insensitive(&self) -> bool {
-        self.eq(&AggregateOrderSensitivity::Insensitive)
-    }
-
-    pub fn is_beneficial(&self) -> bool {
-        self.eq(&AggregateOrderSensitivity::Beneficial)
-    }
-
-    pub fn hard_requires(&self) -> bool {
-        self.eq(&AggregateOrderSensitivity::HardRequirement)
-    }
 }
 
 #[cfg(test)]
@@ -1253,8 +1329,8 @@ mod tests {
     use super::*;
     use crate::{
         col, cube, expr, expr_vec_fmt, grouping_set, lit, rollup,
-        test::function_stub::sum_udaf, AggregateFunction, Cast, WindowFrame,
-        WindowFunctionDefinition,
+        test::function_stub::max_udaf, test::function_stub::min_udaf,
+        test::function_stub::sum_udaf, Cast, ExprFunctionExt, WindowFunctionDefinition,
     };
 
     #[test]
@@ -1268,36 +1344,20 @@ mod tests {
     #[test]
     fn test_group_window_expr_by_sort_keys_empty_window() -> Result<()> {
         let max1 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            WindowFunctionDefinition::AggregateUDF(max_udaf()),
             vec![col("name")],
-            vec![],
-            vec![],
-            WindowFrame::new(None),
-            None,
         ));
         let max2 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            WindowFunctionDefinition::AggregateUDF(max_udaf()),
             vec![col("name")],
-            vec![],
-            vec![],
-            WindowFrame::new(None),
-            None,
         ));
         let min3 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Min),
+            WindowFunctionDefinition::AggregateUDF(min_udaf()),
             vec![col("name")],
-            vec![],
-            vec![],
-            WindowFrame::new(None),
-            None,
         ));
         let sum4 = Expr::WindowFunction(expr::WindowFunction::new(
             WindowFunctionDefinition::AggregateUDF(sum_udaf()),
             vec![col("age")],
-            vec![],
-            vec![],
-            WindowFrame::new(None),
-            None,
         ));
         let exprs = &[max1.clone(), max2.clone(), min3.clone(), sum4.clone()];
         let result = group_window_expr_by_sort_keys(exprs.to_vec())?;
@@ -1310,42 +1370,38 @@ mod tests {
 
     #[test]
     fn test_group_window_expr_by_sort_keys() -> Result<()> {
-        let age_asc = Expr::Sort(expr::Sort::new(Box::new(col("age")), true, true));
-        let name_desc = Expr::Sort(expr::Sort::new(Box::new(col("name")), false, true));
-        let created_at_desc =
-            Expr::Sort(expr::Sort::new(Box::new(col("created_at")), false, true));
+        let age_asc = expr::Sort::new(col("age"), true, true);
+        let name_desc = expr::Sort::new(col("name"), false, true);
+        let created_at_desc = expr::Sort::new(col("created_at"), false, true);
         let max1 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            WindowFunctionDefinition::AggregateUDF(max_udaf()),
             vec![col("name")],
-            vec![],
-            vec![age_asc.clone(), name_desc.clone()],
-            WindowFrame::new(Some(false)),
-            None,
-        ));
+        ))
+        .order_by(vec![age_asc.clone(), name_desc.clone()])
+        .build()
+        .unwrap();
         let max2 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
+            WindowFunctionDefinition::AggregateUDF(max_udaf()),
             vec![col("name")],
-            vec![],
-            vec![],
-            WindowFrame::new(None),
-            None,
         ));
         let min3 = Expr::WindowFunction(expr::WindowFunction::new(
-            WindowFunctionDefinition::AggregateFunction(AggregateFunction::Min),
+            WindowFunctionDefinition::AggregateUDF(min_udaf()),
             vec![col("name")],
-            vec![],
-            vec![age_asc.clone(), name_desc.clone()],
-            WindowFrame::new(Some(false)),
-            None,
-        ));
+        ))
+        .order_by(vec![age_asc.clone(), name_desc.clone()])
+        .build()
+        .unwrap();
         let sum4 = Expr::WindowFunction(expr::WindowFunction::new(
             WindowFunctionDefinition::AggregateUDF(sum_udaf()),
             vec![col("age")],
-            vec![],
-            vec![name_desc.clone(), age_asc.clone(), created_at_desc.clone()],
-            WindowFrame::new(Some(false)),
-            None,
-        ));
+        ))
+        .order_by(vec![
+            name_desc.clone(),
+            age_asc.clone(),
+            created_at_desc.clone(),
+        ])
+        .build()
+        .unwrap();
         // FIXME use as_ref
         let exprs = &[max1.clone(), max2.clone(), min3.clone(), sum4.clone()];
         let result = group_window_expr_by_sort_keys(exprs.to_vec())?;
@@ -1368,43 +1424,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_sort_exprs() -> Result<()> {
-        let exprs = &[
-            Expr::WindowFunction(expr::WindowFunction::new(
-                WindowFunctionDefinition::AggregateFunction(AggregateFunction::Max),
-                vec![col("name")],
-                vec![],
-                vec![
-                    Expr::Sort(expr::Sort::new(Box::new(col("age")), true, true)),
-                    Expr::Sort(expr::Sort::new(Box::new(col("name")), false, true)),
-                ],
-                WindowFrame::new(Some(false)),
-                None,
-            )),
-            Expr::WindowFunction(expr::WindowFunction::new(
-                WindowFunctionDefinition::AggregateUDF(sum_udaf()),
-                vec![col("age")],
-                vec![],
-                vec![
-                    Expr::Sort(expr::Sort::new(Box::new(col("name")), false, true)),
-                    Expr::Sort(expr::Sort::new(Box::new(col("age")), true, true)),
-                    Expr::Sort(expr::Sort::new(Box::new(col("created_at")), false, true)),
-                ],
-                WindowFrame::new(Some(false)),
-                None,
-            )),
-        ];
-        let expected = vec![
-            Expr::Sort(expr::Sort::new(Box::new(col("age")), true, true)),
-            Expr::Sort(expr::Sort::new(Box::new(col("name")), false, true)),
-            Expr::Sort(expr::Sort::new(Box::new(col("created_at")), false, true)),
-        ];
-        let result = find_sort_exprs(exprs);
-        assert_eq!(expected, result);
-        Ok(())
-    }
-
-    #[test]
     fn avoid_generate_duplicate_sort_keys() -> Result<()> {
         let asc_or_desc = [true, false];
         let nulls_first_or_last = [true, false];
@@ -1412,41 +1431,41 @@ mod tests {
         for asc_ in asc_or_desc {
             for nulls_first_ in nulls_first_or_last {
                 let order_by = &[
-                    Expr::Sort(Sort {
-                        expr: Box::new(col("age")),
+                    Sort {
+                        expr: col("age"),
                         asc: asc_,
                         nulls_first: nulls_first_,
-                    }),
-                    Expr::Sort(Sort {
-                        expr: Box::new(col("name")),
+                    },
+                    Sort {
+                        expr: col("name"),
                         asc: asc_,
                         nulls_first: nulls_first_,
-                    }),
+                    },
                 ];
 
                 let expected = vec![
                     (
-                        Expr::Sort(Sort {
-                            expr: Box::new(col("age")),
+                        Sort {
+                            expr: col("age"),
                             asc: asc_,
                             nulls_first: nulls_first_,
-                        }),
+                        },
                         true,
                     ),
                     (
-                        Expr::Sort(Sort {
-                            expr: Box::new(col("name")),
+                        Sort {
+                            expr: col("name"),
                             asc: asc_,
                             nulls_first: nulls_first_,
-                        }),
+                        },
                         true,
                     ),
                     (
-                        Expr::Sort(Sort {
-                            expr: Box::new(col("created_at")),
+                        Sort {
+                            expr: col("created_at"),
                             asc: true,
                             nulls_first: false,
-                        }),
+                        },
                         true,
                     ),
                 ];
@@ -1613,13 +1632,13 @@ mod tests {
     #[test]
     fn test_split_binary_owned() {
         let expr = col("a");
-        assert_eq!(split_binary_owned(expr.clone(), &Operator::And), vec![expr]);
+        assert_eq!(split_binary_owned(expr.clone(), Operator::And), vec![expr]);
     }
 
     #[test]
     fn test_split_binary_owned_two() {
         assert_eq!(
-            split_binary_owned(col("a").eq(lit(5)).and(col("b")), &Operator::And),
+            split_binary_owned(col("a").eq(lit(5)).and(col("b")), Operator::And),
             vec![col("a").eq(lit(5)), col("b")]
         );
     }
@@ -1629,7 +1648,7 @@ mod tests {
         let expr = col("a").eq(lit(5)).or(col("b"));
         assert_eq!(
             // expr is connected by OR, but pass in AND
-            split_binary_owned(expr.clone(), &Operator::And),
+            split_binary_owned(expr.clone(), Operator::And),
             vec![expr]
         );
     }

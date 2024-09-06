@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use super::write::demux::start_demuxer_task;
 use super::write::{create_writer, SharedBuffer};
-use super::{FileFormat, FileFormatFactory, FileScanConfig};
+use super::{transform_schema_to_view, FileFormat, FileFormatFactory, FileScanConfig};
 use crate::arrow::array::RecordBatch;
 use crate::arrow::datatypes::{Fields, Schema, SchemaRef};
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
@@ -48,9 +48,10 @@ use datafusion_common::{
     DEFAULT_PARQUET_EXTENSION,
 };
 use datafusion_common_runtime::SpawnedTask;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::MetricsSet;
 
 use async_trait::async_trait;
@@ -74,12 +75,12 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinSet;
 
-use crate::datasource::physical_plan::parquet::{
-    ParquetExecBuilder, StatisticsConverter,
-};
+use crate::datasource::physical_plan::parquet::ParquetExecBuilder;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
+use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -92,7 +93,8 @@ const BUFFER_FLUSH_BYTES: usize = 1024000;
 #[derive(Default)]
 /// Factory struct used to create [ParquetFormat]
 pub struct ParquetFormatFactory {
-    options: Option<TableParquetOptions>,
+    /// inner options for parquet
+    pub options: Option<TableParquetOptions>,
 }
 
 impl ParquetFormatFactory {
@@ -139,6 +141,10 @@ impl FileFormatFactory for ParquetFormatFactory {
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(ParquetFormat::default())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl GetExt for ParquetFormatFactory {
@@ -148,6 +154,13 @@ impl GetExt for ParquetFormatFactory {
     }
 }
 
+impl fmt::Debug for ParquetFormatFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParquetFormatFactory")
+            .field("ParquetFormatFactory", &self.options)
+            .finish()
+    }
+}
 /// The Apache Parquet `FileFormat` implementation
 #[derive(Debug, Default)]
 pub struct ParquetFormat {
@@ -304,6 +317,17 @@ impl FileFormat for ParquetFormat {
             Schema::try_merge(schemas)
         }?;
 
+        let schema = if state
+            .config_options()
+            .execution
+            .parquet
+            .schema_force_string_view
+        {
+            transform_schema_to_view(&schema)
+        } else {
+            schema
+        };
+
         Ok(Arc::new(schema))
     }
 
@@ -353,7 +377,7 @@ impl FileFormat for ParquetFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for Parquet");
@@ -749,9 +773,13 @@ impl DataSink for ParquetSink {
                         parquet_props.writer_options().clone(),
                     )
                     .await?;
+                let mut reservation =
+                    MemoryConsumer::new(format!("ParquetSink[{}]", path))
+                        .register(context.memory_pool());
                 file_write_tasks.spawn(async move {
                     while let Some(batch) = rx.recv().await {
                         writer.write(&batch).await?;
+                        reservation.try_resize(writer.memory_size())?;
                     }
                     let file_metadata = writer
                         .close()
@@ -771,6 +799,7 @@ impl DataSink for ParquetSink {
                 let schema = self.get_writer_schema();
                 let props = parquet_props.clone();
                 let parallel_options_clone = parallel_options.clone();
+                let pool = Arc::clone(context.memory_pool());
                 file_write_tasks.spawn(async move {
                     let file_metadata = output_single_parquet_file_parallelized(
                         writer,
@@ -778,6 +807,7 @@ impl DataSink for ParquetSink {
                         schema,
                         props.writer_options(),
                         parallel_options_clone,
+                        pool,
                     )
                     .await?;
                     Ok((path, file_metadata))
@@ -807,7 +837,10 @@ impl DataSink for ParquetSink {
             }
         }
 
-        demux_task.join_unwind().await?;
+        demux_task
+            .join_unwind()
+            .await
+            .map_err(DataFusionError::ExecutionJoin)??;
 
         Ok(row_count as u64)
     }
@@ -818,14 +851,16 @@ impl DataSink for ParquetSink {
 async fn column_serializer_task(
     mut rx: Receiver<ArrowLeafColumn>,
     mut writer: ArrowColumnWriter,
-) -> Result<ArrowColumnWriter> {
+    mut reservation: MemoryReservation,
+) -> Result<(ArrowColumnWriter, MemoryReservation)> {
     while let Some(col) = rx.recv().await {
         writer.write(&col)?;
+        reservation.try_resize(writer.memory_size())?;
     }
-    Ok(writer)
+    Ok((writer, reservation))
 }
 
-type ColumnWriterTask = SpawnedTask<Result<ArrowColumnWriter>>;
+type ColumnWriterTask = SpawnedTask<Result<(ArrowColumnWriter, MemoryReservation)>>;
 type ColSender = Sender<ArrowLeafColumn>;
 
 /// Spawns a parallel serialization task for each column
@@ -835,6 +870,7 @@ fn spawn_column_parallel_row_group_writer(
     schema: Arc<Schema>,
     parquet_props: Arc<WriterProperties>,
     max_buffer_size: usize,
+    pool: &Arc<dyn MemoryPool>,
 ) -> Result<(Vec<ColumnWriterTask>, Vec<ColSender>)> {
     let schema_desc = arrow_to_parquet_schema(&schema)?;
     let col_writers = get_column_writers(&schema_desc, &parquet_props, &schema)?;
@@ -844,11 +880,17 @@ fn spawn_column_parallel_row_group_writer(
     let mut col_array_channels = Vec::with_capacity(num_columns);
     for writer in col_writers.into_iter() {
         // Buffer size of this channel limits the number of arrays queued up for column level serialization
-        let (send_array, recieve_array) =
+        let (send_array, receive_array) =
             mpsc::channel::<ArrowLeafColumn>(max_buffer_size);
         col_array_channels.push(send_array);
 
-        let task = SpawnedTask::spawn(column_serializer_task(recieve_array, writer));
+        let reservation =
+            MemoryConsumer::new("ParquetSink(ArrowColumnWriter)").register(pool);
+        let task = SpawnedTask::spawn(column_serializer_task(
+            receive_array,
+            writer,
+            reservation,
+        ));
         col_writer_tasks.push(task);
     }
 
@@ -864,7 +906,7 @@ struct ParallelParquetWriterOptions {
 
 /// This is the return type of calling [ArrowColumnWriter].close() on each column
 /// i.e. the Vec of encoded columns which can be appended to a row group
-type RBStreamSerializeResult = Result<(Vec<ArrowColumnChunk>, usize)>;
+type RBStreamSerializeResult = Result<(Vec<ArrowColumnChunk>, MemoryReservation, usize)>;
 
 /// Sends the ArrowArrays in passed [RecordBatch] through the channels to their respective
 /// parallel column serializers.
@@ -877,12 +919,12 @@ async fn send_arrays_to_col_writers(
     let mut next_channel = 0;
     for (array, field) in rb.columns().iter().zip(schema.fields()) {
         for c in compute_leaves(field, array)? {
-            col_array_channels[next_channel]
-                .send(c)
-                .await
-                .map_err(|_| {
-                    DataFusionError::Internal("Unable to send array to writer!".into())
-                })?;
+            // Do not surface error from closed channel (means something
+            // else hit an error, and the plan is shutting down).
+            if col_array_channels[next_channel].send(c).await.is_err() {
+                return Ok(());
+            }
+
             next_channel += 1;
         }
     }
@@ -895,16 +937,25 @@ async fn send_arrays_to_col_writers(
 fn spawn_rg_join_and_finalize_task(
     column_writer_tasks: Vec<ColumnWriterTask>,
     rg_rows: usize,
+    pool: &Arc<dyn MemoryPool>,
 ) -> SpawnedTask<RBStreamSerializeResult> {
+    let mut rg_reservation =
+        MemoryConsumer::new("ParquetSink(SerializedRowGroupWriter)").register(pool);
+
     SpawnedTask::spawn(async move {
         let num_cols = column_writer_tasks.len();
         let mut finalized_rg = Vec::with_capacity(num_cols);
         for task in column_writer_tasks.into_iter() {
-            let writer = task.join_unwind().await?;
+            let (writer, _col_reservation) = task
+                .join_unwind()
+                .await
+                .map_err(DataFusionError::ExecutionJoin)??;
+            let encoded_size = writer.get_estimated_total_bytes();
+            rg_reservation.grow(encoded_size);
             finalized_rg.push(writer.close()?);
         }
 
-        Ok((finalized_rg, rg_rows))
+        Ok((finalized_rg, rg_reservation, rg_rows))
     })
 }
 
@@ -914,7 +965,7 @@ fn spawn_rg_join_and_finalize_task(
 /// row group is reached, the parallel tasks are joined on another separate task
 /// and sent to a concatenation task. This task immediately continues to work
 /// on the next row group in parallel. So, parquet serialization is parallelized
-/// accross both columns and row_groups, with a theoretical max number of parallel tasks
+/// across both columns and row_groups, with a theoretical max number of parallel tasks
 /// given by n_columns * num_row_groups.
 fn spawn_parquet_parallel_serialization_task(
     mut data: Receiver<RecordBatch>,
@@ -922,6 +973,7 @@ fn spawn_parquet_parallel_serialization_task(
     schema: Arc<Schema>,
     writer_props: Arc<WriterProperties>,
     parallel_options: ParallelParquetWriterOptions,
+    pool: Arc<dyn MemoryPool>,
 ) -> SpawnedTask<Result<(), DataFusionError>> {
     SpawnedTask::spawn(async move {
         let max_buffer_rb = parallel_options.max_buffered_record_batches_per_stream;
@@ -931,6 +983,7 @@ fn spawn_parquet_parallel_serialization_task(
                 schema.clone(),
                 writer_props.clone(),
                 max_buffer_rb,
+                &pool,
             )?;
         let mut current_rg_rows = 0;
 
@@ -957,13 +1010,14 @@ fn spawn_parquet_parallel_serialization_task(
                     let finalize_rg_task = spawn_rg_join_and_finalize_task(
                         column_writer_handles,
                         max_row_group_rows,
+                        &pool,
                     );
 
-                    serialize_tx.send(finalize_rg_task).await.map_err(|_| {
-                        DataFusionError::Internal(
-                            "Unable to send closed RG to concat task!".into(),
-                        )
-                    })?;
+                    // Do not surface error from closed channel (means something
+                    // else hit an error, and the plan is shutting down).
+                    if serialize_tx.send(finalize_rg_task).await.is_err() {
+                        return Ok(());
+                    }
 
                     current_rg_rows = 0;
                     rb = rb.slice(rows_left, rb.num_rows() - rows_left);
@@ -973,6 +1027,7 @@ fn spawn_parquet_parallel_serialization_task(
                             schema.clone(),
                             writer_props.clone(),
                             max_buffer_rb,
+                            &pool,
                         )?;
                 }
             }
@@ -981,14 +1036,17 @@ fn spawn_parquet_parallel_serialization_task(
         drop(col_array_channels);
         // Handle leftover rows as final rowgroup, which may be smaller than max_row_group_rows
         if current_rg_rows > 0 {
-            let finalize_rg_task =
-                spawn_rg_join_and_finalize_task(column_writer_handles, current_rg_rows);
+            let finalize_rg_task = spawn_rg_join_and_finalize_task(
+                column_writer_handles,
+                current_rg_rows,
+                &pool,
+            );
 
-            serialize_tx.send(finalize_rg_task).await.map_err(|_| {
-                DataFusionError::Internal(
-                    "Unable to send closed RG to concat task!".into(),
-                )
-            })?;
+            // Do not surface error from closed channel (means something
+            // else hit an error, and the plan is shutting down).
+            if serialize_tx.send(finalize_rg_task).await.is_err() {
+                return Ok(());
+            }
         }
 
         Ok(())
@@ -1002,8 +1060,12 @@ async fn concatenate_parallel_row_groups(
     schema: Arc<Schema>,
     writer_props: Arc<WriterProperties>,
     mut object_store_writer: Box<dyn AsyncWrite + Send + Unpin>,
+    pool: Arc<dyn MemoryPool>,
 ) -> Result<FileMetaData> {
     let merged_buff = SharedBuffer::new(INITIAL_BUFFER_BYTES);
+
+    let mut file_reservation =
+        MemoryConsumer::new("ParquetSink(SerializedFileWriter)").register(&pool);
 
     let schema_desc = arrow_to_parquet_schema(schema.as_ref())?;
     let mut parquet_writer = SerializedFileWriter::new(
@@ -1015,15 +1077,21 @@ async fn concatenate_parallel_row_groups(
     while let Some(task) = serialize_rx.recv().await {
         let result = task.join_unwind().await;
         let mut rg_out = parquet_writer.next_row_group()?;
-        let (serialized_columns, _cnt) = result?;
+        let (serialized_columns, mut rg_reservation, _cnt) =
+            result.map_err(DataFusionError::ExecutionJoin)??;
         for chunk in serialized_columns {
             chunk.append_to_row_group(&mut rg_out)?;
+            rg_reservation.free();
+
             let mut buff_to_flush = merged_buff.buffer.try_lock().unwrap();
+            file_reservation.try_resize(buff_to_flush.len())?;
+
             if buff_to_flush.len() > BUFFER_FLUSH_BYTES {
                 object_store_writer
                     .write_all(buff_to_flush.as_slice())
                     .await?;
                 buff_to_flush.clear();
+                file_reservation.try_resize(buff_to_flush.len())?; // will set to zero
             }
         }
         rg_out.close()?;
@@ -1034,6 +1102,7 @@ async fn concatenate_parallel_row_groups(
 
     object_store_writer.write_all(final_buff.as_slice()).await?;
     object_store_writer.shutdown().await?;
+    file_reservation.free();
 
     Ok(file_metadata)
 }
@@ -1048,6 +1117,7 @@ async fn output_single_parquet_file_parallelized(
     output_schema: Arc<Schema>,
     parquet_props: &WriterProperties,
     parallel_options: ParallelParquetWriterOptions,
+    pool: Arc<dyn MemoryPool>,
 ) -> Result<FileMetaData> {
     let max_rowgroups = parallel_options.max_parallel_row_groups;
     // Buffer size of this channel limits maximum number of RowGroups being worked on in parallel
@@ -1061,16 +1131,21 @@ async fn output_single_parquet_file_parallelized(
         output_schema.clone(),
         arc_props.clone(),
         parallel_options,
+        Arc::clone(&pool),
     );
     let file_metadata = concatenate_parallel_row_groups(
         serialize_rx,
         output_schema.clone(),
         arc_props.clone(),
         object_store_writer,
+        pool,
     )
     .await?;
 
-    launch_serialization_task.join_unwind().await?;
+    launch_serialization_task
+        .join_unwind()
+        .await
+        .map_err(DataFusionError::ExecutionJoin)??;
     Ok(file_metadata)
 }
 
@@ -1158,8 +1233,10 @@ mod tests {
     use super::super::test_util::scan_format;
     use crate::datasource::listing::{ListingTableUrl, PartitionedFile};
     use crate::physical_plan::collect;
+    use crate::test_util::bounded_stream;
     use std::fmt::{Display, Formatter};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
 
@@ -1266,7 +1343,7 @@ mod tests {
             .map(|i| i.to_string())
             .collect();
         let coll: Vec<_> = schema
-            .all_fields()
+            .flattened_fields()
             .into_iter()
             .map(|i| i.name().to_string())
             .collect();
@@ -1516,7 +1593,7 @@ mod tests {
         // . batch1 written into first file and includes:
         //    - column c1 that has 3 rows with one null. Stats min and max of string column is missing for this test even the column has values
         // . batch2 written into second file and includes:
-        //    - column c2 that has 3 rows with one null. Stats min and max of int are avaialble and 1 and 2 respectively
+        //    - column c2 that has 3 rows with one null. Stats min and max of int are available and 1 and 2 respectively
         let store = Arc::new(LocalFileSystem::new()) as _;
         let (files, _file_names) = store_parquet(vec![batch1, batch2], false).await?;
 
@@ -1933,7 +2010,7 @@ mod tests {
 
         // test result in int_col
         let int_col_index = page_index.get(4).unwrap();
-        let int_col_offset = offset_index.get(4).unwrap();
+        let int_col_offset = offset_index.get(4).unwrap().page_locations();
 
         // 325 pages in int_col
         assert_eq!(int_col_offset.len(), 325);
@@ -2068,7 +2145,7 @@ mod tests {
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(path_parts.len(), 1, "should not have path prefix");
 
-        assert_eq!(num_rows, 2, "file metdata to have 2 rows");
+        assert_eq!(num_rows, 2, "file metadata to have 2 rows");
         assert!(
             schema.iter().any(|col_schema| col_schema.name == "a"),
             "output file metadata should contain col a"
@@ -2164,7 +2241,7 @@ mod tests {
             );
             expected_partitions.remove(prefix);
 
-            assert_eq!(num_rows, 1, "file metdata to have 1 row");
+            assert_eq!(num_rows, 1, "file metadata to have 1 row");
             assert!(
                 !schema.iter().any(|col_schema| col_schema.name == "a"),
                 "output file metadata will not contain partitioned col a"
@@ -2174,6 +2251,107 @@ mod tests {
                 "output file metadata should contain col b"
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_sink_write_memory_reservation() -> Result<()> {
+        async fn test_memory_reservation(global: ParquetOptions) -> Result<()> {
+            let field_a = Field::new("a", DataType::Utf8, false);
+            let field_b = Field::new("b", DataType::Utf8, false);
+            let schema = Arc::new(Schema::new(vec![field_a, field_b]));
+            let object_store_url = ObjectStoreUrl::local_filesystem();
+
+            let file_sink_config = FileSinkConfig {
+                object_store_url: object_store_url.clone(),
+                file_groups: vec![PartitionedFile::new("/tmp".to_string(), 1)],
+                table_paths: vec![ListingTableUrl::parse("file:///")?],
+                output_schema: schema.clone(),
+                table_partition_cols: vec![],
+                overwrite: true,
+                keep_partition_by_columns: false,
+            };
+            let parquet_sink = Arc::new(ParquetSink::new(
+                file_sink_config,
+                TableParquetOptions {
+                    key_value_metadata: std::collections::HashMap::from([
+                        ("my-data".to_string(), Some("stuff".to_string())),
+                        ("my-data-bool-key".to_string(), None),
+                    ]),
+                    global,
+                    ..Default::default()
+                },
+            ));
+
+            // create data
+            let col_a: ArrayRef = Arc::new(StringArray::from(vec!["foo", "bar"]));
+            let col_b: ArrayRef = Arc::new(StringArray::from(vec!["baz", "baz"]));
+            let batch =
+                RecordBatch::try_from_iter(vec![("a", col_a), ("b", col_b)]).unwrap();
+
+            // create task context
+            let task_context = build_ctx(object_store_url.as_ref());
+            assert_eq!(
+                task_context.memory_pool().reserved(),
+                0,
+                "no bytes are reserved yet"
+            );
+
+            let mut write_task = parquet_sink.write_all(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    bounded_stream(batch, 1000),
+                )),
+                &task_context,
+            );
+
+            // incrementally poll and check for memory reservation
+            let mut reserved_bytes = 0;
+            while futures::poll!(&mut write_task).is_pending() {
+                reserved_bytes += task_context.memory_pool().reserved();
+                tokio::time::sleep(Duration::from_micros(1)).await;
+            }
+            assert!(
+                reserved_bytes > 0,
+                "should have bytes reserved during write"
+            );
+            assert_eq!(
+                task_context.memory_pool().reserved(),
+                0,
+                "no leaking byte reservation"
+            );
+
+            Ok(())
+        }
+
+        let write_opts = ParquetOptions {
+            allow_single_file_parallelism: false,
+            ..Default::default()
+        };
+        test_memory_reservation(write_opts)
+            .await
+            .expect("should track for non-parallel writes");
+
+        let row_parallel_write_opts = ParquetOptions {
+            allow_single_file_parallelism: true,
+            maximum_parallel_row_group_writers: 10,
+            maximum_buffered_record_batches_per_stream: 1,
+            ..Default::default()
+        };
+        test_memory_reservation(row_parallel_write_opts)
+            .await
+            .expect("should track for row-parallel writes");
+
+        let col_parallel_write_opts = ParquetOptions {
+            allow_single_file_parallelism: true,
+            maximum_parallel_row_group_writers: 1,
+            maximum_buffered_record_batches_per_stream: 2,
+            ..Default::default()
+        };
+        test_memory_reservation(col_parallel_write_opts)
+            .await
+            .expect("should track for column-parallel writes");
 
         Ok(())
     }

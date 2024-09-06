@@ -33,7 +33,7 @@ use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion_common::{internal_err, DFSchema, DFSchemaRef, Result, ScalarValue};
 use datafusion_expr::expr::{BinaryExpr, Cast, InList, TryCast};
 use datafusion_expr::utils::merge_schema;
-use datafusion_expr::{lit, Expr, ExprSchemable, LogicalPlan, Operator};
+use datafusion_expr::{lit, Expr, ExprSchemable, LogicalPlan};
 
 /// [`UnwrapCastInComparison`] attempts to remove casts from
 /// comparisons to literals ([`ScalarValue`]s) by applying the casts
@@ -99,7 +99,7 @@ impl OptimizerRule for UnwrapCastInComparison {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let mut schema = merge_schema(plan.inputs());
+        let mut schema = merge_schema(&plan.inputs());
 
         if let LogicalPlan::TableScan(ts) = &plan {
             let source_schema = DFSchema::try_from_qualified_schema(
@@ -146,7 +146,7 @@ impl TreeNodeRewriter for UnwrapCastExprRewriter {
                     };
                     is_supported_type(&left_type)
                         && is_supported_type(&right_type)
-                        && is_comparison_op(op)
+                        && op.is_comparison_operator()
                 } =>
             {
                 match (left.as_mut(), right.as_mut()) {
@@ -262,18 +262,6 @@ impl TreeNodeRewriter for UnwrapCastExprRewriter {
     }
 }
 
-fn is_comparison_op(op: &Operator) -> bool {
-    matches!(
-        op,
-        Operator::Eq
-            | Operator::NotEq
-            | Operator::Gt
-            | Operator::GtEq
-            | Operator::Lt
-            | Operator::LtEq
-    )
-}
-
 /// Returns true if [UnwrapCastExprRewriter] supports this data type
 fn is_supported_type(data_type: &DataType) -> bool {
     is_supported_numeric_type(data_type)
@@ -300,7 +288,10 @@ fn is_supported_numeric_type(data_type: &DataType) -> bool {
 
 /// Returns true if [UnwrapCastExprRewriter] supports casting this value as a string
 fn is_supported_string_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
 }
 
 /// Returns true if [UnwrapCastExprRewriter] supports casting this value as a dictionary
@@ -423,32 +414,32 @@ fn try_cast_numeric_literal(
                     DataType::UInt64 => ScalarValue::UInt64(Some(value as u64)),
                     DataType::Timestamp(TimeUnit::Second, tz) => {
                         let value = cast_between_timestamp(
-                            lit_data_type,
-                            DataType::Timestamp(TimeUnit::Second, tz.clone()),
+                            &lit_data_type,
+                            &DataType::Timestamp(TimeUnit::Second, tz.clone()),
                             value,
                         );
                         ScalarValue::TimestampSecond(value, tz.clone())
                     }
                     DataType::Timestamp(TimeUnit::Millisecond, tz) => {
                         let value = cast_between_timestamp(
-                            lit_data_type,
-                            DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
+                            &lit_data_type,
+                            &DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
                             value,
                         );
                         ScalarValue::TimestampMillisecond(value, tz.clone())
                     }
                     DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                         let value = cast_between_timestamp(
-                            lit_data_type,
-                            DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+                            &lit_data_type,
+                            &DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
                             value,
                         );
                         ScalarValue::TimestampMicrosecond(value, tz.clone())
                     }
                     DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
                         let value = cast_between_timestamp(
-                            lit_data_type,
-                            DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+                            &lit_data_type,
+                            &DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
                             value,
                         );
                         ScalarValue::TimestampNanosecond(value, tz.clone())
@@ -473,12 +464,15 @@ fn try_cast_string_literal(
     target_type: &DataType,
 ) -> Option<ScalarValue> {
     let string_value = match lit_value {
-        ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) => s.clone(),
+        ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) | ScalarValue::Utf8View(s) => {
+            s.clone()
+        }
         _ => return None,
     };
     let scalar_value = match target_type {
         DataType::Utf8 => ScalarValue::Utf8(string_value),
         DataType::LargeUtf8 => ScalarValue::LargeUtf8(string_value),
+        DataType::Utf8View => ScalarValue::Utf8View(string_value),
         _ => return None,
     };
     Some(scalar_value)
@@ -511,7 +505,7 @@ fn try_cast_dictionary(
 }
 
 /// Cast a timestamp value from one unit to another
-fn cast_between_timestamp(from: DataType, to: DataType, value: i128) -> Option<i64> {
+fn cast_between_timestamp(from: &DataType, to: &DataType, value: i128) -> Option<i64> {
     let value = value as i64;
     let from_scale = match from {
         DataType::Timestamp(TimeUnit::Second, _) => 1,
@@ -633,7 +627,7 @@ mod tests {
             Box::new(DataType::Int32),
             Box::new(ScalarValue::LargeUtf8(Some("value".to_owned()))),
         );
-        let expr_input = cast(col("largestr"), dict.data_type()).eq(lit(dict.clone()));
+        let expr_input = cast(col("largestr"), dict.data_type()).eq(lit(dict));
         let expected =
             col("largestr").eq(lit(ScalarValue::LargeUtf8(Some("value".to_owned()))));
         assert_eq!(optimize_test(expr_input, &schema), expected);
@@ -832,7 +826,7 @@ mod tests {
 
     fn optimize_test(expr: Expr, schema: &DFSchemaRef) -> Expr {
         let mut expr_rewriter = UnwrapCastExprRewriter {
-            schema: schema.clone(),
+            schema: Arc::clone(schema),
         };
         expr.rewrite(&mut expr_rewriter).data().unwrap()
     }
@@ -899,7 +893,7 @@ mod tests {
         DataType::Timestamp(TimeUnit::Nanosecond, utc)
     }
 
-    // a dictonary type for storing string tags
+    // a dictionary type for storing string tags
     fn dictionary_tag_type() -> DataType {
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
     }
@@ -1080,7 +1074,7 @@ mod tests {
                 ),
             };
 
-            // Datafusion ignores timezones for comparisons of ScalarValue
+            // DataFusion ignores timezones for comparisons of ScalarValue
             // so double check it here
             assert_eq!(lit_tz_none, lit_tz_utc);
 

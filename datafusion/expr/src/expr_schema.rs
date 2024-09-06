@@ -17,19 +17,19 @@
 
 use super::{Between, Expr, Like};
 use crate::expr::{
-    AggregateFunction, AggregateFunctionDefinition, Alias, BinaryExpr, Cast, InList,
-    InSubquery, Placeholder, ScalarFunction, Sort, TryCast, Unnest, WindowFunction,
+    AggregateFunction, Alias, BinaryExpr, Cast, InList, InSubquery, Placeholder,
+    ScalarFunction, TryCast, Unnest, WindowFunction,
 };
 use crate::type_coercion::binary::get_result_type;
 use crate::type_coercion::functions::{
-    data_types_with_aggregate_udf, data_types_with_scalar_udf,
+    data_types_with_aggregate_udf, data_types_with_scalar_udf, data_types_with_window_udf,
 };
 use crate::{utils, LogicalPlan, Projection, Subquery, WindowFunctionDefinition};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::{
-    internal_err, not_impl_err, plan_datafusion_err, plan_err, Column, ExprSchema,
-    Result, TableReference,
+    not_impl_err, plan_datafusion_err, plan_err, Column, ExprSchema, Result,
+    TableReference,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,12 +107,22 @@ impl ExprSchemable for Expr {
                 },
                 _ => expr.get_type(schema),
             },
-            Expr::Sort(Sort { expr, .. }) | Expr::Negative(expr) => expr.get_type(schema),
+            Expr::Negative(expr) => expr.get_type(schema),
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::OuterReferenceColumn(ty, _) => Ok(ty.clone()),
             Expr::ScalarVariable(ty, _) => Ok(ty.clone()),
             Expr::Literal(l) => Ok(l.data_type()),
-            Expr::Case(case) => case.when_then_expr[0].1.get_type(schema),
+            Expr::Case(case) => {
+                for (_, then_expr) in &case.when_then_expr {
+                    let then_type = then_expr.get_type(schema)?;
+                    if !then_type.is_null() {
+                        return Ok(then_type);
+                    }
+                }
+                case.else_expr
+                    .as_ref()
+                    .map_or(Ok(DataType::Null), |e| e.get_type(schema))
+            }
             Expr::Cast(Cast { data_type, .. })
             | Expr::TryCast(TryCast { data_type, .. }) => Ok(data_type.clone()),
             Expr::Unnest(Unnest { expr }) => {
@@ -138,6 +148,7 @@ impl ExprSchemable for Expr {
                     .iter()
                     .map(|e| e.get_type(schema))
                     .collect::<Result<Vec<_>>>()?;
+
                 // verify that function is invoked with correct number and type of arguments as defined in `TypeSignature`
                 data_types_with_scalar_udf(&arg_data_types, func).map_err(|err| {
                     plan_datafusion_err!(
@@ -173,45 +184,49 @@ impl ExprSchemable for Expr {
                                 err,
                                 utils::generate_signature_error_msg(
                                     fun.name(),
-                                    fun.signature().clone(),
+                                    fun.signature(),
                                     &data_types
                                 )
                             )
                         })?;
                         Ok(fun.return_type(&new_types, &nullability)?)
                     }
+                    WindowFunctionDefinition::WindowUDF(udwf) => {
+                        let new_types = data_types_with_window_udf(&data_types, udwf)
+                            .map_err(|err| {
+                                plan_datafusion_err!(
+                                    "{} {}",
+                                    err,
+                                    utils::generate_signature_error_msg(
+                                        fun.name(),
+                                        fun.signature(),
+                                        &data_types
+                                    )
+                                )
+                            })?;
+                        Ok(fun.return_type(&new_types, &nullability)?)
+                    }
                     _ => fun.return_type(&data_types, &nullability),
                 }
             }
-            Expr::AggregateFunction(AggregateFunction { func_def, args, .. }) => {
+            Expr::AggregateFunction(AggregateFunction { func, args, .. }) => {
                 let data_types = args
                     .iter()
                     .map(|e| e.get_type(schema))
                     .collect::<Result<Vec<_>>>()?;
-                let nullability = args
-                    .iter()
-                    .map(|e| e.nullable(schema))
-                    .collect::<Result<Vec<_>>>()?;
-                match func_def {
-                    AggregateFunctionDefinition::BuiltIn(fun) => {
-                        fun.return_type(&data_types, &nullability)
-                    }
-                    AggregateFunctionDefinition::UDF(fun) => {
-                        let new_types = data_types_with_aggregate_udf(&data_types, fun)
-                            .map_err(|err| {
-                            plan_datafusion_err!(
-                                "{} {}",
-                                err,
-                                utils::generate_signature_error_msg(
-                                    fun.name(),
-                                    fun.signature().clone(),
-                                    &data_types
-                                )
+                let new_types = data_types_with_aggregate_udf(&data_types, func)
+                    .map_err(|err| {
+                        plan_datafusion_err!(
+                            "{} {}",
+                            err,
+                            utils::generate_signature_error_msg(
+                                func.name(),
+                                func.signature().clone(),
+                                &data_types
                             )
-                        })?;
-                        Ok(fun.return_type(&new_types)?)
-                    }
-                }
+                        )
+                    })?;
+                Ok(func.return_type(&new_types)?)
             }
             Expr::Not(_)
             | Expr::IsNull(_)
@@ -244,13 +259,7 @@ impl ExprSchemable for Expr {
                     )
                 })
             }
-            Expr::Wildcard { qualifier } => {
-                // Wildcard do not really have a type and do not appear in projections
-                match qualifier {
-                    Some(_) => internal_err!("QualifiedWildcard expressions are not valid in a logical query plan"),
-                    None => Ok(DataType::Null)
-                }
-            }
+            Expr::Wildcard { .. } => Ok(DataType::Null),
             Expr::GroupingSet(_) => {
                 // grouping sets do not really have a type and do not appear in projections
                 Ok(DataType::Null)
@@ -271,10 +280,9 @@ impl ExprSchemable for Expr {
     /// column that does not exist in the schema.
     fn nullable(&self, input_schema: &dyn ExprSchema) -> Result<bool> {
         match self {
-            Expr::Alias(Alias { expr, .. })
-            | Expr::Not(expr)
-            | Expr::Negative(expr)
-            | Expr::Sort(Sort { expr, .. }) => expr.nullable(input_schema),
+            Expr::Alias(Alias { expr, .. }) | Expr::Not(expr) | Expr::Negative(expr) => {
+                expr.nullable(input_schema)
+            }
 
             Expr::InList(InList { expr, list, .. }) => {
                 // Avoid inspecting too many expressions.
@@ -326,20 +334,28 @@ impl ExprSchemable for Expr {
                 }
             }
             Expr::Cast(Cast { expr, .. }) => expr.nullable(input_schema),
-            Expr::AggregateFunction(AggregateFunction { func_def, .. }) => {
-                match func_def {
-                    AggregateFunctionDefinition::BuiltIn(fun) => fun.nullable(),
-                    // TODO: UDF should be able to customize nullability
-                    AggregateFunctionDefinition::UDF(udf) if udf.name() == "count" => {
-                        Ok(false)
-                    }
-                    AggregateFunctionDefinition::UDF(_) => Ok(true),
-                }
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                Ok(func.is_nullable(args, input_schema))
             }
+            Expr::AggregateFunction(AggregateFunction { func, .. }) => {
+                Ok(func.is_nullable())
+            }
+            Expr::WindowFunction(WindowFunction { fun, .. }) => match fun {
+                WindowFunctionDefinition::BuiltInWindowFunction(func) => {
+                    if func.name() == "RANK"
+                        || func.name() == "NTILE"
+                        || func.name() == "CUME_DIST"
+                    {
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                }
+                WindowFunctionDefinition::AggregateUDF(func) => Ok(func.is_nullable()),
+                WindowFunctionDefinition::WindowUDF(udwf) => Ok(udwf.nullable()),
+            },
             Expr::ScalarVariable(_, _)
             | Expr::TryCast { .. }
-            | Expr::ScalarFunction(..)
-            | Expr::WindowFunction { .. }
             | Expr::Unnest(_)
             | Expr::Placeholder(_) => Ok(true),
             Expr::IsNull(_)
@@ -364,12 +380,7 @@ impl ExprSchemable for Expr {
             | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                 Ok(expr.nullable(input_schema)? || pattern.nullable(input_schema)?)
             }
-            Expr::Wildcard { qualifier } => match qualifier {
-                Some(_) => internal_err!(
-                    "QualifiedWildcard expressions are not valid in a logical query plan"
-                ),
-                None => Ok(false),
-            },
+            Expr::Wildcard { .. } => Ok(false),
             Expr::GroupingSet(_) => {
                 // grouping sets do not really have the concept of nullable and do not appear
                 // in projections
@@ -410,9 +421,7 @@ impl ExprSchemable for Expr {
                 },
                 _ => expr.data_type_and_nullable(schema),
             },
-            Expr::Sort(Sort { expr, .. }) | Expr::Negative(expr) => {
-                expr.data_type_and_nullable(schema)
-            }
+            Expr::Negative(expr) => expr.data_type_and_nullable(schema),
             Expr::Column(c) => schema
                 .data_type_and_nullable(c)
                 .map(|(d, n)| (d.clone(), n)),
@@ -476,7 +485,7 @@ impl ExprSchemable for Expr {
                 let (data_type, nullable) = self.data_type_and_nullable(input_schema)?;
                 Ok((
                     None,
-                    Field::new(self.display_name()?, data_type, nullable)
+                    Field::new(self.schema_name().to_string(), data_type, nullable)
                         .with_metadata(self.metadata(input_schema)?)
                         .into(),
                 ))
@@ -550,7 +559,7 @@ mod tests {
     use super::*;
     use crate::{col, lit};
 
-    use datafusion_common::{DFSchema, ScalarValue};
+    use datafusion_common::{internal_err, DFSchema, ScalarValue};
 
     macro_rules! test_is_expr_nullable {
         ($EXPR_TYPE:ident) => {{

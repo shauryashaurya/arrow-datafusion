@@ -21,38 +21,41 @@ use std::borrow::Borrow;
 use std::sync::Arc;
 
 use crate::{
-    aggregates,
     expressions::{
         cume_dist, dense_rank, lag, lead, percent_rank, rank, Literal, NthValue, Ntile,
-        PhysicalSortExpr, RowNumber,
+        PhysicalSortExpr,
     },
-    udaf, ExecutionPlan, ExecutionPlanProperties, InputOrderMode, PhysicalExpr,
+    ExecutionPlan, ExecutionPlanProperties, InputOrderMode, PhysicalExpr,
 };
 
 use arrow::datatypes::Schema;
 use arrow_schema::{DataType, Field, SchemaRef};
-use datafusion_common::{exec_err, Column, DataFusionError, Result, ScalarValue};
-use datafusion_expr::Expr;
-use datafusion_expr::{
-    BuiltInWindowFunction, PartitionEvaluator, SortExpr, WindowFrame,
-    WindowFunctionDefinition, WindowUDF,
+use datafusion_common::{
+    exec_datafusion_err, exec_err, DataFusionError, Result, ScalarValue,
 };
+use datafusion_expr::{
+    BuiltInWindowFunction, PartitionEvaluator, WindowFrame, WindowFunctionDefinition,
+    WindowUDF,
+};
+use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::equivalence::collapse_lex_req;
 use datafusion_physical_expr::{
     reverse_order_bys,
     window::{BuiltInWindowFunctionExpr, SlidingAggregateWindowExpr},
-    AggregateExpr, ConstExpr, EquivalenceProperties, LexOrdering,
-    PhysicalSortRequirement,
+    ConstExpr, EquivalenceProperties, LexOrdering, PhysicalSortRequirement,
 };
 use itertools::Itertools;
 
 mod bounded_window_agg_exec;
+mod utils;
 mod window_agg_exec;
 
 pub use bounded_window_agg_exec::BoundedWindowAggExec;
+use datafusion_physical_expr::expressions::Column;
 pub use datafusion_physical_expr::window::{
     BuiltInWindowExpr, PlainAggregateWindowExpr, WindowExpr,
 };
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 pub use window_agg_exec::WindowAggExec;
 
 /// Build field from window function and add it into schema
@@ -64,11 +67,11 @@ pub fn schema_add_window_field(
 ) -> Result<Arc<Schema>> {
     let data_types = args
         .iter()
-        .map(|e| e.clone().as_ref().data_type(schema))
+        .map(|e| Arc::clone(e).as_ref().data_type(schema))
         .collect::<Result<Vec<_>>>()?;
     let nullability = args
         .iter()
-        .map(|e| e.clone().as_ref().nullable(schema))
+        .map(|e| Arc::clone(e).as_ref().nullable(schema))
         .collect::<Result<Vec<_>>>()?;
     let window_expr_return_type = window_fn.return_type(&data_types, &nullability)?;
     let mut window_fields = schema
@@ -95,7 +98,6 @@ pub fn create_window_expr(
     fun: &WindowFunctionDefinition,
     name: String,
     args: &[Arc<dyn PhysicalExpr>],
-    logical_args: &[Expr],
     partition_by: &[Arc<dyn PhysicalExpr>],
     order_by: &[PhysicalSortExpr],
     window_frame: Arc<WindowFrame>,
@@ -103,23 +105,6 @@ pub fn create_window_expr(
     ignore_nulls: bool,
 ) -> Result<Arc<dyn WindowExpr>> {
     Ok(match fun {
-        WindowFunctionDefinition::AggregateFunction(fun) => {
-            let aggregate = aggregates::create_aggregate_expr(
-                fun,
-                false,
-                args,
-                &[],
-                input_schema,
-                name,
-                ignore_nulls,
-            )?;
-            window_expr_from_aggregate_expr(
-                partition_by,
-                order_by,
-                window_frame,
-                aggregate,
-            )
-        }
         WindowFunctionDefinition::BuiltInWindowFunction(fun) => {
             Arc::new(BuiltInWindowExpr::new(
                 create_built_in_window_expr(fun, args, input_schema, name, ignore_nulls)?,
@@ -129,35 +114,11 @@ pub fn create_window_expr(
             ))
         }
         WindowFunctionDefinition::AggregateUDF(fun) => {
-            // TODO: Ordering not supported for Window UDFs yet
-            // Convert `Vec<PhysicalSortExpr>` into `Vec<Expr::Sort>`
-            let sort_exprs = order_by
-                .iter()
-                .map(|PhysicalSortExpr { expr, options }| {
-                    let field_name = expr.to_string();
-                    let field_name = field_name.split('@').next().unwrap_or(&field_name);
-                    Expr::Sort(SortExpr {
-                        expr: Box::new(Expr::Column(Column::new(
-                            None::<String>,
-                            field_name,
-                        ))),
-                        asc: !options.descending,
-                        nulls_first: options.nulls_first,
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let aggregate = udaf::create_aggregate_expr(
-                fun.as_ref(),
-                args,
-                logical_args,
-                &sort_exprs,
-                order_by,
-                input_schema,
-                name,
-                ignore_nulls,
-                false,
-            )?;
+            let aggregate = AggregateExprBuilder::new(Arc::clone(fun), args.to_vec())
+                .schema(Arc::new(input_schema.clone()))
+                .alias(name)
+                .with_ignore_nulls(ignore_nulls)
+                .build()?;
             window_expr_from_aggregate_expr(
                 partition_by,
                 order_by,
@@ -165,6 +126,7 @@ pub fn create_window_expr(
                 aggregate,
             )
         }
+        // TODO: Ordering not supported for Window UDFs yet
         WindowFunctionDefinition::WindowUDF(fun) => Arc::new(BuiltInWindowExpr::new(
             create_udwf_window_expr(fun, args, input_schema, name)?,
             partition_by,
@@ -179,7 +141,7 @@ fn window_expr_from_aggregate_expr(
     partition_by: &[Arc<dyn PhysicalExpr>],
     order_by: &[PhysicalSortExpr],
     window_frame: Arc<WindowFrame>,
-    aggregate: Arc<dyn AggregateExpr>,
+    aggregate: Arc<AggregateFunctionExpr>,
 ) -> Arc<dyn WindowExpr> {
     // Is there a potentially unlimited sized window frame?
     let unbounded_window = window_frame.start_bound.is_unbounded();
@@ -260,7 +222,6 @@ fn create_built_in_window_expr(
     let out_data_type: &DataType = input_schema.field_with_name(&name)?.data_type();
 
     Ok(match fun {
-        BuiltInWindowFunction::RowNumber => Arc::new(RowNumber::new(name, out_data_type)),
         BuiltInWindowFunction::Rank => Arc::new(rank(name, out_data_type)),
         BuiltInWindowFunction::DenseRank => Arc::new(dense_rank(name, out_data_type)),
         BuiltInWindowFunction::PercentRank => Arc::new(percent_rank(name, out_data_type)),
@@ -288,7 +249,7 @@ fn create_built_in_window_expr(
             }
         }
         BuiltInWindowFunction::Lag => {
-            let arg = args[0].clone();
+            let arg = Arc::clone(&args[0]);
             let shift_offset = get_scalar_value_from_args(args, 1)?
                 .map(get_signed_integer)
                 .map_or(Ok(None), |v| v.map(Some))?;
@@ -304,7 +265,7 @@ fn create_built_in_window_expr(
             ))
         }
         BuiltInWindowFunction::Lead => {
-            let arg = args[0].clone();
+            let arg = Arc::clone(&args[0]);
             let shift_offset = get_scalar_value_from_args(args, 1)?
                 .map(get_signed_integer)
                 .map_or(Ok(None), |v| v.map(Some))?;
@@ -320,12 +281,14 @@ fn create_built_in_window_expr(
             ))
         }
         BuiltInWindowFunction::NthValue => {
-            let arg = args[0].clone();
+            let arg = Arc::clone(&args[0]);
             let n = get_signed_integer(
                 args[1]
                     .as_any()
                     .downcast_ref::<Literal>()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        exec_datafusion_err!("Expected a signed integer literal for the second argument of nth_value, got {}", args[1])
+                    })?
                     .value()
                     .clone(),
             )?;
@@ -338,7 +301,7 @@ fn create_built_in_window_expr(
             )?)
         }
         BuiltInWindowFunction::FirstValue => {
-            let arg = args[0].clone();
+            let arg = Arc::clone(&args[0]);
             Arc::new(NthValue::first(
                 name,
                 arg,
@@ -347,7 +310,7 @@ fn create_built_in_window_expr(
             ))
         }
         BuiltInWindowFunction::LastValue => {
-            let arg = args[0].clone();
+            let arg = Arc::clone(&args[0]);
             Arc::new(NthValue::last(
                 name,
                 arg,
@@ -398,8 +361,11 @@ impl BuiltInWindowFunctionExpr for WindowUDFExpr {
     }
 
     fn field(&self) -> Result<Field> {
-        let nullable = true;
-        Ok(Field::new(&self.name, self.data_type.clone(), nullable))
+        Ok(Field::new(
+            &self.name,
+            self.data_type.clone(),
+            self.fun.nullable(),
+        ))
     }
 
     fn expressions(&self) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -417,6 +383,16 @@ impl BuiltInWindowFunctionExpr for WindowUDFExpr {
     fn reverse_expr(&self) -> Option<Arc<dyn BuiltInWindowFunctionExpr>> {
         None
     }
+
+    fn get_result_ordering(&self, schema: &SchemaRef) -> Option<PhysicalSortExpr> {
+        self.fun
+            .sort_options()
+            .zip(schema.column_with_name(self.name()))
+            .map(|(options, (idx, field))| {
+                let expr = Arc::new(Column::new(field.name(), idx));
+                PhysicalSortExpr { expr, options }
+            })
+    }
 }
 
 pub(crate) fn calc_requirements<
@@ -425,17 +401,20 @@ pub(crate) fn calc_requirements<
 >(
     partition_by_exprs: impl IntoIterator<Item = T>,
     orderby_sort_exprs: impl IntoIterator<Item = S>,
-) -> Option<Vec<PhysicalSortRequirement>> {
+) -> Option<LexRequirement> {
     let mut sort_reqs = partition_by_exprs
         .into_iter()
         .map(|partition_by| {
-            PhysicalSortRequirement::new(partition_by.borrow().clone(), None)
+            PhysicalSortRequirement::new(Arc::clone(partition_by.borrow()), None)
         })
         .collect::<Vec<_>>();
     for element in orderby_sort_exprs.into_iter() {
         let PhysicalSortExpr { expr, options } = element.borrow();
         if !sort_reqs.iter().any(|e| e.expr.eq(expr)) {
-            sort_reqs.push(PhysicalSortRequirement::new(expr.clone(), Some(*options)));
+            sort_reqs.push(PhysicalSortRequirement::new(
+                Arc::clone(expr),
+                Some(*options),
+            ));
         }
     }
     // Convert empty result to None. Otherwise wrap result inside Some()
@@ -464,7 +443,7 @@ pub(crate) fn get_partition_by_sort_exprs(
 ) -> Result<LexOrdering> {
     let ordered_partition_exprs = ordered_partition_by_indices
         .iter()
-        .map(|idx| partition_by_exprs[*idx].clone())
+        .map(|idx| Arc::clone(&partition_by_exprs[*idx]))
         .collect::<Vec<_>>();
     // Make sure ordered section doesn't move over the partition by expression
     assert!(ordered_partition_by_indices.len() <= partition_by_exprs.len());
@@ -485,7 +464,7 @@ pub(crate) fn window_equivalence_properties(
 ) -> EquivalenceProperties {
     // We need to update the schema, so we can not directly use
     // `input.equivalence_properties()`.
-    let mut window_eq_properties = EquivalenceProperties::new(schema.clone())
+    let mut window_eq_properties = EquivalenceProperties::new(Arc::clone(schema))
         .extend(input.equivalence_properties().clone());
 
     for expr in window_expr {
@@ -556,7 +535,7 @@ pub fn get_best_fitting_window(
     if window_expr.iter().all(|e| e.uses_bounded_memory()) {
         Ok(Some(Arc::new(BoundedWindowAggExec::try_new(
             window_expr,
-            input.clone(),
+            Arc::clone(input),
             physical_partition_keys.to_vec(),
             input_order_mode,
         )?) as _))
@@ -569,7 +548,7 @@ pub fn get_best_fitting_window(
     } else {
         Ok(Some(Arc::new(WindowAggExec::try_new(
             window_expr,
-            input.clone(),
+            Arc::clone(input),
             physical_partition_keys.to_vec(),
         )?) as _))
     }
@@ -582,6 +561,7 @@ pub fn get_best_fitting_window(
 ///   (input ordering is not sufficient to run current window executor).
 /// - A `Some((bool, InputOrderMode))` value indicates that the window operator
 ///   can run with existing input ordering, so we can remove `SortExec` before it.
+///
 /// The `bool` field in the return value represents whether we should reverse window
 /// operator to remove `SortExec` before it. The `InputOrderMode` field represents
 /// the mode this window operator should work in to accommodate the existing ordering.
@@ -591,10 +571,10 @@ pub fn get_window_mode(
     input: &Arc<dyn ExecutionPlan>,
 ) -> Option<(bool, InputOrderMode)> {
     let input_eqs = input.equivalence_properties().clone();
-    let mut partition_by_reqs: Vec<PhysicalSortRequirement> = vec![];
+    let mut partition_by_reqs: LexRequirement = vec![];
     let (_, indices) = input_eqs.find_longest_permutation(partitionby_exprs);
     partition_by_reqs.extend(indices.iter().map(|&idx| PhysicalSortRequirement {
-        expr: partitionby_exprs[idx].clone(),
+        expr: Arc::clone(&partitionby_exprs[idx]),
         options: None,
     }));
     // Treat partition by exprs as constant. During analysis of requirements are satisfied.
@@ -694,7 +674,7 @@ mod tests {
         let sort_exprs = sort_exprs.into_iter().collect();
 
         Ok(Arc::new(StreamingTableExec::try_new(
-            schema.clone(),
+            Arc::clone(schema),
             vec![],
             None,
             Some(sort_exprs),
@@ -748,7 +728,7 @@ mod tests {
                 orderbys.push(PhysicalSortExpr { expr, options });
             }
 
-            let mut expected: Option<Vec<PhysicalSortRequirement>> = None;
+            let mut expected: Option<LexRequirement> = None;
             for (col_name, reqs) in expected_params {
                 let options = reqs.map(|(descending, nulls_first)| SortOptions {
                     descending,
@@ -782,7 +762,6 @@ mod tests {
                 &[col("a", &schema)?],
                 &[],
                 &[],
-                &[],
                 Arc::new(WindowFrame::new(None)),
                 schema.as_ref(),
                 false,
@@ -802,7 +781,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_satisfiy_nullable() -> Result<()> {
+    async fn test_satisfy_nullable() -> Result<()> {
         let schema = create_test_schema()?;
         let params = vec![
             ((true, true), (false, false), false),

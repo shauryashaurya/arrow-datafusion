@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::expr::{Alias, Unnest};
+use crate::expr::{Alias, Sort, Unnest};
 use crate::logical_plan::Projection;
 use crate::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder};
 
@@ -42,7 +42,7 @@ pub use order_by::rewrite_sort_cols_by_aggs;
 ///
 /// For example, concatenating arrays `a || b` is represented as
 /// `Operator::ArrowAt`, but can be implemented by calling a function
-/// `array_concat` from the `functions-array` crate.
+/// `array_concat` from the `functions-nested` crate.
 // This is not used in datafusion internally, but it is still helpful for downstream project so don't remove it.
 pub trait FunctionRewrite {
     /// Return a human readable name for this rewrite
@@ -60,7 +60,7 @@ pub trait FunctionRewrite {
     ) -> Result<Transformed<Expr>>;
 }
 
-/// Recursively call [`Column::normalize_with_schemas`] on all [`Column`] expressions
+/// Recursively call `LogicalPlanBuilder::normalize` on all [`Column`] expressions
 /// in the `expr` expression tree.
 pub fn normalize_col(expr: Expr, plan: &LogicalPlan) -> Result<Expr> {
     expr.transform(|expr| {
@@ -117,6 +117,20 @@ pub fn normalize_cols(
         .collect()
 }
 
+pub fn normalize_sorts(
+    sorts: impl IntoIterator<Item = impl Into<Sort>>,
+    plan: &LogicalPlan,
+) -> Result<Vec<Sort>> {
+    sorts
+        .into_iter()
+        .map(|e| {
+            let sort = e.into();
+            normalize_col(sort.expr, plan)
+                .map(|expr| Sort::new(expr, sort.asc, sort.nulls_first))
+        })
+        .collect()
+}
+
 /// Recursively replace all [`Column`] expressions in a given expression tree with
 /// `Column` expressions provided by the hash map argument.
 pub fn replace_col(expr: Expr, replace_map: &HashMap<&Column, &Column>) -> Result<Expr> {
@@ -155,7 +169,7 @@ pub fn unnormalize_col(expr: Expr) -> Expr {
         })
     })
     .data()
-    .expect("Unnormalize is infallable")
+    .expect("Unnormalize is infallible")
 }
 
 /// Create a Column from the Scalar Expr
@@ -173,7 +187,7 @@ pub fn create_col_from_scalar_expr(
             name,
         )),
         _ => {
-            let scalar_column = scalar_expr.display_name()?;
+            let scalar_column = scalar_expr.schema_name().to_string();
             Ok(Column::new(
                 Some::<TableReference>(subqry_alias.into()),
                 scalar_column,
@@ -201,33 +215,31 @@ pub fn strip_outer_reference(expr: Expr) -> Expr {
         })
     })
     .data()
-    .expect("strip_outer_reference is infallable")
+    .expect("strip_outer_reference is infallible")
 }
 
 /// Returns plan with expressions coerced to types compatible with
 /// schema types
 pub fn coerce_plan_expr_for_schema(
-    plan: &LogicalPlan,
+    plan: LogicalPlan,
     schema: &DFSchema,
 ) -> Result<LogicalPlan> {
     match plan {
         // special case Projection to avoid adding multiple projections
         LogicalPlan::Projection(Projection { expr, input, .. }) => {
-            let new_exprs =
-                coerce_exprs_for_schema(expr.clone(), input.schema(), schema)?;
-            let projection = Projection::try_new(new_exprs, Arc::clone(input))?;
+            let new_exprs = coerce_exprs_for_schema(expr, input.schema(), schema)?;
+            let projection = Projection::try_new(new_exprs, input)?;
             Ok(LogicalPlan::Projection(projection))
         }
         _ => {
             let exprs: Vec<Expr> = plan.schema().iter().map(Expr::from).collect();
-
             let new_exprs = coerce_exprs_for_schema(exprs, plan.schema(), schema)?;
             let add_project = new_exprs.iter().any(|expr| expr.try_as_col().is_none());
             if add_project {
-                let projection = Projection::try_new(new_exprs, Arc::new(plan.clone()))?;
+                let projection = Projection::try_new(new_exprs, Arc::new(plan))?;
                 Ok(LogicalPlan::Projection(projection))
             } else {
-                Ok(plan.clone())
+                Ok(plan)
             }
         }
     }
@@ -248,6 +260,7 @@ fn coerce_exprs_for_schema(
                     Expr::Alias(Alias { expr, name, .. }) => {
                         Ok(expr.cast_to(new_type, src_schema)?.alias(name))
                     }
+                    Expr::Wildcard { .. } => Ok(expr),
                     _ => expr.cast_to(new_type, src_schema),
                 }
             } else {
@@ -280,12 +293,64 @@ where
     expr.alias_if_changed(original_name)
 }
 
+/// Handles ensuring the name of rewritten expressions is not changed.
+///
+/// For example, if an expression `1 + 2` is rewritten to `3`, the name of the
+/// expression should be preserved: `3 as "1 + 2"`
+///
+/// See <https://github.com/apache/datafusion/issues/3555> for details
+pub struct NamePreserver {
+    use_alias: bool,
+}
+
+/// If the name of an expression is remembered, it will be preserved when
+/// rewriting the expression
+pub struct SavedName(Option<String>);
+
+impl NamePreserver {
+    /// Create a new NamePreserver for rewriting the `expr` that is part of the specified plan
+    pub fn new(plan: &LogicalPlan) -> Self {
+        Self {
+            // The schema of Filter and Join nodes comes from their inputs rather than their output expressions,
+            // so there is no need to use aliases to preserve expression names.
+            use_alias: !matches!(plan, LogicalPlan::Filter(_) | LogicalPlan::Join(_)),
+        }
+    }
+
+    /// Create a new NamePreserver for rewriting the `expr`s in `Projection`
+    ///
+    /// This will use aliases
+    pub fn new_for_projection() -> Self {
+        Self { use_alias: true }
+    }
+
+    pub fn save(&self, expr: &Expr) -> Result<SavedName> {
+        let original_name = if self.use_alias {
+            Some(expr.name_for_alias()?)
+        } else {
+            None
+        };
+
+        Ok(SavedName(original_name))
+    }
+}
+
+impl SavedName {
+    /// Ensures the name of the rewritten expression is preserved
+    pub fn restore(self, expr: Expr) -> Result<Expr> {
+        let Self(original_name) = self;
+        match original_name {
+            Some(name) => expr.alias_if_changed(name),
+            None => Ok(expr),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::ops::Add;
 
     use super::*;
-    use crate::expr::Sort;
     use crate::{col, lit, Cast};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::ScalarValue;
@@ -446,12 +511,6 @@ mod test {
 
         // change literal type from i32 to i64
         test_rewrite(col("a").add(lit(1i32)), col("a").add(lit(1i64)));
-
-        // SortExpr a+1 ==> b + 2
-        test_rewrite(
-            Expr::Sort(Sort::new(Box::new(col("a").add(lit(1i32))), true, false)),
-            Expr::Sort(Sort::new(Box::new(col("b").add(lit(2i64))), true, false)),
-        );
     }
 
     /// rewrites `expr_from` to `rewrite_to` using
@@ -474,17 +533,8 @@ mod test {
         };
         let expr = rewrite_preserving_name(expr_from.clone(), &mut rewriter).unwrap();
 
-        let original_name = match &expr_from {
-            Expr::Sort(Sort { expr, .. }) => expr.display_name(),
-            expr => expr.display_name(),
-        }
-        .unwrap();
-
-        let new_name = match &expr {
-            Expr::Sort(Sort { expr, .. }) => expr.display_name(),
-            expr => expr.display_name(),
-        }
-        .unwrap();
+        let original_name = expr_from.schema_name().to_string();
+        let new_name = expr.schema_name().to_string();
 
         assert_eq!(
             original_name, new_name,

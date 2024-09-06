@@ -50,7 +50,7 @@ impl TryFrom<&CsvOptions> for CsvWriterOptions {
 
     fn try_from(value: &CsvOptions) -> Result<Self> {
         let mut builder = WriterBuilder::default()
-            .with_header(value.has_header.unwrap_or(false))
+            .with_header(value.has_header.unwrap_or(true))
             .with_quote(value.quote)
             .with_delimiter(value.delimiter);
 
@@ -62,6 +62,9 @@ impl TryFrom<&CsvOptions> for CsvWriterOptions {
         }
         if let Some(v) = &value.timestamp_format {
             builder = builder.with_timestamp_format(v.into())
+        }
+        if let Some(v) = &value.timestamp_tz_format {
+            builder = builder.with_timestamp_tz_format(v.into())
         }
         if let Some(v) = &value.time_format {
             builder = builder.with_time_format(v.into())

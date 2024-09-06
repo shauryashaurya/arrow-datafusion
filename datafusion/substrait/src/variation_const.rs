@@ -25,20 +25,29 @@
 //! - Default type reference is 0. It is used when the actual type is the same with the original type.
 //! - Extended variant type references start from 1, and ususlly increase by 1.
 //!
-//! Definitions here are not the final form. All the non-system-preferred variations will be defined
+//! TODO: Definitions here are not the final form. All the non-system-preferred variations will be defined
 //! using [simple extensions] as per the [spec of type_variations](https://substrait.io/types/type_variations/)
+//! <https://github.com/apache/datafusion/issues/11545>
 //!
 //! [simple extensions]: (https://substrait.io/extensions/#simple-extensions)
 
 // For [type variations](https://substrait.io/types/type_variations/#type-variations) in substrait.
 // Type variations are used to represent different types based on one type class.
+// TODO: Define as extensions: <https://github.com/apache/datafusion/issues/11544>
+
 /// The "system-preferred" variation (i.e., no variation).
 pub const DEFAULT_TYPE_VARIATION_REF: u32 = 0;
 pub const UNSIGNED_INTEGER_TYPE_VARIATION_REF: u32 = 1;
+
+#[deprecated(since = "42.0.0", note = "Use `PrecisionTimestamp(Tz)` type instead")]
 pub const TIMESTAMP_SECOND_TYPE_VARIATION_REF: u32 = 0;
+#[deprecated(since = "42.0.0", note = "Use `PrecisionTimestamp(Tz)` type instead")]
 pub const TIMESTAMP_MILLI_TYPE_VARIATION_REF: u32 = 1;
+#[deprecated(since = "42.0.0", note = "Use `PrecisionTimestamp(Tz)` type instead")]
 pub const TIMESTAMP_MICRO_TYPE_VARIATION_REF: u32 = 2;
+#[deprecated(since = "42.0.0", note = "Use `PrecisionTimestamp(Tz)` type instead")]
 pub const TIMESTAMP_NANO_TYPE_VARIATION_REF: u32 = 3;
+
 pub const DATE_32_TYPE_VARIATION_REF: u32 = 0;
 pub const DATE_64_TYPE_VARIATION_REF: u32 = 1;
 pub const DEFAULT_CONTAINER_TYPE_VARIATION_REF: u32 = 0;
@@ -55,6 +64,7 @@ pub const DECIMAL_256_TYPE_VARIATION_REF: u32 = 1;
 /// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
 /// [`IntervalUnit::YearMonth`]: datafusion::arrow::datatypes::IntervalUnit::YearMonth
 /// [`ScalarValue::IntervalYearMonth`]: datafusion::common::ScalarValue::IntervalYearMonth
+#[deprecated(since = "41.0.0", note = "Use Substrait `IntervalYear` type instead")]
 pub const INTERVAL_YEAR_MONTH_TYPE_REF: u32 = 1;
 
 /// For [`DataType::Interval`] with [`IntervalUnit::DayTime`].
@@ -68,6 +78,7 @@ pub const INTERVAL_YEAR_MONTH_TYPE_REF: u32 = 1;
 /// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
 /// [`IntervalUnit::DayTime`]: datafusion::arrow::datatypes::IntervalUnit::DayTime
 /// [`ScalarValue::IntervalDayTime`]: datafusion::common::ScalarValue::IntervalDayTime
+#[deprecated(since = "41.0.0", note = "Use Substrait `IntervalDay` type instead")]
 pub const INTERVAL_DAY_TIME_TYPE_REF: u32 = 2;
 
 /// For [`DataType::Interval`] with [`IntervalUnit::MonthDayNano`].
@@ -82,21 +93,14 @@ pub const INTERVAL_DAY_TIME_TYPE_REF: u32 = 2;
 /// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
 /// [`IntervalUnit::MonthDayNano`]: datafusion::arrow::datatypes::IntervalUnit::MonthDayNano
 /// [`ScalarValue::IntervalMonthDayNano`]: datafusion::common::ScalarValue::IntervalMonthDayNano
+#[deprecated(
+    since = "41.0.0",
+    note = "Use Substrait `UserDefinedType` with name `INTERVAL_MONTH_DAY_NANO_TYPE_NAME` instead"
+)]
 pub const INTERVAL_MONTH_DAY_NANO_TYPE_REF: u32 = 3;
 
-// For User Defined URLs
-/// For [`DataType::Interval`] with [`IntervalUnit::YearMonth`].
-///
-/// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
-/// [`IntervalUnit::YearMonth`]: datafusion::arrow::datatypes::IntervalUnit::YearMonth
-pub const INTERVAL_YEAR_MONTH_TYPE_URL: &str = "interval-year-month";
-/// For [`DataType::Interval`] with [`IntervalUnit::DayTime`].
-///
-/// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
-/// [`IntervalUnit::DayTime`]: datafusion::arrow::datatypes::IntervalUnit::DayTime
-pub const INTERVAL_DAY_TIME_TYPE_URL: &str = "interval-day-time";
 /// For [`DataType::Interval`] with [`IntervalUnit::MonthDayNano`].
 ///
 /// [`DataType::Interval`]: datafusion::arrow::datatypes::DataType::Interval
 /// [`IntervalUnit::MonthDayNano`]: datafusion::arrow::datatypes::IntervalUnit::MonthDayNano
-pub const INTERVAL_MONTH_DAY_NANO_TYPE_URL: &str = "interval-month-day-nano";
+pub const INTERVAL_MONTH_DAY_NANO_TYPE_NAME: &str = "interval-month-day-nano";

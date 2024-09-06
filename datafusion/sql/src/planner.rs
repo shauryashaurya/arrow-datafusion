@@ -24,11 +24,10 @@ use arrow_schema::*;
 use datafusion_common::{
     field_not_found, internal_err, plan_datafusion_err, DFSchemaRef, SchemaError,
 };
-use datafusion_expr::planner::UserDefinedSQLPlanner;
-use sqlparser::ast::TimezoneInfo;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
+use sqlparser::ast::{TimezoneInfo, Value};
 
 use datafusion_common::TableReference;
 use datafusion_common::{
@@ -39,8 +38,7 @@ use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::utils::find_column_exprs;
 use datafusion_expr::{col, Expr};
 
-use crate::utils::make_decimal_type;
-
+use crate::utils::{make_decimal_type, value_to_string};
 pub use datafusion_expr::planner::ContextProvider;
 
 /// SQL parser options
@@ -49,6 +47,7 @@ pub struct ParserOptions {
     pub parse_float_as_decimal: bool,
     pub enable_ident_normalization: bool,
     pub support_varchar_with_length: bool,
+    pub enable_options_value_normalization: bool,
 }
 
 impl Default for ParserOptions {
@@ -57,6 +56,7 @@ impl Default for ParserOptions {
             parse_float_as_decimal: false,
             enable_ident_normalization: true,
             support_varchar_with_length: true,
+            enable_options_value_normalization: true,
         }
     }
 }
@@ -87,6 +87,32 @@ impl IdentNormalizer {
     }
 }
 
+/// Value Normalizer
+#[derive(Debug)]
+pub struct ValueNormalizer {
+    normalize: bool,
+}
+
+impl Default for ValueNormalizer {
+    fn default() -> Self {
+        Self { normalize: true }
+    }
+}
+
+impl ValueNormalizer {
+    pub fn new(normalize: bool) -> Self {
+        Self { normalize }
+    }
+
+    pub fn normalize(&self, value: Value) -> Option<String> {
+        match (value_to_string(&value), self.normalize) {
+            (Some(s), true) => Some(s.to_ascii_lowercase()),
+            (Some(s), false) => Some(s),
+            (None, _) => None,
+        }
+    }
+}
+
 /// Struct to store the states used by the Planner. The Planner will leverage the states to resolve
 /// CTEs, Views, subqueries and PREPARE statements. The states include
 /// Common Table Expression (CTE) provided with WITH clause and
@@ -109,6 +135,9 @@ pub struct PlannerContext {
     ctes: HashMap<String, Arc<LogicalPlan>>,
     /// The query schema of the outer query plan, used to resolve the columns in subquery
     outer_query_schema: Option<DFSchemaRef>,
+    /// The joined schemas of all FROM clauses planned so far. When planning LATERAL
+    /// FROM clauses, this should become a suffix of the `outer_query_schema`.
+    outer_from_schema: Option<DFSchemaRef>,
 }
 
 impl Default for PlannerContext {
@@ -124,6 +153,7 @@ impl PlannerContext {
             prepare_param_data_types: Arc::new(vec![]),
             ctes: HashMap::new(),
             outer_query_schema: None,
+            outer_from_schema: None,
         }
     }
 
@@ -149,6 +179,29 @@ impl PlannerContext {
     ) -> Option<DFSchemaRef> {
         std::mem::swap(&mut self.outer_query_schema, &mut schema);
         schema
+    }
+
+    // return a clone of the outer FROM schema
+    pub fn outer_from_schema(&self) -> Option<Arc<DFSchema>> {
+        self.outer_from_schema.clone()
+    }
+
+    /// sets the outer FROM schema, returning the existing one, if any
+    pub fn set_outer_from_schema(
+        &mut self,
+        mut schema: Option<DFSchemaRef>,
+    ) -> Option<DFSchemaRef> {
+        std::mem::swap(&mut self.outer_from_schema, &mut schema);
+        schema
+    }
+
+    /// extends the FROM schema, returning the existing one, if any
+    pub fn extend_outer_from_schema(&mut self, schema: &DFSchemaRef) -> Result<()> {
+        self.outer_from_schema = match self.outer_from_schema.as_ref() {
+            Some(from_schema) => Some(Arc::new(from_schema.join(schema)?)),
+            None => Some(Arc::clone(schema)),
+        };
+        Ok(())
     }
 
     /// Return the types of parameters (`$1`, `$2`, etc) if known
@@ -185,9 +238,8 @@ impl PlannerContext {
 pub struct SqlToRel<'a, S: ContextProvider> {
     pub(crate) context_provider: &'a S,
     pub(crate) options: ParserOptions,
-    pub(crate) normalizer: IdentNormalizer,
-    /// user defined planner extensions
-    pub(crate) planners: Vec<Arc<dyn UserDefinedSQLPlanner>>,
+    pub(crate) ident_normalizer: IdentNormalizer,
+    pub(crate) value_normalizer: ValueNormalizer,
 }
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
@@ -196,24 +248,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         Self::new_with_options(context_provider, ParserOptions::default())
     }
 
-    /// add an user defined planner
-    pub fn with_user_defined_planner(
-        mut self,
-        planner: Arc<dyn UserDefinedSQLPlanner>,
-    ) -> Self {
-        self.planners.push(planner);
-        self
-    }
-
     /// Create a new query planner
     pub fn new_with_options(context_provider: &'a S, options: ParserOptions) -> Self {
-        let normalize = options.enable_ident_normalization;
+        let ident_normalize = options.enable_ident_normalization;
+        let options_value_normalize = options.enable_options_value_normalization;
 
         SqlToRel {
             context_provider,
             options,
-            normalizer: IdentNormalizer::new(normalize),
-            planners: vec![],
+            ident_normalizer: IdentNormalizer::new(ident_normalize),
+            value_normalizer: ValueNormalizer::new(options_value_normalize),
         }
     }
 
@@ -227,7 +271,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 .iter()
                 .any(|x| x.option == ColumnOption::NotNull);
             fields.push(Field::new(
-                self.normalizer.normalize(column.name),
+                self.ident_normalizer.normalize(column.name),
                 data_type,
                 !not_nullable,
             ));
@@ -265,8 +309,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 let default_expr = self
                     .sql_to_expr(default_sql_expr.clone(), &empty_schema, planner_context)
                     .map_err(error_desc)?;
-                column_defaults
-                    .push((self.normalizer.normalize(column.name.clone()), default_expr));
+                column_defaults.push((
+                    self.ident_normalizer.normalize(column.name.clone()),
+                    default_expr,
+                ));
             }
         }
         Ok(column_defaults)
@@ -281,7 +327,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let plan = self.apply_expr_alias(plan, alias.columns)?;
 
         LogicalPlanBuilder::from(plan)
-            .alias(TableReference::bare(self.normalizer.normalize(alias.name)))?
+            .alias(TableReference::bare(
+                self.ident_normalizer.normalize(alias.name),
+            ))?
             .build()
     }
 
@@ -302,7 +350,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             let fields = plan.schema().fields().clone();
             LogicalPlanBuilder::from(plan)
                 .project(fields.iter().zip(idents.into_iter()).map(|(field, ident)| {
-                    col(field.name()).alias(self.normalizer.normalize(ident))
+                    col(field.name()).alias(self.ident_normalizer.normalize(ident))
                 }))?
                 .build()
         }
@@ -417,7 +465,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
-            SQLDataType::Struct(fields) => {
+            SQLDataType::Struct(fields, _) => {
                 let fields = fields
                     .iter()
                     .enumerate()
@@ -428,7 +476,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             None => Ident::new(format!("c{idx}"))
                         };
                         Ok(Arc::new(Field::new(
-                            self.normalizer.normalize(field_name),
+                            self.ident_normalizer.normalize(field_name),
                             data_type,
                             true,
                         )))
@@ -471,6 +519,28 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Float64
             | SQLDataType::JSONB
             | SQLDataType::Unspecified
+            // Clickhouse datatypes
+            | SQLDataType::Int16
+            | SQLDataType::Int32
+            | SQLDataType::Int128
+            | SQLDataType::Int256
+            | SQLDataType::UInt8
+            | SQLDataType::UInt16
+            | SQLDataType::UInt32
+            | SQLDataType::UInt64
+            | SQLDataType::UInt128
+            | SQLDataType::UInt256
+            | SQLDataType::Float32
+            | SQLDataType::Date32
+            | SQLDataType::Datetime64(_, _)
+            | SQLDataType::FixedString(_)
+            | SQLDataType::Map(_, _)
+            | SQLDataType::Tuple(_)
+            | SQLDataType::Nested(_)
+            | SQLDataType::Union(_)
+            | SQLDataType::Nullable(_)
+            | SQLDataType::LowCardinality(_)
+            | SQLDataType::Trigger
             => not_impl_err!(
                 "Unsupported SQL type {sql_type:?}"
             ),

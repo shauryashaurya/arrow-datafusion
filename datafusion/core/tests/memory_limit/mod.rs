@@ -26,23 +26,29 @@ use datafusion::assert_batches_eq;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion_execution::memory_pool::{
+    GreedyMemoryPool, MemoryPool, TrackConsumersPool,
+};
 use datafusion_expr::{Expr, TableType};
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use futures::StreamExt;
 use std::any::Any;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
+use tokio::fs::File;
 
 use datafusion::datasource::streaming::StreamingTable;
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::execution::context::SessionState;
 use datafusion::execution::disk_manager::DiskManagerConfig;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::join_selection::JoinSelection;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion_common::{assert_contains, Result};
 
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_catalog::Session;
 use datafusion_execution::TaskContext;
 use test_utils::AccessLogGenerator;
 
@@ -70,8 +76,7 @@ async fn group_by_none() {
     TestCase::new()
         .with_query("select median(request_bytes) from t")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "AggregateStream",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: AggregateStream"
         ])
         .with_memory_limit(2_000)
         .run()
@@ -83,8 +88,7 @@ async fn group_by_row_hash() {
     TestCase::new()
         .with_query("select count(*) from t GROUP BY response_bytes")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "GroupedHashAggregateStream",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: GroupedHashAggregateStream"
         ])
         .with_memory_limit(2_000)
         .run()
@@ -97,8 +101,7 @@ async fn group_by_hash() {
         // group by dict column
         .with_query("select count(*) from t GROUP BY service, host, pod, container")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "GroupedHashAggregateStream",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: GroupedHashAggregateStream"
         ])
         .with_memory_limit(1_000)
         .run()
@@ -111,8 +114,7 @@ async fn join_by_key_multiple_partitions() {
     TestCase::new()
         .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "HashJoinInput[0]",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: HashJoinInput[0]",
         ])
         .with_memory_limit(1_000)
         .with_config(config)
@@ -126,8 +128,7 @@ async fn join_by_key_single_partition() {
     TestCase::new()
         .with_query("select t1.* from t t1 JOIN t t2 ON t1.service = t2.service")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "HashJoinInput",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: HashJoinInput",
         ])
         .with_memory_limit(1_000)
         .with_config(config)
@@ -140,8 +141,7 @@ async fn join_by_expression() {
     TestCase::new()
         .with_query("select t1.* from t t1 JOIN t t2 ON t1.service != t2.service")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "NestedLoopJoinLoad[0]",
+           "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: NestedLoopJoinLoad[0]",
         ])
         .with_memory_limit(1_000)
         .run()
@@ -153,8 +153,7 @@ async fn cross_join() {
     TestCase::new()
         .with_query("select t1.* from t t1 CROSS JOIN t t2")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "CrossJoinExec",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: CrossJoinExec",
         ])
         .with_memory_limit(1_000)
         .run()
@@ -162,7 +161,7 @@ async fn cross_join() {
 }
 
 #[tokio::test]
-async fn merge_join() {
+async fn sort_merge_join_no_spill() {
     // Planner chooses MergeJoin only if number of partitions > 1
     let config = SessionConfig::new()
         .with_target_partitions(2)
@@ -173,11 +172,32 @@ async fn merge_join() {
             "select t1.* from t t1 JOIN t t2 ON t1.pod = t2.pod AND t1.time = t2.time",
         )
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
+            "Failed to allocate additional",
             "SMJStream",
+            "Disk spilling disabled",
         ])
         .with_memory_limit(1_000)
         .with_config(config)
+        .with_scenario(Scenario::AccessLogStreaming)
+        .run()
+        .await
+}
+
+#[tokio::test]
+async fn sort_merge_join_spill() {
+    // Planner chooses MergeJoin only if number of partitions > 1
+    let config = SessionConfig::new()
+        .with_target_partitions(2)
+        .set_bool("datafusion.optimizer.prefer_hash_join", false);
+
+    TestCase::new()
+        .with_query(
+            "select t1.* from t t1 JOIN t t2 ON t1.pod = t2.pod AND t1.time = t2.time",
+        )
+        .with_memory_limit(1_000)
+        .with_config(config)
+        .with_disk_manager_config(DiskManagerConfig::NewOs)
+        .with_scenario(Scenario::AccessLogStreaming)
         .run()
         .await
 }
@@ -189,8 +209,7 @@ async fn symmetric_hash_join() {
             "select t1.* from t t1 JOIN t t2 ON t1.pod = t2.pod AND t1.time = t2.time",
         )
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "SymmetricHashJoinStream",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: SymmetricHashJoinStream",
         ])
         .with_memory_limit(1_000)
         .with_scenario(Scenario::AccessLogStreaming)
@@ -208,8 +227,7 @@ async fn sort_preserving_merge() {
     // so only a merge is needed
         .with_query("select * from t ORDER BY a ASC NULLS LAST, b ASC NULLS LAST LIMIT 10")
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "SortPreservingMergeExec",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: SortPreservingMergeExec",
         ])
         // provide insufficient memory to merge
         .with_memory_limit(partition_size / 2)
@@ -220,17 +238,15 @@ async fn sort_preserving_merge() {
             // SortPreservingMergeExec (not a Sort which would compete
             // with the SortPreservingMergeExec for memory)
             &[
-                "+---------------+-------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                        |",
-                "+---------------+-------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Limit: skip=0, fetch=10                                                                                     |",
-                "|               |   Sort: t.a ASC NULLS LAST, t.b ASC NULLS LAST, fetch=10                                                    |",
-                "|               |     TableScan: t projection=[a, b]                                                                          |",
-                "| physical_plan | GlobalLimitExec: skip=0, fetch=10                                                                           |",
-                "|               |   SortPreservingMergeExec: [a@0 ASC NULLS LAST,b@1 ASC NULLS LAST], fetch=10                                |",
-                "|               |     MemoryExec: partitions=2, partition_sizes=[5, 5], output_ordering=a@0 ASC NULLS LAST,b@1 ASC NULLS LAST |",
-                "|               |                                                                                                             |",
-                "+---------------+-------------------------------------------------------------------------------------------------------------+",
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                      |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Sort: t.a ASC NULLS LAST, t.b ASC NULLS LAST, fetch=10                                                    |",
+                "|               |   TableScan: t projection=[a, b]                                                                          |",
+                "| physical_plan | SortPreservingMergeExec: [a@0 ASC NULLS LAST,b@1 ASC NULLS LAST], fetch=10                                |",
+                "|               |   MemoryExec: partitions=2, partition_sizes=[5, 5], output_ordering=a@0 ASC NULLS LAST,b@1 ASC NULLS LAST |",
+                "|               |                                                                                                           |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------+",
             ]
         )
         .run()
@@ -257,7 +273,7 @@ async fn sort_spill_reservation() {
         .with_query("select * from t ORDER BY a , b DESC")
     // enough memory to sort if we don't try to merge it all at once
         .with_memory_limit(partition_size)
-    // use a single partiton so only a sort is needed
+    // use a single partition so only a sort is needed
         .with_scenario(scenario)
         .with_disk_manager_config(DiskManagerConfig::NewOs)
         .with_expected_plan(
@@ -285,8 +301,7 @@ async fn sort_spill_reservation() {
 
     test.clone()
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "ExternalSorterMerge", // merging in sort fails
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: ExternalSorterMerge",
         ])
         .with_config(config)
         .run()
@@ -315,10 +330,66 @@ async fn oom_recursive_cte() {
         SELECT * FROM nodes;",
         )
         .with_expected_errors(vec![
-            "Resources exhausted: Failed to allocate additional",
-            "RecursiveQuery",
+            "Resources exhausted: Additional allocation failed with top memory consumers (across reservations) as: RecursiveQuery",
         ])
         .with_memory_limit(2_000)
+        .run()
+        .await
+}
+
+#[tokio::test]
+async fn oom_parquet_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.into_path().join("test.parquet");
+    let _ = File::create(path.clone()).await.unwrap();
+
+    TestCase::new()
+        .with_query(format!(
+            "
+            COPY (select * from t)
+            TO '{}'
+            STORED AS PARQUET OPTIONS (compression 'uncompressed');
+        ",
+            path.to_string_lossy()
+        ))
+        .with_expected_errors(vec![
+            "Failed to allocate additional",
+            "for ParquetSink(ArrowColumnWriter)",
+        ])
+        .with_memory_limit(200_000)
+        .run()
+        .await
+}
+
+#[tokio::test]
+async fn oom_with_tracked_consumer_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.into_path().join("test.parquet");
+    let _ = File::create(path.clone()).await.unwrap();
+
+    TestCase::new()
+        .with_config(
+            SessionConfig::new()
+        )
+        .with_query(format!(
+            "
+            COPY (select * from t)
+            TO '{}'
+            STORED AS PARQUET OPTIONS (compression 'uncompressed');
+        ",
+            path.to_string_lossy()
+        ))
+        .with_expected_errors(vec![
+            "Failed to allocate additional",
+            "for ParquetSink(ArrowColumnWriter)",
+            "Additional allocation failed with top memory consumers (across reservations) as: ParquetSink(ArrowColumnWriter)"
+        ])
+        .with_memory_pool(Arc::new(
+            TrackConsumersPool::new(
+                GreedyMemoryPool::new(200_000),
+                NonZeroUsize::new(1).unwrap()
+            )
+        ))
         .run()
         .await
 }
@@ -330,12 +401,13 @@ struct TestCase {
     query: Option<String>,
     expected_errors: Vec<String>,
     memory_limit: usize,
+    memory_pool: Option<Arc<dyn MemoryPool>>,
     config: SessionConfig,
     scenario: Scenario,
     /// How should the disk manager (that allows spilling) be
     /// configured? Defaults to `Disabled`
     disk_manager_config: DiskManagerConfig,
-    /// Expected explain plan, if non emptry
+    /// Expected explain plan, if non-empty
     expected_plan: Vec<String>,
     /// Is the plan expected to pass? Defaults to false
     expected_success: bool,
@@ -348,6 +420,7 @@ impl TestCase {
             expected_errors: vec![],
             memory_limit: 0,
             config: SessionConfig::new(),
+            memory_pool: None,
             scenario: Scenario::AccessLog,
             disk_manager_config: DiskManagerConfig::Disabled,
             expected_plan: vec![],
@@ -374,6 +447,15 @@ impl TestCase {
     /// Set the amount of memory that can be used
     fn with_memory_limit(mut self, memory_limit: usize) -> Self {
         self.memory_limit = memory_limit;
+        self
+    }
+
+    /// Set the memory pool to be used
+    ///
+    /// This will override the memory_limit requested,
+    /// as the memory pool includes the limit.
+    fn with_memory_pool(mut self, memory_pool: Arc<dyn MemoryPool>) -> Self {
+        self.memory_pool = Some(memory_pool);
         self
     }
 
@@ -417,6 +499,7 @@ impl TestCase {
             query,
             expected_errors,
             memory_limit,
+            memory_pool,
             config,
             scenario,
             disk_manager_config,
@@ -426,21 +509,27 @@ impl TestCase {
 
         let table = scenario.table();
 
-        let rt_config = RuntimeConfig::new()
-            // do not allow spilling
+        let mut builder = RuntimeEnvBuilder::new()
+            // disk manager setting controls the spilling
             .with_disk_manager(disk_manager_config)
             .with_memory_limit(memory_limit, MEMORY_FRACTION);
 
-        let runtime = RuntimeEnv::new(rt_config).unwrap();
+        if let Some(pool) = memory_pool {
+            builder = builder.with_memory_pool(pool);
+        };
+        let runtime = builder.build_arc().unwrap();
 
         // Configure execution
-        let state = SessionState::new_with_config_rt(config, Arc::new(runtime));
-        let state = match scenario.rules() {
-            Some(rules) => state.with_physical_optimizer_rules(rules),
-            None => state,
+        let builder = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features();
+        let builder = match scenario.rules() {
+            Some(rules) => builder.with_physical_optimizer_rules(rules),
+            None => builder,
         };
 
-        let ctx = SessionContext::new_with_state(state);
+        let ctx = SessionContext::new_with_state(builder.build());
         ctx.register_table("t", table).expect("registering table");
 
         let query = query.expect("Test error: query not specified");
@@ -742,7 +831,7 @@ impl TableProvider for SortedTableProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,

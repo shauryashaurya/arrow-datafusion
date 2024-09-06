@@ -28,17 +28,18 @@ use crate::aggregates::{
     PhysicalGroupBy,
 };
 use crate::common::IPCWriter;
-use crate::metrics::{BaselineMetrics, RecordOutput};
+use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
 use crate::sorts::sort::sort_batch;
 use crate::sorts::streaming_merge;
+use crate::spill::read_spill_as_stream;
 use crate::stream::RecordBatchStreamAdapter;
-use crate::{aggregates, read_spill_as_stream, ExecutionPlan, PhysicalExpr};
+use crate::{aggregates, metrics, ExecutionPlan, PhysicalExpr};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
 
 use arrow::array::*;
 use arrow::datatypes::SchemaRef;
 use arrow_schema::SortOptions;
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{internal_datafusion_err, DataFusionError, Result};
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -46,10 +47,9 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_execution::TaskContext;
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{
-    AggregateExpr, GroupsAccumulatorAdapter, PhysicalSortExpr,
-};
+use datafusion_physical_expr::{GroupsAccumulatorAdapter, PhysicalSortExpr};
 
+use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
@@ -61,6 +61,12 @@ pub(crate) enum ExecutionState {
     /// When producing output, the remaining rows to output are stored
     /// here and are sliced off as needed in batch_size chunks
     ProducingOutput(RecordBatch),
+    /// Produce intermediate aggregate state for each input row without
+    /// aggregation.
+    ///
+    /// See "partial aggregation" discussion on [`GroupedHashAggregateStream`]
+    SkippingAggregation,
+    /// All input has been consumed and all groups have been emitted
     Done,
 }
 
@@ -69,24 +75,130 @@ use super::AggregateExec;
 
 /// This encapsulates the spilling state
 struct SpillState {
-    /// If data has previously been spilled, the locations of the
-    /// spill files (in Arrow IPC format)
-    spills: Vec<RefCountedTempFile>,
-
+    // ========================================================================
+    // PROPERTIES:
+    // These fields are initialized at the start and remain constant throughout
+    // the execution.
+    // ========================================================================
     /// Sorting expression for spilling batches
     spill_expr: Vec<PhysicalSortExpr>,
 
     /// Schema for spilling batches
     spill_schema: SchemaRef,
 
-    /// true when streaming merge is in progress
-    is_stream_merging: bool,
-
     /// aggregate_arguments for merging spilled data
     merging_aggregate_arguments: Vec<Vec<Arc<dyn PhysicalExpr>>>,
 
     /// GROUP BY expressions for merging spilled data
     merging_group_by: PhysicalGroupBy,
+
+    // ========================================================================
+    // STATES:
+    // Fields changes during execution. Can be buffer, or state flags that
+    // influence the execution in parent `GroupedHashAggregateStream`
+    // ========================================================================
+    /// If data has previously been spilled, the locations of the
+    /// spill files (in Arrow IPC format)
+    spills: Vec<RefCountedTempFile>,
+
+    /// true when streaming merge is in progress
+    is_stream_merging: bool,
+}
+
+/// Tracks if the aggregate should skip partial aggregations
+///
+/// See "partial aggregation" discussion on [`GroupedHashAggregateStream`]
+struct SkipAggregationProbe {
+    // ========================================================================
+    // PROPERTIES:
+    // These fields are initialized at the start and remain constant throughout
+    // the execution.
+    // ========================================================================
+    /// Aggregation ratio check performed when the number of input rows exceeds
+    /// this threshold (from `SessionConfig`)
+    probe_rows_threshold: usize,
+    /// Maximum ratio of `num_groups` to `input_rows` for continuing aggregation
+    /// (from `SessionConfig`). If the ratio exceeds this value, aggregation
+    /// is skipped and input rows are directly converted to output
+    probe_ratio_threshold: f64,
+
+    // ========================================================================
+    // STATES:
+    // Fields changes during execution. Can be buffer, or state flags that
+    // influence the exeuction in parent `GroupedHashAggregateStream`
+    // ========================================================================
+    /// Number of processed input rows (updated during probing)
+    input_rows: usize,
+    /// Number of total group values for `input_rows` (updated during probing)
+    num_groups: usize,
+
+    /// Flag indicating further data aggregation may be skipped (decision made
+    /// when probing complete)
+    should_skip: bool,
+    /// Flag indicating further updates of `SkipAggregationProbe` state won't
+    /// make any effect (set either while probing or on probing completion)
+    is_locked: bool,
+
+    /// Number of rows where state was output without aggregation.
+    ///
+    /// * If 0, all input rows were aggregated (should_skip was always false)
+    ///
+    /// * if greater than zero, the number of rows which were output directly
+    ///   without aggregation
+    skipped_aggregation_rows: metrics::Count,
+}
+
+impl SkipAggregationProbe {
+    fn new(
+        probe_rows_threshold: usize,
+        probe_ratio_threshold: f64,
+        skipped_aggregation_rows: metrics::Count,
+    ) -> Self {
+        Self {
+            input_rows: 0,
+            num_groups: 0,
+            probe_rows_threshold,
+            probe_ratio_threshold,
+            should_skip: false,
+            is_locked: false,
+            skipped_aggregation_rows,
+        }
+    }
+
+    /// Updates `SkipAggregationProbe` state:
+    /// - increments the number of input rows
+    /// - replaces the number of groups with the new value
+    /// - on `probe_rows_threshold` exceeded calculates
+    ///   aggregation ratio and sets `should_skip` flag
+    /// - if `should_skip` is set, locks further state updates
+    fn update_state(&mut self, input_rows: usize, num_groups: usize) {
+        if self.is_locked {
+            return;
+        }
+        self.input_rows += input_rows;
+        self.num_groups = num_groups;
+        if self.input_rows >= self.probe_rows_threshold {
+            self.should_skip = self.num_groups as f64 / self.input_rows as f64
+                >= self.probe_ratio_threshold;
+            self.is_locked = true;
+        }
+    }
+
+    fn should_skip(&self) -> bool {
+        self.should_skip
+    }
+
+    /// Provides an ability to externally set `should_skip` flag
+    /// to `false` and prohibit further state updates
+    fn forbid_skipping(&mut self) {
+        self.should_skip = false;
+        self.is_locked = true;
+    }
+
+    /// Record the number of rows that were output directly without aggregation
+    fn record_skipped(&mut self, batch: &RecordBatch) {
+        self.skipped_aggregation_rows.add(batch.num_rows());
+    }
 }
 
 /// HashTable based Grouping Aggregator
@@ -136,7 +248,7 @@ struct SpillState {
 /// of `x` and one accumulator for `SUM(y)`, specialized for the data
 /// type of `y`.
 ///
-/// # Description
+/// # Discussion
 ///
 /// [`group_values`] does not store any aggregate state inline. It only
 /// assigns "group indices", one for each (distinct) group value. The
@@ -154,7 +266,25 @@ struct SpillState {
 ///
 /// [`group_values`]: Self::group_values
 ///
-/// # Spilling
+/// # Partial Aggregate and multi-phase grouping
+///
+/// As described on [`Accumulator::state`], this operator is used in the context
+/// "multi-phase" grouping when the mode is [`AggregateMode::Partial`].
+///
+/// An important optimization for multi-phase partial aggregation is to skip
+/// partial aggregation when it is not effective enough to warrant the memory or
+/// CPU cost, as is often the case for queries many distinct groups (high
+/// cardinality group by). Memory is particularly important because each Partial
+/// aggregator must store the intermediate state for each group.
+///
+/// If the ratio of the number of groups to the number of input rows exceeds a
+/// threshold, and [`GroupsAccumulator::supports_convert_to_state`] is
+/// supported, this operator will stop applying Partial aggregation and directly
+/// pass the input rows to the next aggregation phase.
+///
+/// [`Accumulator::state`]: datafusion_expr::Accumulator::state
+///
+/// # Spilling (to disk)
 ///
 /// The sizes of group values and accumulators can become large. Before that causes out of memory,
 /// this hash aggregator outputs partial states early for partial aggregation or spills to local
@@ -205,16 +335,14 @@ struct SpillState {
 /// └─────────────────┘    └─────────────────┘
 /// ```
 pub(crate) struct GroupedHashAggregateStream {
+    // ========================================================================
+    // PROPERTIES:
+    // These fields are initialized at the start and remain constant throughout
+    // the execution.
+    // ========================================================================
     schema: SchemaRef,
     input: SendableRecordBatchStream,
     mode: AggregateMode,
-
-    /// Accumulators, one for each `AggregateExpr` in the query
-    ///
-    /// For example, if the query has aggregates, `SUM(x)`,
-    /// `COUNT(y)`, there will be two accumulators, each one
-    /// specialized for that particular aggregate and its input types
-    accumulators: Vec<Box<dyn GroupsAccumulator>>,
 
     /// Arguments to pass to each accumulator.
     ///
@@ -236,9 +364,30 @@ pub(crate) struct GroupedHashAggregateStream {
     /// GROUP BY expressions
     group_by: PhysicalGroupBy,
 
-    /// The memory reservation for this grouping
-    reservation: MemoryReservation,
+    /// max rows in output RecordBatches
+    batch_size: usize,
 
+    /// Optional soft limit on the number of `group_values` in a batch
+    /// If the number of `group_values` in a single batch exceeds this value,
+    /// the `GroupedHashAggregateStream` operation immediately switches to
+    /// output mode and emits all groups.
+    group_values_soft_limit: Option<usize>,
+
+    // ========================================================================
+    // STATE FLAGS:
+    // These fields will be updated during the execution. And control the flow of
+    // the execution.
+    // ========================================================================
+    /// Tracks if this stream is generating input or output
+    exec_state: ExecutionState,
+
+    /// Have we seen the end of the input
+    input_done: bool,
+
+    // ========================================================================
+    // STATE BUFFERS:
+    // These fields will accumulate intermediate results during the execution.
+    // ========================================================================
     /// An interning store of group keys
     group_values: Box<dyn GroupValues>,
 
@@ -246,34 +395,41 @@ pub(crate) struct GroupedHashAggregateStream {
     /// processed. Reused across batches here to avoid reallocations
     current_group_indices: Vec<usize>,
 
-    /// Tracks if this stream is generating input or output
-    exec_state: ExecutionState,
+    /// Accumulators, one for each `AggregateFunctionExpr` in the query
+    ///
+    /// For example, if the query has aggregates, `SUM(x)`,
+    /// `COUNT(y)`, there will be two accumulators, each one
+    /// specialized for that particular aggregate and its input types
+    accumulators: Vec<Box<dyn GroupsAccumulator>>,
 
-    /// Execution metrics
-    baseline_metrics: BaselineMetrics,
-
-    /// max rows in output RecordBatches
-    batch_size: usize,
-
+    // ========================================================================
+    // TASK-SPECIFIC STATES:
+    // Inner states groups together properties, states for a specific task.
+    // ========================================================================
     /// Optional ordering information, that might allow groups to be
     /// emitted from the hash table prior to seeing the end of the
     /// input
     group_ordering: GroupOrdering,
 
-    /// Have we seen the end of the input
-    input_done: bool,
-
-    /// The [`RuntimeEnv`] associated with the [`TaskContext`] argument
-    runtime: Arc<RuntimeEnv>,
-
     /// The spill state object
     spill_state: SpillState,
 
-    /// Optional soft limit on the number of `group_values` in a batch
-    /// If the number of `group_values` in a single batch exceeds this value,
-    /// the `GroupedHashAggregateStream` operation immediately switches to
-    /// output mode and emits all groups.
-    group_values_soft_limit: Option<usize>,
+    /// Optional probe for skipping data aggregation, if supported by
+    /// current stream.
+    skip_aggregation_probe: Option<SkipAggregationProbe>,
+
+    // ========================================================================
+    // EXECUTION RESOURCES:
+    // Fields related to managing execution resources and monitoring performance.
+    // ========================================================================
+    /// The memory reservation for this grouping
+    reservation: MemoryReservation,
+
+    /// Execution metrics
+    baseline_metrics: BaselineMetrics,
+
+    /// The [`RuntimeEnv`] associated with the [`TaskContext`] argument
+    runtime: Arc<RuntimeEnv>,
 }
 
 impl GroupedHashAggregateStream {
@@ -358,10 +514,40 @@ impl GroupedHashAggregateStream {
         let spill_state = SpillState {
             spills: vec![],
             spill_expr,
-            spill_schema: agg_schema.clone(),
+            spill_schema: Arc::clone(&agg_schema),
             is_stream_merging: false,
             merging_aggregate_arguments,
             merging_group_by: PhysicalGroupBy::new_single(agg_group_by.expr.clone()),
+        };
+
+        // Skip aggregation is supported if:
+        // - aggregation mode is Partial
+        // - input is not ordered by GROUP BY expressions,
+        //   since Final mode expects unique group values as its input
+        // - all accumulators support input batch to intermediate
+        //   aggregate state conversion
+        // - there is only one GROUP BY expressions set
+        let skip_aggregation_probe = if agg.mode == AggregateMode::Partial
+            && matches!(group_ordering, GroupOrdering::None)
+            && accumulators
+                .iter()
+                .all(|acc| acc.supports_convert_to_state())
+            && agg_group_by.is_single()
+        {
+            let options = &context.session_config().options().execution;
+            let probe_rows_threshold =
+                options.skip_partial_aggregation_probe_rows_threshold;
+            let probe_ratio_threshold =
+                options.skip_partial_aggregation_probe_ratio_threshold;
+            let skipped_aggregation_rows = MetricBuilder::new(&agg.metrics)
+                .counter("skipped_aggregation_rows", partition);
+            Some(SkipAggregationProbe::new(
+                probe_rows_threshold,
+                probe_ratio_threshold,
+                skipped_aggregation_rows,
+            ))
+        } else {
+            None
         };
 
         Ok(GroupedHashAggregateStream {
@@ -383,6 +569,7 @@ impl GroupedHashAggregateStream {
             runtime: context.runtime_env(),
             spill_state,
             group_values_soft_limit: agg.limit,
+            skip_aggregation_probe,
         })
     }
 }
@@ -391,7 +578,7 @@ impl GroupedHashAggregateStream {
 /// that is supported by the aggregate, or a
 /// [`GroupsAccumulatorAdapter`] if not.
 pub(crate) fn create_group_accumulator(
-    agg_expr: &Arc<dyn AggregateExpr>,
+    agg_expr: &Arc<AggregateFunctionExpr>,
 ) -> Result<Box<dyn GroupsAccumulator>> {
     if agg_expr.groups_accumulator_supported() {
         agg_expr.create_groups_accumulator()
@@ -401,7 +588,7 @@ pub(crate) fn create_group_accumulator(
             "Creating GroupsAccumulatorAdapter for {}: {agg_expr:?}",
             agg_expr.name()
         );
-        let agg_expr_captured = agg_expr.clone();
+        let agg_expr_captured = Arc::clone(agg_expr);
         let factory = move || agg_expr_captured.create_accumulator();
         Ok(Box::new(GroupsAccumulatorAdapter::new(factory)))
     }
@@ -433,11 +620,15 @@ impl Stream for GroupedHashAggregateStream {
                         // new batch to aggregate
                         Some(Ok(batch)) => {
                             let timer = elapsed_compute.timer();
+                            let input_rows = batch.num_rows();
+
                             // Make sure we have enough capacity for `batch`, otherwise spill
                             extract_ok!(self.spill_previous_if_necessary(&batch));
 
                             // Do the grouping
                             extract_ok!(self.group_aggregate_batch(batch));
+
+                            self.update_skip_aggregation_probe(input_rows);
 
                             // If we can begin emitting rows, do so,
                             // otherwise keep consuming input
@@ -462,6 +653,8 @@ impl Stream for GroupedHashAggregateStream {
 
                             extract_ok!(self.emit_early_if_necessary());
 
+                            extract_ok!(self.switch_to_skip_aggregation());
+
                             timer.done();
                         }
                         Some(Err(e)) => {
@@ -475,6 +668,29 @@ impl Stream for GroupedHashAggregateStream {
                     }
                 }
 
+                ExecutionState::SkippingAggregation => {
+                    match ready!(self.input.poll_next_unpin(cx)) {
+                        Some(Ok(batch)) => {
+                            let _timer = elapsed_compute.timer();
+                            if let Some(probe) = self.skip_aggregation_probe.as_mut() {
+                                probe.record_skipped(&batch);
+                            }
+                            let states = self.transform_to_states(batch)?;
+                            return Poll::Ready(Some(Ok(
+                                states.record_output(&self.baseline_metrics)
+                            )));
+                        }
+                        Some(Err(e)) => {
+                            // inner had error, return to caller
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        None => {
+                            // inner is done, switching to `Done` state
+                            self.exec_state = ExecutionState::Done;
+                        }
+                    }
+                }
+
                 ExecutionState::ProducingOutput(batch) => {
                     // slice off a part of the batch, if needed
                     let output_batch;
@@ -483,6 +699,8 @@ impl Stream for GroupedHashAggregateStream {
                         (
                             if self.input_done {
                                 ExecutionState::Done
+                            } else if self.should_skip_aggregation() {
+                                ExecutionState::SkippingAggregation
                             } else {
                                 ExecutionState::ReadingInput
                             },
@@ -515,7 +733,7 @@ impl Stream for GroupedHashAggregateStream {
 
 impl RecordBatchStream for GroupedHashAggregateStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -625,7 +843,7 @@ impl GroupedHashAggregateStream {
     /// accumulator states/values specified in emit_to
     fn emit(&mut self, emit_to: EmitTo, spilling: bool) -> Result<RecordBatch> {
         let schema = if spilling {
-            self.spill_state.spill_schema.clone()
+            Arc::clone(&self.spill_state.spill_schema)
         } else {
             self.schema()
         };
@@ -746,13 +964,13 @@ impl GroupedHashAggregateStream {
         let expr = self.spill_state.spill_expr.clone();
         let schema = batch.schema();
         streams.push(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
+            Arc::clone(&schema),
             futures::stream::once(futures::future::lazy(move |_| {
                 sort_batch(&batch, &expr, None)
             })),
         )));
         for spill in self.spill_state.spills.drain(..) {
-            let stream = read_spill_as_stream(spill, schema.clone(), 2)?;
+            let stream = read_spill_as_stream(spill, Arc::clone(&schema), 2)?;
             streams.push(stream);
         }
         self.spill_state.is_stream_merging = true;
@@ -795,5 +1013,69 @@ impl GroupedHashAggregateStream {
         };
         timer.done();
         Ok(())
+    }
+
+    /// Updates skip aggregation probe state.
+    ///
+    /// In case stream has any spills, the probe is forcefully set to
+    /// forbid aggregation skipping, and locked, since spilling resets
+    /// total number of unique groups.
+    ///
+    /// Note: currently spilling is not supported for Partial aggregation
+    fn update_skip_aggregation_probe(&mut self, input_rows: usize) {
+        if let Some(probe) = self.skip_aggregation_probe.as_mut() {
+            if !self.spill_state.spills.is_empty() {
+                probe.forbid_skipping();
+            } else {
+                probe.update_state(input_rows, self.group_values.len());
+            }
+        };
+    }
+
+    /// In case the probe indicates that aggregation may be
+    /// skipped, forces stream to produce currently accumulated output.
+    fn switch_to_skip_aggregation(&mut self) -> Result<()> {
+        if let Some(probe) = self.skip_aggregation_probe.as_mut() {
+            if probe.should_skip() {
+                let batch = self.emit(EmitTo::All, false)?;
+                self.exec_state = ExecutionState::ProducingOutput(batch);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if the aggregation probe indicates that aggregation
+    /// should be skipped.
+    fn should_skip_aggregation(&self) -> bool {
+        self.skip_aggregation_probe
+            .as_ref()
+            .is_some_and(|probe| probe.should_skip())
+    }
+
+    /// Transforms input batch to intermediate aggregate state, without grouping it
+    fn transform_to_states(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let group_values = evaluate_group_by(&self.group_by, &batch)?;
+        let input_values = evaluate_many(&self.aggregate_arguments, &batch)?;
+        let filter_values = evaluate_optional(&self.filter_expressions, &batch)?;
+
+        let mut output = group_values.first().cloned().ok_or_else(|| {
+            internal_datafusion_err!("group_values expected to have at least one element")
+        })?;
+
+        let iter = self
+            .accumulators
+            .iter()
+            .zip(input_values.iter())
+            .zip(filter_values.iter());
+
+        for ((acc, values), opt_filter) in iter {
+            let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
+            output.extend(acc.convert_to_state(values, opt_filter)?);
+        }
+
+        let states_batch = RecordBatch::try_new(self.schema(), output)?;
+
+        Ok(states_batch)
     }
 }

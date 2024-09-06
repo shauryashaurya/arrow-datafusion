@@ -112,7 +112,7 @@ SELECT iszero(1.0), iszero(0.0), iszero(-0.0), iszero(NULL)
 ----
 false true true NULL
 
-# abs: empty argumnet
+# abs: empty argument
 statement error
 SELECT abs();
 
@@ -280,7 +280,7 @@ CREATE TABLE test_non_nullable_integer(
     c5 TINYINT UNSIGNED NOT NULL, 
     c6 SMALLINT UNSIGNED NOT NULL, 
     c7 INT UNSIGNED NOT NULL, 
-    c8 BIGINT UNSIGNED NOT NULL, 
+    c8 BIGINT UNSIGNED NOT NULL
     );
 
 query I
@@ -348,7 +348,7 @@ drop table test_non_nullable_integer
 statement ok
 CREATE TABLE test_nullable_float(
     c1 float,
-    c2 double, 
+    c2 double
     ) AS VALUES
     (-1.0, -1.0),
     (1.0, 1.0), 
@@ -415,7 +415,7 @@ drop table test_nullable_float
 statement ok
 CREATE TABLE test_non_nullable_float(
     c1 float NOT NULL,
-    c2 double NOT NULL, 
+    c2 double NOT NULL
     ); 
 
 query I
@@ -673,7 +673,7 @@ query error DataFusion error: Arrow error: Compute error: Signed integer overflo
 select lcm(2, 9223372036854775803);
 
 
-query error DataFusion error: Arrow error: Compute error: Overflow happened on: 2107754225 \^ 1221660777
+query error DataFusion error: Arrow error: Arithmetic overflow: Overflow happened on: 2107754225 \^ 1221660777
 select power(2107754225, 1221660777);
 
 # factorial overflow

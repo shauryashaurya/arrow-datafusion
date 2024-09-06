@@ -772,7 +772,7 @@ concat(str[, ..., str_n])
 Concatenates multiple strings together with a specified separator.
 
 ```
-concat(separator, str[, ..., str_n])
+concat_ws(separator, str[, ..., str_n])
 ```
 
 #### Arguments
@@ -1480,6 +1480,7 @@ contains(string, search_string)
 - [make_date](#make_date)
 - [to_char](#to_char)
 - [to_date](#to_date)
+- [to_local_time](#to_local_time)
 - [to_timestamp](#to_timestamp)
 - [to_timestamp_millis](#to_timestamp_millis)
 - [to_timestamp_micros](#to_timestamp_micros)
@@ -1710,7 +1711,7 @@ to_char(expression, format)
 #### Example
 
 ```
-> > select to_char('2023-03-01'::date, '%d-%m-%Y');
+> select to_char('2023-03-01'::date, '%d-%m-%Y');
 +----------------------------------------------+
 | to_char(Utf8("2023-03-01"),Utf8("%d-%m-%Y")) |
 +----------------------------------------------+
@@ -1770,6 +1771,68 @@ to_date(expression[, ..., format_n])
 ```
 
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/to_date.rs)
+
+### `to_local_time`
+
+Converts a timestamp with a timezone to a timestamp without a timezone (with no offset or
+timezone information). This function handles daylight saving time changes.
+
+```
+to_local_time(expression)
+```
+
+#### Arguments
+
+- **expression**: Time expression to operate on. Can be a constant, column, or function.
+
+#### Example
+
+```
+> SELECT to_local_time('2024-04-01T00:00:20Z'::timestamp);
++---------------------------------------------+
+| to_local_time(Utf8("2024-04-01T00:00:20Z")) |
++---------------------------------------------+
+| 2024-04-01T00:00:20                         |
++---------------------------------------------+
+
+> SELECT to_local_time('2024-04-01T00:00:20Z'::timestamp AT TIME ZONE 'Europe/Brussels');
++---------------------------------------------+
+| to_local_time(Utf8("2024-04-01T00:00:20Z")) |
++---------------------------------------------+
+| 2024-04-01T00:00:20                         |
++---------------------------------------------+
+
+> SELECT
+  time,
+  arrow_typeof(time) as type,
+  to_local_time(time) as to_local_time,
+  arrow_typeof(to_local_time(time)) as to_local_time_type
+FROM (
+  SELECT '2024-04-01T00:00:20Z'::timestamp AT TIME ZONE 'Europe/Brussels' AS time
+);
++---------------------------+------------------------------------------------+---------------------+-----------------------------+
+| time                      | type                                           | to_local_time       | to_local_time_type          |
++---------------------------+------------------------------------------------+---------------------+-----------------------------+
+| 2024-04-01T00:00:20+02:00 | Timestamp(Nanosecond, Some("Europe/Brussels")) | 2024-04-01T00:00:20 | Timestamp(Nanosecond, None) |
++---------------------------+------------------------------------------------+---------------------+-----------------------------+
+
+# combine `to_local_time()` with `date_bin()` to bin on boundaries in the timezone rather
+# than UTC boundaries
+
+> SELECT date_bin(interval '1 day', to_local_time('2024-04-01T00:00:20Z'::timestamp AT TIME ZONE 'Europe/Brussels')) AS date_bin;
++---------------------+
+| date_bin            |
++---------------------+
+| 2024-04-01T00:00:00 |
++---------------------+
+
+> SELECT date_bin(interval '1 day', to_local_time('2024-04-01T00:00:20Z'::timestamp AT TIME ZONE 'Europe/Brussels')) AT TIME ZONE 'Europe/Brussels' AS date_bin_with_timezone;
++---------------------------+
+| date_bin_with_timezone    |
++---------------------------+
+| 2024-04-01T00:00:00+02:00 |
++---------------------------+
+```
 
 ### `to_timestamp`
 
@@ -2030,6 +2093,7 @@ to_unixtime(expression[, ..., format_n])
 - [array_concat](#array_concat)
 - [array_contains](#array_contains)
 - [array_dims](#array_dims)
+- [array_distance](#array_distance)
 - [array_distinct](#array_distinct)
 - [array_has](#array_has)
 - [array_has_all](#array_has_all)
@@ -2072,6 +2136,7 @@ to_unixtime(expression[, ..., format_n])
 - [list_cat](#list_cat)
 - [list_concat](#list_concat)
 - [list_dims](#list_dims)
+- [list_distance](#list_distance)
 - [list_distinct](#list_distinct)
 - [list_element](#list_element)
 - [list_except](#list_except)
@@ -2324,6 +2389,36 @@ array_dims(array)
 #### Aliases
 
 - list_dims
+
+### `array_distance`
+
+Returns the Euclidean distance between two input arrays of equal length.
+
+```
+array_distance(array1, array2)
+```
+
+#### Arguments
+
+- **array1**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+- **array2**: Array expression.
+  Can be a constant, column, or function, and any combination of array operators.
+
+#### Example
+
+```
+> select array_distance([1, 2], [1, 4]);
++------------------------------------+
+| array_distance(List([1,2], [1,4])) |
++------------------------------------+
+| 2.0                                |
++------------------------------------+
+```
+
+#### Aliases
+
+- list_distance
 
 ### `array_distinct`
 
@@ -3161,9 +3256,13 @@ _Alias of [array_concat](#array_concat)._
 
 _Alias of [array_dims](#array_dims)._
 
+### `list_distance`
+
+_Alias of [array_distance](#array_distance)._
+
 ### `list_distinct`
 
-_Alias of [array_dims](#array_distinct)._
+_Alias of [array_distinct](#array_distinct)._
 
 ### `list_element`
 
@@ -3571,6 +3670,151 @@ Unwraps struct fields into columns.
 +-----------------------+-----------------------+
 | 5                     | a string              |
 +-----------------------+-----------------------+
+```
+
+## Map Functions
+
+- [map](#map)
+- [make_map](#make_map)
+- [map_extract](#map_extract)
+- [map_keys](#map_keys)
+- [map_values](#map_values)
+
+### `map`
+
+Returns an Arrow map with the specified key-value pairs.
+
+```
+map(key, value)
+map(key: value)
+```
+
+#### Arguments
+
+- **key**: Expression to be used for key.
+  Can be a constant, column, or function, any combination of arithmetic or
+  string operators, or a named expression of previous listed.
+- **value**: Expression to be used for value.
+  Can be a constant, column, or function, any combination of arithmetic or
+  string operators, or a named expression of previous listed.
+
+#### Example
+
+```
+SELECT MAP(['POST', 'HEAD', 'PATCH'], [41, 33, null]);
+----
+{POST: 41, HEAD: 33, PATCH: }
+
+SELECT MAP([[1,2], [3,4]], ['a', 'b']);
+----
+{[1, 2]: a, [3, 4]: b}
+
+SELECT MAP { 'a': 1, 'b': 2 };
+----
+{a: 1, b: 2}
+```
+
+### `make_map`
+
+Returns an Arrow map with the specified key-value pairs.
+
+```
+make_map(key_1, value_1, ..., key_n, value_n)
+```
+
+#### Arguments
+
+- **key_n**: Expression to be used for key.
+  Can be a constant, column, or function, any combination of arithmetic or
+  string operators, or a named expression of previous listed.
+- **value_n**: Expression to be used for value.
+  Can be a constant, column, or function, any combination of arithmetic or
+  string operators, or a named expression of previous listed.
+
+#### Example
+
+```
+SELECT MAKE_MAP('POST', 41, 'HEAD', 33, 'PATCH', null);
+----
+{POST: 41, HEAD: 33, PATCH: }
+```
+
+### `map_extract`
+
+Return a list containing the value for a given key or an empty list if the key is not contained in the map.
+
+```
+map_extract(map, key)
+```
+
+#### Arguments
+
+- `map`: Map expression.
+  Can be a constant, column, or function, and any combination of map operators.
+- `key`: Key to extract from the map.
+  Can be a constant, column, or function, any combination of arithmetic or
+  string operators, or a named expression of previous listed.
+
+#### Example
+
+```
+SELECT map_extract(MAP {'a': 1, 'b': NULL, 'c': 3}, 'a');
+----
+[1]
+```
+
+#### Aliases
+
+- element_at
+
+### `map_keys`
+
+Return a list of all keys in the map.
+
+```
+map_keys(map)
+```
+
+#### Arguments
+
+- `map`: Map expression.
+  Can be a constant, column, or function, and any combination of map operators.
+
+#### Example
+
+```
+SELECT map_keys(MAP {'a': 1, 'b': NULL, 'c': 3});
+----
+[a, b, c]
+
+select map_keys(map([100, 5], [42,43]));
+----
+[100, 5]
+```
+
+### `map_values`
+
+Return a list of all values in the map.
+
+```
+map_values(map)
+```
+
+#### Arguments
+
+- `map`: Map expression.
+  Can be a constant, column, or function, and any combination of map operators.
+
+#### Example
+
+```
+SELECT map_values(MAP {'a': 1, 'b': NULL, 'c': 3});
+----
+[1, , 3]
+
+select map_values(map([100, 5], [42,43]));
+----
+[42, 43]
 ```
 
 ## Hashing Functions

@@ -43,14 +43,14 @@ macro_rules! handle_transform_recursion {
 /// There are three categories of TreeNode APIs:
 ///
 /// 1. "Inspecting" APIs to traverse a tree of `&TreeNodes`:
-/// [`apply`], [`visit`], [`exists`].
+///    [`apply`], [`visit`], [`exists`].
 ///
 /// 2. "Transforming" APIs that traverse and consume a tree of `TreeNode`s
-/// producing possibly changed `TreeNode`s: [`transform`], [`transform_up`],
-/// [`transform_down`], [`transform_down_up`], and [`rewrite`].
+///    producing possibly changed `TreeNode`s: [`transform`], [`transform_up`],
+///    [`transform_down`], [`transform_down_up`], and [`rewrite`].
 ///
 /// 3. Internal APIs used to implement the `TreeNode` API: [`apply_children`],
-/// and [`map_children`].
+///    and [`map_children`].
 ///
 /// | Traversal Order | Inspecting | Transforming |
 /// | --- | --- | --- |
@@ -485,6 +485,9 @@ pub trait TreeNodeVisitor<'n>: Sized {
 
 /// A [Visitor](https://en.wikipedia.org/wiki/Visitor_pattern) for recursively
 /// rewriting [`TreeNode`]s via [`TreeNode::rewrite`].
+///
+/// For example you can implement this trait on a struct to rewrite `Expr` or
+/// `LogicalPlan` that needs to track state during the rewrite.
 ///
 /// See [`TreeNode`] for more details on available APIs
 ///

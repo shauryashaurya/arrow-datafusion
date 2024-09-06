@@ -25,16 +25,15 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::datasource::provider::TableProviderFactory;
-use crate::datasource::{create_ordering, TableProvider};
-use crate::execution::context::SessionState;
+use crate::catalog::{TableProvider, TableProviderFactory};
+use crate::datasource::create_ordering;
 
 use arrow_array::{RecordBatch, RecordBatchReader, RecordBatchWriter};
 use arrow_schema::SchemaRef;
 use datafusion_common::{config_err, plan_err, Constraints, DataFusionError, Result};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::{CreateExternalTable, Expr, TableType};
+use datafusion_expr::{CreateExternalTable, Expr, SortExpr, TableType};
 use datafusion_physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion_physical_plan::metrics::MetricsSet;
 use datafusion_physical_plan::stream::RecordBatchReceiverStreamBuilder;
@@ -42,6 +41,7 @@ use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 
 use async_trait::async_trait;
+use datafusion_catalog::Session;
 use futures::StreamExt;
 
 /// A [`TableProviderFactory`] for [`StreamTable`]
@@ -52,7 +52,7 @@ pub struct StreamTableFactory {}
 impl TableProviderFactory for StreamTableFactory {
     async fn create(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
         let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
@@ -248,7 +248,7 @@ impl StreamProvider for FileStreamProvider {
 #[derive(Debug)]
 pub struct StreamConfig {
     source: Arc<dyn StreamProvider>,
-    order: Vec<Vec<Expr>>,
+    order: Vec<Vec<SortExpr>>,
     constraints: Constraints,
 }
 
@@ -263,7 +263,7 @@ impl StreamConfig {
     }
 
     /// Specify a sort order for the stream
-    pub fn with_order(mut self, order: Vec<Vec<Expr>>) -> Self {
+    pub fn with_order(mut self, order: Vec<Vec<SortExpr>>) -> Self {
         self.order = order;
         self
     }
@@ -322,7 +322,7 @@ impl TableProvider for StreamTable {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         limit: Option<usize>,
@@ -347,7 +347,7 @@ impl TableProvider for StreamTable {
 
     async fn insert_into(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         _overwrite: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -438,6 +438,9 @@ impl DataSink for StreamWrite {
             }
         }
         drop(sender);
-        write_task.join_unwind().await
+        write_task
+            .join_unwind()
+            .await
+            .map_err(DataFusionError::ExecutionJoin)?
     }
 }

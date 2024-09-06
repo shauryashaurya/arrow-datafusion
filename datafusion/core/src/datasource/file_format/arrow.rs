@@ -47,12 +47,13 @@ use datafusion_common::{
     not_impl_err, DataFusionError, GetExt, Statistics, DEFAULT_ARROW_EXTENSION,
 };
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion_physical_plan::metrics::MetricsSet;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
@@ -66,7 +67,7 @@ const INITIAL_BUFFER_BYTES: usize = 1048576;
 /// If the buffered Arrow data exceeds this size, it is flushed to object store
 const BUFFER_FLUSH_BYTES: usize = 1024000;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 /// Factory struct used to create [ArrowFormat]
 pub struct ArrowFormatFactory;
 
@@ -88,6 +89,10 @@ impl FileFormatFactory for ArrowFormatFactory {
 
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(ArrowFormat)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -174,7 +179,7 @@ impl FileFormat for ArrowFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for Arrow format");
@@ -337,7 +342,10 @@ impl DataSink for ArrowFileSink {
             }
         }
 
-        demux_task.join_unwind().await?;
+        demux_task
+            .join_unwind()
+            .await
+            .map_err(DataFusionError::ExecutionJoin)??;
         Ok(row_count as u64)
     }
 }
@@ -353,7 +361,7 @@ async fn infer_schema_from_file_stream(
     // Expected format:
     // <magic number "ARROW1"> - 6 bytes
     // <empty padding bytes [to 8 byte boundary]> - 2 bytes
-    // <continutation: 0xFFFFFFFF> - 4 bytes, not present below v0.15.0
+    // <continuation: 0xFFFFFFFF> - 4 bytes, not present below v0.15.0
     // <metadata_size: int32> - 4 bytes
     // <metadata_flatbuffer: bytes>
     // <rest of file bytes>
@@ -365,7 +373,7 @@ async fn infer_schema_from_file_stream(
     // Files should start with these magic bytes
     if bytes[0..6] != ARROW_MAGIC {
         return Err(ArrowError::ParseError(
-            "Arrow file does not contian correct header".to_string(),
+            "Arrow file does not contain correct header".to_string(),
         ))?;
     }
 

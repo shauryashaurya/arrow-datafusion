@@ -15,22 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use crate::signature::{
-    ArrayFunctionSignature, FIXED_SIZE_LIST_WILDCARD, TIMEZONE_WILDCARD,
-};
-use crate::{AggregateUDF, ScalarUDF, Signature, TypeSignature};
+use super::binary::{binary_numeric_coercion, comparison_coercion};
+use crate::{AggregateUDF, ScalarUDF, Signature, TypeSignature, WindowUDF};
 use arrow::{
     compute::can_cast_types,
     datatypes::{DataType, TimeUnit},
 };
-use datafusion_common::utils::{coerced_fixed_size_list_to_list, list_ndims};
 use datafusion_common::{
-    exec_err, internal_datafusion_err, internal_err, plan_err, Result,
+    exec_err, internal_datafusion_err, internal_err, plan_err,
+    utils::{coerced_fixed_size_list_to_list, list_ndims},
+    Result,
 };
-
-use super::binary::{binary_numeric_coercion, comparison_coercion};
+use datafusion_expr_common::signature::{
+    ArrayFunctionSignature, FIXED_SIZE_LIST_WILDCARD, TIMEZONE_WILDCARD,
+};
+use std::sync::Arc;
 
 /// Performs type coercion for scalar function arguments.
 ///
@@ -66,6 +65,13 @@ pub fn data_types_with_scalar_udf(
     try_coerce_types(valid_types, current_types, &signature.type_signature)
 }
 
+/// Performs type coercion for aggregate function arguments.
+///
+/// Returns the data types to which each argument must be coerced to
+/// match `signature`.
+///
+/// For more details on coercion in general, please see the
+/// [`type_coercion`](crate::type_coercion) module.
 pub fn data_types_with_aggregate_udf(
     current_types: &[DataType],
     func: &AggregateUDF,
@@ -85,6 +91,39 @@ pub fn data_types_with_aggregate_udf(
         current_types,
         func,
     )?;
+    if valid_types
+        .iter()
+        .any(|data_type| data_type == current_types)
+    {
+        return Ok(current_types.to_vec());
+    }
+
+    try_coerce_types(valid_types, current_types, &signature.type_signature)
+}
+
+/// Performs type coercion for window function arguments.
+///
+/// Returns the data types to which each argument must be coerced to
+/// match `signature`.
+///
+/// For more details on coercion in general, please see the
+/// [`type_coercion`](crate::type_coercion) module.
+pub fn data_types_with_window_udf(
+    current_types: &[DataType],
+    func: &WindowUDF,
+) -> Result<Vec<DataType>> {
+    let signature = func.signature();
+
+    if current_types.is_empty() {
+        if signature.type_signature.supports_zero_argument() {
+            return Ok(vec![]);
+        } else {
+            return plan_err!("{} does not support zero arguments.", func.name());
+        }
+    }
+
+    let valid_types =
+        get_valid_types_with_window_udf(&signature.type_signature, current_types, func)?;
     if valid_types
         .iter()
         .any(|data_type| data_type == current_types)
@@ -136,7 +175,14 @@ fn try_coerce_types(
     let mut valid_types = valid_types;
 
     // Well-supported signature that returns exact valid types.
-    if !valid_types.is_empty() && matches!(type_signature, TypeSignature::UserDefined) {
+    if !valid_types.is_empty()
+        && matches!(
+            type_signature,
+            TypeSignature::UserDefined
+                | TypeSignature::Numeric(_)
+                | TypeSignature::Coercible(_)
+        )
+    {
         // exact valid types
         assert_eq!(valid_types.len(), 1);
         let valid_types = valid_types.swap_remove(0);
@@ -197,6 +243,27 @@ fn get_valid_types_with_aggregate_udf(
             .filter_map(|t| {
                 get_valid_types_with_aggregate_udf(t, current_types, func).ok()
             })
+            .flatten()
+            .collect::<Vec<_>>(),
+        _ => get_valid_types(signature, current_types)?,
+    };
+
+    Ok(valid_types)
+}
+
+fn get_valid_types_with_window_udf(
+    signature: &TypeSignature,
+    current_types: &[DataType],
+    func: &WindowUDF,
+) -> Result<Vec<Vec<DataType>>> {
+    let valid_types = match signature {
+        TypeSignature::UserDefined => match func.coerce_types(current_types) {
+            Ok(coerced_types) => vec![coerced_types],
+            Err(e) => return exec_err!("User-defined coercion failed with {:?}", e),
+        },
+        TypeSignature::OneOf(signatures) => signatures
+            .iter()
+            .filter_map(|t| get_valid_types_with_window_udf(t, current_types, func).ok())
             .flatten()
             .collect::<Vec<_>>(),
         _ => get_valid_types(signature, current_types)?,
@@ -337,6 +404,30 @@ fn get_valid_types(
 
             vec![vec![valid_type; *number]]
         }
+        TypeSignature::Coercible(target_types) => {
+            if target_types.is_empty() {
+                return plan_err!(
+                    "The signature expected at least one argument but received {}",
+                    current_types.len()
+                );
+            }
+            if target_types.len() != current_types.len() {
+                return plan_err!(
+                    "The signature expected {} arguments but received {}",
+                    target_types.len(),
+                    current_types.len()
+                );
+            }
+
+            for (data_type, target_type) in current_types.iter().zip(target_types.iter())
+            {
+                if !can_cast_types(data_type, target_type) {
+                    return plan_err!("{data_type} is not coercible to {target_type}");
+                }
+            }
+
+            vec![target_types.to_owned()]
+        }
         TypeSignature::Uniform(number, valid_types) => valid_types
             .iter()
             .map(|valid_type| (0..*number).map(|_| valid_type.clone()).collect())
@@ -377,6 +468,16 @@ fn get_valid_types(
 
                 array(&current_types[0])
                     .map_or_else(|| vec![vec![]], |array_type| vec![vec![array_type]])
+            }
+            ArrayFunctionSignature::MapArray => {
+                if current_types.len() != 1 {
+                    return Ok(vec![vec![]]);
+                }
+
+                match &current_types[0] {
+                    DataType::Map(_, _) => vec![vec![current_types[0].clone()]],
+                    _ => vec![vec![]],
+                }
             }
         },
         TypeSignature::Any(number) => {
@@ -573,6 +674,10 @@ fn coerced_from<'a>(
         (Interval(_), _) if matches!(type_from, Utf8 | LargeUtf8) => {
             Some(type_into.clone())
         }
+        // We can go into a Utf8View from a Utf8 or LargeUtf8
+        (Utf8View, _) if matches!(type_from, Utf8 | LargeUtf8 | Null) => {
+            Some(type_into.clone())
+        }
         // Any type can be coerced into strings
         (Utf8 | LargeUtf8, _) => Some(type_into.clone()),
         (Null, _) if can_cast_types(type_from, type_into) => Some(type_into.clone()),
@@ -637,6 +742,18 @@ mod tests {
     use arrow::datatypes::Field;
 
     #[test]
+    fn test_string_conversion() {
+        let cases = vec![
+            (DataType::Utf8View, DataType::Utf8, true),
+            (DataType::Utf8View, DataType::LargeUtf8, true),
+        ];
+
+        for case in cases {
+            assert_eq!(can_coerce_from(&case.0, &case.1), case.2);
+        }
+    }
+
+    #[test]
     fn test_maybe_data_types() {
         // this vec contains: arg1, arg2, expected result
         let cases = vec![
@@ -646,7 +763,7 @@ mod tests {
                 vec![DataType::UInt8, DataType::UInt16],
                 Some(vec![DataType::UInt8, DataType::UInt16]),
             ),
-            // 2 entries, can coerse values
+            // 2 entries, can coerce values
             (
                 vec![DataType::UInt16, DataType::UInt16],
                 vec![DataType::UInt8, DataType::UInt16],

@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FilterExec evaluates a boolean predicate against all input batches to determine which rows to
-//! include in its output batches.
-
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use super::{
     ColumnStatistics, DisplayAs, ExecutionPlanProperties, PlanProperties,
@@ -37,7 +34,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::stats::Precision;
-use datafusion_common::{plan_err, DataFusionError, Result};
+use datafusion_common::{internal_err, plan_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::BinaryExpr;
@@ -60,8 +57,9 @@ pub struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// Selectivity for statistics. 0 = no rows, 100 all rows
+    /// Selectivity for statistics. 0 = no rows, 100 = all rows
     default_selectivity: u8,
+    /// Properties equivalence properties, partitioning, etc.
     cache: PlanProperties,
 }
 
@@ -78,14 +76,14 @@ impl FilterExec {
                     Self::compute_properties(&input, &predicate, default_selectivity)?;
                 Ok(Self {
                     predicate,
-                    input: input.clone(),
+                    input: Arc::clone(&input),
                     metrics: ExecutionPlanMetricsSet::new(),
                     default_selectivity,
                     cache,
                 })
             }
             other => {
-                plan_err!("Filter predicate must return boolean values, not {other:?}")
+                plan_err!("Filter predicate must return BOOLEAN values, got {other:?}")
             }
         }
     }
@@ -95,7 +93,9 @@ impl FilterExec {
         default_selectivity: u8,
     ) -> Result<Self, DataFusionError> {
         if default_selectivity > 100 {
-            return plan_err!("Default filter selectivity needs to be less than 100");
+            return plan_err!(
+                "Default filter selectivity value needs to be less than or equal to 100"
+            );
         }
         self.default_selectivity = default_selectivity;
         Ok(self)
@@ -126,7 +126,7 @@ impl FilterExec {
         let schema = input.schema();
         if !check_support(predicate, &schema) {
             let selectivity = default_selectivity as f64 / 100.0;
-            let mut stats = input_stats.into_inexact();
+            let mut stats = input_stats.to_inexact();
             stats.num_rows = stats.num_rows.with_estimated_selectivity(selectivity);
             stats.total_byte_size = stats
                 .total_byte_size
@@ -263,7 +263,7 @@ impl ExecutionPlan for FilterExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        FilterExec::try_new(self.predicate.clone(), children.swap_remove(0))
+        FilterExec::try_new(Arc::clone(&self.predicate), children.swap_remove(0))
             .and_then(|e| {
                 let selectivity = e.default_selectivity();
                 e.with_default_selectivity(selectivity)
@@ -280,7 +280,7 @@ impl ExecutionPlan for FilterExec {
         let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         Ok(Box::pin(FilterExecStream {
             schema: self.input.schema(),
-            predicate: self.predicate.clone(),
+            predicate: Arc::clone(&self.predicate),
             input: self.input.execute(partition, context)?,
             baseline_metrics,
         }))
@@ -324,7 +324,7 @@ fn collect_new_statistics(
                     (Precision::Inexact(lower), Precision::Inexact(upper))
                 };
                 ColumnStatistics {
-                    null_count: input_column_stats[idx].null_count.clone().to_inexact(),
+                    null_count: input_column_stats[idx].null_count.to_inexact(),
                     max_value,
                     min_value,
                     distinct_count: distinct_count.to_inexact(),
@@ -347,7 +347,7 @@ struct FilterExecStream {
     baseline_metrics: BaselineMetrics,
 }
 
-pub(crate) fn batch_filter(
+pub fn batch_filter(
     batch: &RecordBatch,
     predicate: &Arc<dyn PhysicalExpr>,
 ) -> Result<RecordBatch> {
@@ -355,9 +355,15 @@ pub(crate) fn batch_filter(
         .evaluate(batch)
         .and_then(|v| v.into_array(batch.num_rows()))
         .and_then(|array| {
-            Ok(as_boolean_array(&array)?)
+            Ok(match as_boolean_array(&array) {
                 // apply filter array to record batch
-                .and_then(|filter_array| Ok(filter_record_batch(batch, filter_array)?))
+                Ok(filter_array) => filter_record_batch(batch, filter_array)?,
+                Err(_) => {
+                    return internal_err!(
+                        "Cannot create filter_array from non-boolean predicates"
+                    );
+                }
+            })
         })
 }
 
@@ -370,26 +376,20 @@ impl Stream for FilterExecStream {
     ) -> Poll<Option<Self::Item>> {
         let poll;
         loop {
-            match self.input.poll_next_unpin(cx) {
-                Poll::Ready(value) => match value {
-                    Some(Ok(batch)) => {
-                        let timer = self.baseline_metrics.elapsed_compute().timer();
-                        let filtered_batch = batch_filter(&batch, &self.predicate)?;
-                        // skip entirely filtered batches
-                        if filtered_batch.num_rows() == 0 {
-                            continue;
-                        }
-                        timer.done();
-                        poll = Poll::Ready(Some(Ok(filtered_batch)));
-                        break;
+            match ready!(self.input.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let timer = self.baseline_metrics.elapsed_compute().timer();
+                    let filtered_batch = batch_filter(&batch, &self.predicate)?;
+                    timer.done();
+                    // skip entirely filtered batches
+                    if filtered_batch.num_rows() == 0 {
+                        continue;
                     }
-                    _ => {
-                        poll = Poll::Ready(value);
-                        break;
-                    }
-                },
-                Poll::Pending => {
-                    poll = Poll::Pending;
+                    poll = Poll::Ready(Some(Ok(filtered_batch)));
+                    break;
+                }
+                value => {
+                    poll = Poll::Ready(value);
                     break;
                 }
             }
@@ -405,7 +405,7 @@ impl Stream for FilterExecStream {
 
 impl RecordBatchStream for FilterExecStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -1124,7 +1124,7 @@ mod tests {
                 binary(col("c1", &schema)?, Operator::LtEq, lit(4i32), &schema)?,
                 &schema,
             )?,
-            Arc::new(EmptyExec::new(schema.clone())),
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
         )?;
 
         exec.statistics().unwrap();

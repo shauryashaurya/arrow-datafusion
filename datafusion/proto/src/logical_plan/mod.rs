@@ -20,7 +20,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::protobuf::logical_plan_node::LogicalPlanType::CustomScan;
-use crate::protobuf::{CustomTableScanNode, LogicalExprNodeCollection};
+use crate::protobuf::{CustomTableScanNode, SortExprNodeCollection};
 use crate::{
     convert_required, into_required,
     protobuf::{
@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-use crate::protobuf::{proto_error, FromProtoError, ToProtoError};
+use crate::protobuf::{proto_error, ToProtoError};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 #[cfg(feature = "parquet")]
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -38,7 +38,10 @@ use datafusion::datasource::file_format::{
 };
 use datafusion::{
     datasource::{
-        file_format::{avro::AvroFormat, csv::CsvFormat, FileFormat},
+        file_format::{
+            avro::AvroFormat, csv::CsvFormat, json::JsonFormat as OtherNdJsonFormat,
+            FileFormat,
+        },
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
         view::ViewTable,
         TableProvider,
@@ -51,7 +54,6 @@ use datafusion_common::{
     context, internal_datafusion_err, internal_err, not_impl_err, DataFusionError,
     Result, TableReference,
 };
-use datafusion_expr::Unnest;
 use datafusion_expr::{
     dml,
     logical_plan::{
@@ -60,13 +62,15 @@ use datafusion_expr::{
         EmptyRelation, Extension, Join, JoinConstraint, Limit, Prepare, Projection,
         Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
     },
-    DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
+    DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
+    WindowUDF,
 };
+use datafusion_expr::{AggregateUDF, Unnest};
 
+use self::to_proto::{serialize_expr, serialize_exprs};
+use crate::logical_plan::to_proto::serialize_sorts;
 use prost::bytes::BufMut;
 use prost::Message;
-
-use self::to_proto::serialize_expr;
 
 pub mod file_formats;
 pub mod from_proto;
@@ -131,7 +135,7 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync {
 
     fn try_encode_file_format(
         &self,
-        _buf: &[u8],
+        _buf: &mut Vec<u8>,
         _node: Arc<dyn FileFormatFactory>,
     ) -> Result<()> {
         Ok(())
@@ -142,6 +146,24 @@ pub trait LogicalExtensionCodec: Debug + Send + Sync {
     }
 
     fn try_encode_udf(&self, _node: &ScalarUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_decode_udaf(&self, name: &str, _buf: &[u8]) -> Result<Arc<AggregateUDF>> {
+        not_impl_err!(
+            "LogicalExtensionCodec is not provided for aggregate function {name}"
+        )
+    }
+
+    fn try_encode_udaf(&self, _node: &AggregateUDF, _buf: &mut Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_decode_udwf(&self, name: &str, _buf: &[u8]) -> Result<Arc<WindowUDF>> {
+        not_impl_err!("LogicalExtensionCodec is not provided for window function {name}")
+    }
+
+    fn try_encode_udwf(&self, _node: &WindowUDF, _buf: &mut Vec<u8>) -> Result<()> {
         Ok(())
     }
 }
@@ -252,13 +274,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     values
                         .values_list
                         .chunks_exact(n_cols)
-                        .map(|r| {
-                            r.iter()
-                                .map(|expr| {
-                                    from_proto::parse_expr(expr, ctx, extension_codec)
-                                })
-                                .collect::<Result<Vec<_>, FromProtoError>>()
-                        })
+                        .map(|r| from_proto::parse_exprs(r, ctx, extension_codec))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| e.into())
                 }?;
@@ -267,11 +283,8 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Projection(projection) => {
                 let input: LogicalPlan =
                     into_logical_plan!(projection.input, ctx, extension_codec)?;
-                let expr: Vec<Expr> = projection
-                    .expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let expr: Vec<Expr> =
+                    from_proto::parse_exprs(&projection.expr, ctx, extension_codec)?;
 
                 let new_proj = project(input, expr)?;
                 match projection.optional_alias.as_ref() {
@@ -303,26 +316,17 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Window(window) => {
                 let input: LogicalPlan =
                     into_logical_plan!(window.input, ctx, extension_codec)?;
-                let window_expr = window
-                    .window_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let window_expr =
+                    from_proto::parse_exprs(&window.window_expr, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input).window(window_expr)?.build()
             }
             LogicalPlanType::Aggregate(aggregate) => {
                 let input: LogicalPlan =
                     into_logical_plan!(aggregate.input, ctx, extension_codec)?;
-                let group_expr = aggregate
-                    .group_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
-                let aggr_expr = aggregate
-                    .aggr_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let group_expr =
+                    from_proto::parse_exprs(&aggregate.group_expr, ctx, extension_codec)?;
+                let aggr_expr =
+                    from_proto::parse_exprs(&aggregate.aggr_expr, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input)
                     .aggregate(group_expr, aggr_expr)?
                     .build()
@@ -340,20 +344,16 @@ impl AsLogicalPlan for LogicalPlanNode {
                     projection = Some(column_indices);
                 }
 
-                let filters = scan
-                    .filters
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters =
+                    from_proto::parse_exprs(&scan.filters, ctx, extension_codec)?;
 
                 let mut all_sort_orders = vec![];
                 for order in &scan.file_sort_order {
-                    let file_sort_order = order
-                        .logical_expr_nodes
-                        .iter()
-                        .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    all_sort_orders.push(file_sort_order)
+                    all_sort_orders.push(from_proto::parse_sorts(
+                        &order.sort_expr_nodes,
+                        ctx,
+                        extension_codec,
+                    )?)
                 }
 
                 let file_format: Arc<dyn FileFormat> =
@@ -377,7 +377,17 @@ impl AsLogicalPlan for LogicalPlanNode {
                             if let Some(options) = options {
                                 csv = csv.with_options(options.try_into()?)
                             }
-                            Arc::new(csv)},
+                            Arc::new(csv)
+                        },
+                        FileFormatType::Json(protobuf::NdJsonFormat {
+                            options
+                        }) => {
+                            let mut json = OtherNdJsonFormat::default();
+                            if let Some(options) = options {
+                                json = json.with_options(options.try_into()?)
+                            }
+                            Arc::new(json)
+                        }
                         FileFormatType::Avro(..) => Arc::new(AvroFormat),
                     };
 
@@ -444,11 +454,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                     projection = Some(column_indices);
                 }
 
-                let filters = scan
-                    .filters
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters =
+                    from_proto::parse_exprs(&scan.filters, ctx, extension_codec)?;
 
                 let table_name =
                     from_table_reference(scan.table_name.as_ref(), "CustomScan")?;
@@ -471,11 +478,8 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::Sort(sort) => {
                 let input: LogicalPlan =
                     into_logical_plan!(sort.input, ctx, extension_codec)?;
-                let sort_expr: Vec<Expr> = sort
-                    .expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let sort_expr: Vec<SortExpr> =
+                    from_proto::parse_sorts(&sort.expr, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input).sort(sort_expr)?.build()
             }
             LogicalPlanType::Repartition(repartition) => {
@@ -494,12 +498,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         hash_expr: pb_hash_expr,
                         partition_count,
                     }) => Partitioning::Hash(
-                        pb_hash_expr
-                            .iter()
-                            .map(|expr| {
-                                from_proto::parse_expr(expr, ctx, extension_codec)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
+                        from_proto::parse_exprs(pb_hash_expr, ctx, extension_codec)?,
                         *partition_count as usize,
                     ),
                     PartitionMethod::RoundRobin(partition_count) => {
@@ -539,12 +538,11 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 let mut order_exprs = vec![];
                 for expr in &create_extern_table.order_exprs {
-                    let order_expr = expr
-                        .logical_expr_nodes
-                        .iter()
-                        .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                        .collect::<Result<Vec<Expr>, _>>()?;
-                    order_exprs.push(order_expr)
+                    order_exprs.push(from_proto::parse_sorts(
+                        &expr.sort_expr_nodes,
+                        ctx,
+                        extension_codec,
+                    )?);
                 }
 
                 let mut column_defaults =
@@ -662,16 +660,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                 LogicalPlanBuilder::from(input).limit(skip, fetch)?.build()
             }
             LogicalPlanType::Join(join) => {
-                let left_keys: Vec<Expr> = join
-                    .left_join_key
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let right_keys: Vec<Expr> = join
-                    .right_join_key
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let left_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.left_join_key, ctx, extension_codec)?;
+                let right_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.right_join_key, ctx, extension_codec)?;
                 let join_type =
                     protobuf::JoinType::try_from(join.join_type).map_err(|_| {
                         proto_error(format!(
@@ -773,27 +765,20 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlanType::DistinctOn(distinct_on) => {
                 let input: LogicalPlan =
                     into_logical_plan!(distinct_on.input, ctx, extension_codec)?;
-                let on_expr = distinct_on
-                    .on_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
-                let select_expr = distinct_on
-                    .select_expr
-                    .iter()
-                    .map(|expr| from_proto::parse_expr(expr, ctx, extension_codec))
-                    .collect::<Result<Vec<Expr>, _>>()?;
+                let on_expr =
+                    from_proto::parse_exprs(&distinct_on.on_expr, ctx, extension_codec)?;
+                let select_expr = from_proto::parse_exprs(
+                    &distinct_on.select_expr,
+                    ctx,
+                    extension_codec,
+                )?;
                 let sort_expr = match distinct_on.sort_expr.len() {
                     0 => None,
-                    _ => Some(
-                        distinct_on
-                            .sort_expr
-                            .iter()
-                            .map(|expr| {
-                                from_proto::parse_expr(expr, ctx, extension_codec)
-                            })
-                            .collect::<Result<Vec<Expr>, _>>()?,
-                    ),
+                    _ => Some(from_proto::parse_sorts(
+                        &distinct_on.sort_expr,
+                        ctx,
+                        extension_codec,
+                    )?),
                 };
                 LogicalPlanBuilder::from(input)
                     .distinct_on(on_expr, select_expr, sort_expr)?
@@ -912,11 +897,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 } else {
                     values[0].len()
                 } as u64;
-                let values_list = values
-                    .iter()
-                    .flatten()
-                    .map(|v| serialize_expr(v, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let values_list =
+                    serialize_exprs(values.iter().flatten(), extension_codec)?;
                 Ok(protobuf::LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Values(
                         protobuf::ValuesNode {
@@ -951,10 +933,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                 };
                 let schema: protobuf::Schema = schema.as_ref().try_into()?;
 
-                let filters: Vec<protobuf::LogicalExprNode> = filters
-                    .iter()
-                    .map(|filter| serialize_expr(filter, extension_codec))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let filters: Vec<protobuf::LogicalExprNode> =
+                    serialize_exprs(filters, extension_codec)?;
 
                 if let Some(listing_table) = source.downcast_ref::<ListingTable>() {
                     let any = listing_table.options().format.as_any();
@@ -978,6 +958,14 @@ impl AsLogicalPlan for LogicalPlanNode {
                                 }));
                         }
 
+                        if let Some(json) = any.downcast_ref::<OtherNdJsonFormat>() {
+                            let options = json.options();
+                            maybe_some_type =
+                                Some(FileFormatType::Json(protobuf::NdJsonFormat {
+                                    options: Some(options.try_into()?),
+                                }))
+                        }
+
                         if any.is::<AvroFormat>() {
                             maybe_some_type =
                                 Some(FileFormatType::Avro(protobuf::AvroFormat {}))
@@ -995,13 +983,10 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                     let options = listing_table.options();
 
-                    let mut exprs_vec: Vec<LogicalExprNodeCollection> = vec![];
+                    let mut exprs_vec: Vec<SortExprNodeCollection> = vec![];
                     for order in &options.file_sort_order {
-                        let expr_vec = LogicalExprNodeCollection {
-                            logical_expr_nodes: order
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, ToProtoError>>()?,
+                        let expr_vec = SortExprNodeCollection {
+                            sort_expr_nodes: serialize_sorts(order, extension_codec)?,
                         };
                         exprs_vec.push(expr_vec);
                     }
@@ -1079,10 +1064,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                                     extension_codec,
                                 )?,
                             )),
-                            expr: expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, ToProtoError>>()?,
+                            expr: serialize_exprs(expr, extension_codec)?,
                             optional_alias: None,
                         },
                     ))),
@@ -1134,22 +1116,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                     )?;
                 let sort_expr = match sort_expr {
                     None => vec![],
-                    Some(sort_expr) => sort_expr
-                        .iter()
-                        .map(|expr| serialize_expr(expr, extension_codec))
-                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(sort_expr) => serialize_sorts(sort_expr, extension_codec)?,
                 };
                 Ok(protobuf::LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::DistinctOn(Box::new(
                         protobuf::DistinctOnNode {
-                            on_expr: on_expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, _>>()?,
-                            select_expr: select_expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, _>>()?,
+                            on_expr: serialize_exprs(on_expr, extension_codec)?,
+                            select_expr: serialize_exprs(select_expr, extension_codec)?,
                             sort_expr,
                             input: Some(Box::new(input)),
                         },
@@ -1168,10 +1141,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Window(Box::new(
                         protobuf::WindowNode {
                             input: Some(Box::new(input)),
-                            window_expr: window_expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, _>>()?,
+                            window_expr: serialize_exprs(window_expr, extension_codec)?,
                         },
                     ))),
                 })
@@ -1191,14 +1161,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Aggregate(Box::new(
                         protobuf::AggregateNode {
                             input: Some(Box::new(input)),
-                            group_expr: group_expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, _>>()?,
-                            aggr_expr: aggr_expr
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, _>>()?,
+                            group_expr: serialize_exprs(group_expr, extension_codec)?,
+                            aggr_expr: serialize_exprs(aggr_expr, extension_codec)?,
                         },
                     ))),
                 })
@@ -1296,15 +1260,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                         input.as_ref(),
                         extension_codec,
                     )?;
-                let selection_expr: Vec<protobuf::LogicalExprNode> = expr
-                    .iter()
-                    .map(|expr| serialize_expr(expr, extension_codec))
-                    .collect::<Result<Vec<_>, ToProtoError>>()?;
+                let sort_expr: Vec<protobuf::SortExprNode> =
+                    serialize_sorts(expr, extension_codec)?;
                 Ok(protobuf::LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Sort(Box::new(
                         protobuf::SortNode {
                             input: Some(Box::new(input)),
-                            expr: selection_expr,
+                            expr: sort_expr,
                             fetch: fetch.map(|f| f as i64).unwrap_or(-1i64),
                         },
                     ))),
@@ -1328,10 +1290,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let pb_partition_method = match partitioning_scheme {
                     Partitioning::Hash(exprs, partition_count) => {
                         PartitionMethod::Hash(protobuf::HashRepartition {
-                            hash_expr: exprs
-                                .iter()
-                                .map(|expr| serialize_expr(expr, extension_codec))
-                                .collect::<Result<Vec<_>, ToProtoError>>()?,
+                            hash_expr: serialize_exprs(exprs, extension_codec)?,
                             partition_count: *partition_count as u64,
                         })
                     }
@@ -1377,13 +1336,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                     column_defaults,
                 },
             )) => {
-                let mut converted_order_exprs: Vec<LogicalExprNodeCollection> = vec![];
+                let mut converted_order_exprs: Vec<SortExprNodeCollection> = vec![];
                 for order in order_exprs {
-                    let temp = LogicalExprNodeCollection {
-                        logical_expr_nodes: order
-                            .iter()
-                            .map(|expr| serialize_expr(expr, extension_codec))
-                            .collect::<Result<Vec<_>, ToProtoError>>()?,
+                    let temp = SortExprNodeCollection {
+                        sort_expr_nodes: serialize_sorts(order, extension_codec)?,
                     };
                     converted_order_exprs.push(temp);
                 }
@@ -1606,6 +1562,9 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for CreateMemoryTable",
             )),
+            LogicalPlan::Ddl(DdlStatement::CreateIndex(_)) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for CreateIndex",
+            )),
             LogicalPlan::Ddl(DdlStatement::DropTable(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for DropTable",
             )),
@@ -1648,10 +1607,9 @@ impl AsLogicalPlan for LogicalPlanNode {
                     input,
                     extension_codec,
                 )?;
-
-                let buf = Vec::new();
+                let mut buf = Vec::new();
                 extension_codec
-                    .try_encode_file_format(&buf, file_type_to_format(file_type)?)?;
+                    .try_encode_file_format(&mut buf, file_type_to_format(file_type)?)?;
 
                 Ok(protobuf::LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::CopyTo(Box::new(

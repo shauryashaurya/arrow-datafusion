@@ -24,7 +24,6 @@ use crate::join_key_set::JoinKeySet;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{internal_err, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
-use datafusion_expr::logical_plan::tree_node::unwrap_arc;
 use datafusion_expr::logical_plan::{
     CrossJoin, Filter, Join, JoinConstraint, JoinType, LogicalPlan, Projection,
 };
@@ -86,7 +85,7 @@ impl OptimizerRule for EliminateCrossJoin {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let plan_schema = plan.schema().clone();
+        let plan_schema = Arc::clone(plan.schema());
         let mut possible_join_keys = JoinKeySet::new();
         let mut all_inputs: Vec<LogicalPlan> = vec![];
 
@@ -114,7 +113,7 @@ impl OptimizerRule for EliminateCrossJoin {
                 input, predicate, ..
             } = filter;
             flatten_join_inputs(
-                unwrap_arc(input),
+                Arc::unwrap_or_clone(input),
                 &mut possible_join_keys,
                 &mut all_inputs,
             )?;
@@ -155,7 +154,7 @@ impl OptimizerRule for EliminateCrossJoin {
         if &plan_schema != left.schema() {
             left = LogicalPlan::Projection(Projection::new_from_schema(
                 Arc::new(left),
-                plan_schema.clone(),
+                Arc::clone(&plan_schema),
             ));
         }
 
@@ -217,12 +216,28 @@ fn flatten_join_inputs(
                 );
             }
             possible_join_keys.insert_all_owned(join.on);
-            flatten_join_inputs(unwrap_arc(join.left), possible_join_keys, all_inputs)?;
-            flatten_join_inputs(unwrap_arc(join.right), possible_join_keys, all_inputs)?;
+            flatten_join_inputs(
+                Arc::unwrap_or_clone(join.left),
+                possible_join_keys,
+                all_inputs,
+            )?;
+            flatten_join_inputs(
+                Arc::unwrap_or_clone(join.right),
+                possible_join_keys,
+                all_inputs,
+            )?;
         }
         LogicalPlan::CrossJoin(join) => {
-            flatten_join_inputs(unwrap_arc(join.left), possible_join_keys, all_inputs)?;
-            flatten_join_inputs(unwrap_arc(join.right), possible_join_keys, all_inputs)?;
+            flatten_join_inputs(
+                Arc::unwrap_or_clone(join.left),
+                possible_join_keys,
+                all_inputs,
+            )?;
+            flatten_join_inputs(
+                Arc::unwrap_or_clone(join.right),
+                possible_join_keys,
+                all_inputs,
+            )?;
         }
         _ => {
             all_inputs.push(plan);
@@ -363,7 +378,7 @@ fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
                 extract_possible_join_keys(left, &mut left_join_keys);
                 extract_possible_join_keys(right, &mut right_join_keys);
 
-                join_keys.insert_intersection(left_join_keys, right_join_keys)
+                join_keys.insert_intersection(&left_join_keys, &right_join_keys)
             }
             _ => (),
         };
@@ -386,9 +401,7 @@ fn remove_join_expressions(expr: Expr, join_keys: &JoinKeySet) -> Option<Expr> {
             None
         }
         // Fix for issue#78 join predicates from inside of OR expr also pulled up properly.
-        Expr::BinaryExpr(BinaryExpr { left, op, right })
-            if matches!(op, Operator::And | Operator::Or) =>
-        {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == Operator::And => {
             let l = remove_join_expressions(*left, join_keys);
             let r = remove_join_expressions(*right, join_keys);
             match (l, r) {
@@ -402,7 +415,20 @@ fn remove_join_expressions(expr: Expr, join_keys: &JoinKeySet) -> Option<Expr> {
                 _ => None,
             }
         }
-
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == Operator::Or => {
+            let l = remove_join_expressions(*left, join_keys);
+            let r = remove_join_expressions(*right, join_keys);
+            match (l, r) {
+                (Some(ll), Some(rr)) => Some(Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(ll),
+                    op,
+                    Box::new(rr),
+                ))),
+                // When either `left` or `right` is empty, it means they are `true`
+                // so OR'ing anything with them will also be true
+                _ => None,
+            }
+        }
         _ => Some(expr),
     }
 }
@@ -420,7 +446,7 @@ mod tests {
     };
 
     fn assert_optimized_plan_eq(plan: LogicalPlan, expected: Vec<&str>) {
-        let starting_schema = plan.schema().clone();
+        let starting_schema = Arc::clone(plan.schema());
         let rule = EliminateCrossJoin::new();
         let transformed_plan = rule.rewrite(plan, &OptimizerContext::new()).unwrap();
         assert!(transformed_plan.transformed, "failed to optimize plan");
@@ -995,6 +1021,7 @@ mod tests {
         let t4 = test_table_scan_with_name("t4")?;
 
         // could eliminate to inner join
+        // filter: (t1.a = t2.a OR t2.c < 15) AND (t1.a = t2.a AND tc.2 = 688)
         let plan1 = LogicalPlanBuilder::from(t1)
             .cross_join(t2)?
             .filter(binary_expr(
@@ -1012,6 +1039,10 @@ mod tests {
         let plan2 = LogicalPlanBuilder::from(t3).cross_join(t4)?.build()?;
 
         // could eliminate to inner join
+        // filter:
+        //   ((t3.a = t1.a AND t4.c < 15) OR (t3.a = t1.a AND t4.c = 688))
+        //     AND
+        //   ((t3.a = t4.a AND t4.c < 15) OR (t3.a = t4.a AND t3.c = 688) OR (t3.a = t4.a AND t3.b = t4.b))
         let plan = LogicalPlanBuilder::from(plan1)
             .cross_join(plan2)?
             .filter(binary_expr(
@@ -1057,7 +1088,7 @@ mod tests {
             "Filter: (t4.c < UInt32(15) OR t4.c = UInt32(688)) AND (t4.c < UInt32(15) OR t3.c = UInt32(688) OR t3.b = t4.b) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "  Inner Join: t3.a = t4.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "    Inner Join: t1.a = t3.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
-            "      Filter: t2.c < UInt32(15) AND t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
+            "      Filter: t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "        Inner Join: t1.a = t2.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "          TableScan: t1 [a:UInt32, b:UInt32, c:UInt32]",
             "          TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]",
@@ -1084,6 +1115,12 @@ mod tests {
         let plan2 = LogicalPlanBuilder::from(t3).cross_join(t4)?.build()?;
 
         // could eliminate to inner join
+        // Filter:
+        //  ((t3.a = t1.a AND t4.c < 15) OR (t3.a = t1.a AND t4.c = 688))
+        //      AND
+        //  ((t3.a = t4.a AND t4.c < 15) OR (t3.a = t4.a AND t3.c = 688) OR (t3.a = t4.a AND t3.b = t4.b))
+        //      AND
+        //  ((t1.a = t2.a OR t2.c < 15) AND (t1.a = t2.a AND t2.c = 688))
         let plan = LogicalPlanBuilder::from(plan1)
             .cross_join(plan2)?
             .filter(binary_expr(
@@ -1142,7 +1179,7 @@ mod tests {
             .build()?;
 
         let expected = vec![
-            "Filter: (t4.c < UInt32(15) OR t4.c = UInt32(688)) AND (t4.c < UInt32(15) OR t3.c = UInt32(688) OR t3.b = t4.b) AND t2.c < UInt32(15) AND t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
+            "Filter: (t4.c < UInt32(15) OR t4.c = UInt32(688)) AND (t4.c < UInt32(15) OR t3.c = UInt32(688) OR t3.b = t4.b) AND t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "  Inner Join: t3.a = t4.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "    Inner Join: t1.a = t3.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",
             "      Inner Join: t1.a = t2.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]",

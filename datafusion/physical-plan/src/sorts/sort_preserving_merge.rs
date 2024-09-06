@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::common::spawn_buffered;
 use crate::expressions::PhysicalSortExpr;
+use crate::limit::LimitStream;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::sorts::streaming_merge;
 use crate::{
@@ -34,6 +35,7 @@ use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::PhysicalSortRequirement;
 
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use log::{debug, trace};
 
 /// Sort preserving merge execution plan
@@ -163,6 +165,21 @@ impl ExecutionPlan for SortPreservingMergeExec {
         &self.cache
     }
 
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Sets the number of rows to fetch
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(Self {
+            input: Arc::clone(&self.input),
+            expr: self.expr.clone(),
+            metrics: self.metrics.clone(),
+            fetch: limit,
+            cache: self.cache.clone(),
+        }))
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::UnspecifiedDistribution]
     }
@@ -171,7 +188,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
         vec![false]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         vec![Some(PhysicalSortRequirement::from_sort_exprs(&self.expr))]
     }
 
@@ -188,7 +205,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(
-            SortPreservingMergeExec::new(self.expr.clone(), children[0].clone())
+            SortPreservingMergeExec::new(self.expr.clone(), Arc::clone(&children[0]))
                 .with_fetch(self.fetch),
         ))
     }
@@ -223,16 +240,28 @@ impl ExecutionPlan for SortPreservingMergeExec {
             0 => internal_err!(
                 "SortPreservingMergeExec requires at least one input partition"
             ),
-            1 => {
-                // bypass if there is only one partition to merge (no metrics in this case either)
-                let result = self.input.execute(0, context);
-                debug!("Done getting stream for SortPreservingMergeExec::execute with 1 input");
-                result
-            }
+            1 => match self.fetch {
+                Some(fetch) => {
+                    let stream = self.input.execute(0, context)?;
+                    debug!("Done getting stream for SortPreservingMergeExec::execute with 1 input with {fetch}");
+                    Ok(Box::pin(LimitStream::new(
+                        stream,
+                        0,
+                        Some(fetch),
+                        BaselineMetrics::new(&self.metrics, partition),
+                    )))
+                }
+                None => {
+                    let stream = self.input.execute(0, context);
+                    debug!("Done getting stream for SortPreservingMergeExec::execute with 1 input without fetch");
+                    stream
+                }
+            },
             _ => {
                 let receivers = (0..input_partitions)
                     .map(|partition| {
-                        let stream = self.input.execute(partition, context.clone())?;
+                        let stream =
+                            self.input.execute(partition, Arc::clone(&context))?;
                         Ok(spawn_buffered(stream, 1))
                     })
                     .collect::<Result<_>>()?;
@@ -262,6 +291,10 @@ impl ExecutionPlan for SortPreservingMergeExec {
 
     fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
     }
 }
 
@@ -587,8 +620,9 @@ mod tests {
             },
         }];
 
-        let basic = basic_sort(csv.clone(), sort.clone(), task_ctx.clone()).await;
-        let partition = partition_sort(csv, sort, task_ctx.clone()).await;
+        let basic =
+            basic_sort(Arc::clone(&csv), sort.clone(), Arc::clone(&task_ctx)).await;
+        let partition = partition_sort(csv, sort, Arc::clone(&task_ctx)).await;
 
         let basic = arrow::util::pretty::pretty_format_batches(&[basic])
             .unwrap()
@@ -654,10 +688,11 @@ mod tests {
         }];
 
         let input =
-            sorted_partitioned_input(sort.clone(), &[10, 3, 11], task_ctx.clone())
+            sorted_partitioned_input(sort.clone(), &[10, 3, 11], Arc::clone(&task_ctx))
                 .await?;
-        let basic = basic_sort(input.clone(), sort.clone(), task_ctx.clone()).await;
-        let partition = sorted_merge(input, sort, task_ctx.clone()).await;
+        let basic =
+            basic_sort(Arc::clone(&input), sort.clone(), Arc::clone(&task_ctx)).await;
+        let partition = sorted_merge(input, sort, Arc::clone(&task_ctx)).await;
 
         assert_eq!(basic.num_rows(), 1200);
         assert_eq!(partition.num_rows(), 1200);
@@ -685,9 +720,9 @@ mod tests {
         // Test streaming with default batch size
         let task_ctx = Arc::new(TaskContext::default());
         let input =
-            sorted_partitioned_input(sort.clone(), &[10, 5, 13], task_ctx.clone())
+            sorted_partitioned_input(sort.clone(), &[10, 5, 13], Arc::clone(&task_ctx))
                 .await?;
-        let basic = basic_sort(input.clone(), sort.clone(), task_ctx).await;
+        let basic = basic_sort(Arc::clone(&input), sort.clone(), task_ctx).await;
 
         // batch size of 23
         let task_ctx = TaskContext::default()
@@ -796,6 +831,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sort_merge_single_partition_with_fetch() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 7, 9, 3]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
+        let batch = RecordBatch::try_from_iter(vec![("a", a), ("b", b)]).unwrap();
+        let schema = batch.schema();
+
+        let sort = vec![PhysicalSortExpr {
+            expr: col("b", &schema).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        }];
+        let exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, Arc::new(exec)).with_fetch(Some(2)),
+        );
+
+        let collected = collect(merge, task_ctx).await.unwrap();
+        assert_eq!(collected.len(), 1);
+
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | a |",
+                "| 2 | b |",
+                "+---+---+",
+            ],
+            collected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_merge_single_partition_without_fetch() {
+        let task_ctx = Arc::new(TaskContext::default());
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 7, 9, 3]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
+        let batch = RecordBatch::try_from_iter(vec![("a", a), ("b", b)]).unwrap();
+        let schema = batch.schema();
+
+        let sort = vec![PhysicalSortExpr {
+            expr: col("b", &schema).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        }];
+        let exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
+
+        let collected = collect(merge, task_ctx).await.unwrap();
+        assert_eq!(collected.len(), 1);
+
+        assert_batches_eq!(
+            &[
+                "+---+---+",
+                "| a | b |",
+                "+---+---+",
+                "| 1 | a |",
+                "| 2 | b |",
+                "| 7 | c |",
+                "| 9 | d |",
+                "| 3 | e |",
+                "+---+---+",
+            ],
+            collected.as_slice()
+        );
+    }
+
+    #[tokio::test]
     async fn test_async() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = make_partition(11).schema();
@@ -805,17 +913,18 @@ mod tests {
         }];
 
         let batches =
-            sorted_partitioned_input(sort.clone(), &[5, 7, 3], task_ctx.clone()).await?;
+            sorted_partitioned_input(sort.clone(), &[5, 7, 3], Arc::clone(&task_ctx))
+                .await?;
 
         let partition_count = batches.output_partitioning().partition_count();
         let mut streams = Vec::with_capacity(partition_count);
 
         for partition in 0..partition_count {
-            let mut builder = RecordBatchReceiverStream::builder(schema.clone(), 1);
+            let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 1);
 
             let sender = builder.tx();
 
-            let mut stream = batches.execute(partition, task_ctx.clone()).unwrap();
+            let mut stream = batches.execute(partition, Arc::clone(&task_ctx)).unwrap();
             builder.spawn(async move {
                 while let Some(batch) = stream.next().await {
                     sender.send(batch).await.unwrap();
@@ -849,7 +958,7 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         let merged = merged.remove(0);
-        let basic = basic_sort(batches, sort.clone(), task_ctx.clone()).await;
+        let basic = basic_sort(batches, sort.clone(), Arc::clone(&task_ctx)).await;
 
         let basic = arrow::util::pretty::pretty_format_batches(&[basic])
             .unwrap()
@@ -885,7 +994,9 @@ mod tests {
         let exec = MemoryExec::try_new(&[vec![b1], vec![b2]], schema, None).unwrap();
         let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
 
-        let collected = collect(merge.clone(), task_ctx).await.unwrap();
+        let collected = collect(Arc::clone(&merge) as Arc<dyn ExecutionPlan>, task_ctx)
+            .await
+            .unwrap();
         let expected = [
             "+----+---+",
             "| a  | b |",

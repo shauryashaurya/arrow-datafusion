@@ -18,6 +18,7 @@
 use std::any::Any;
 #[cfg(test)]
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::vec;
 
 use arrow_schema::TimeUnit::Nanosecond;
@@ -27,9 +28,12 @@ use datafusion_common::{
     assert_contains, DataFusionError, ParamValues, Result, ScalarValue,
 };
 use datafusion_expr::{
+    col,
+    dml::CopyTo,
     logical_plan::{LogicalPlan, Prepare},
     test::function_stub::sum_udaf,
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, CreateExternalTable, CreateIndex, DdlStatement, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion_functions::{string, unicode};
 use datafusion_sql::{
@@ -37,8 +41,11 @@ use datafusion_sql::{
     planner::{ParserOptions, SqlToRel},
 };
 
+use crate::common::MockSessionState;
+use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions_aggregate::{
-    approx_median::approx_median_udaf, count::count_udaf,
+    approx_median::approx_median_udaf, count::count_udaf, min_max::max_udaf,
+    min_max::min_udaf,
 };
 use datafusion_functions_aggregate::{average::avg_udaf, grouping::grouping_udaf};
 use rstest::rstest;
@@ -51,7 +58,7 @@ mod common;
 fn test_schema_support() {
     quick_test(
         "SELECT * FROM s1.test",
-        "Projection: s1.test.t_date32, s1.test.t_date64\
+        "Projection: *\
              \n  TableScan: s1.test",
     );
 }
@@ -85,6 +92,7 @@ fn parse_decimals() {
                 parse_float_as_decimal: true,
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
+                enable_options_value_normalization: false,
             },
         );
     }
@@ -139,12 +147,78 @@ fn parse_ident_normalization() {
                 parse_float_as_decimal: false,
                 enable_ident_normalization,
                 support_varchar_with_length: false,
+                enable_options_value_normalization: false,
             },
         );
         if plan.is_ok() {
-            assert_eq!(expected, format!("{plan:?}"));
+            let plan = plan.unwrap();
+            assert_eq!(expected, format!("Ok({plan})"));
         } else {
             assert_eq!(expected, plan.unwrap_err().strip_backtrace());
+        }
+    }
+}
+
+#[test]
+fn test_parse_options_value_normalization() {
+    let test_data = [
+        (
+            "CREATE EXTERNAL TABLE test OPTIONS ('location' 'LoCaTiOn') STORED AS PARQUET LOCATION 'fake_location'",
+            "CreateExternalTable: Bare { table: \"test\" }",
+            HashMap::from([("format.location", "LoCaTiOn")]),
+            false,
+        ),
+        (
+            "CREATE EXTERNAL TABLE test OPTIONS ('location' 'LoCaTiOn') STORED AS PARQUET LOCATION 'fake_location'",
+            "CreateExternalTable: Bare { table: \"test\" }",
+            HashMap::from([("format.location", "location")]),
+            true,
+        ),
+        (
+            "COPY test TO 'fake_location' STORED AS PARQUET OPTIONS ('location' 'LoCaTiOn')",
+            "CopyTo: format=csv output_url=fake_location options: (format.location LoCaTiOn)\n  TableScan: test",
+            HashMap::from([("format.location", "LoCaTiOn")]),
+            false,
+        ),
+        (
+            "COPY test TO 'fake_location' STORED AS PARQUET OPTIONS ('location' 'LoCaTiOn')",
+            "CopyTo: format=csv output_url=fake_location options: (format.location location)\n  TableScan: test",
+            HashMap::from([("format.location", "location")]),
+            true,
+        ),
+    ];
+
+    for (sql, expected_plan, expected_options, enable_options_value_normalization) in
+        test_data
+    {
+        let plan = logical_plan_with_options(
+            sql,
+            ParserOptions {
+                parse_float_as_decimal: false,
+                enable_ident_normalization: false,
+                support_varchar_with_length: false,
+                enable_options_value_normalization,
+            },
+        );
+        if let Ok(plan) = plan {
+            assert_eq!(expected_plan, format!("{plan}"));
+
+            match plan {
+                LogicalPlan::Ddl(DdlStatement::CreateExternalTable(
+                    CreateExternalTable { options, .. },
+                ))
+                | LogicalPlan::Copy(CopyTo { options, .. }) => {
+                    expected_options.iter().for_each(|(k, v)| {
+                        assert_eq!(Some(&v.to_string()), options.get(*k));
+                    });
+                }
+                _ => panic!(
+                    "Expected Ddl(CreateExternalTable) or Copy(CopyTo) but got {:?}",
+                    plan
+                ),
+            }
+        } else {
+            assert_eq!(expected_plan, plan.unwrap_err().strip_backtrace());
         }
     }
 }
@@ -443,7 +517,7 @@ fn plan_copy_to_query() {
     let plan = r#"
 CopyTo: format=csv output_url=output.csv options: ()
   Limit: skip=0, fetch=10
-    Projection: test_decimal.id, test_decimal.price
+    Projection: *
       TableScan: test_decimal
     "#
     .trim();
@@ -564,22 +638,12 @@ fn select_repeated_column() {
 }
 
 #[test]
-fn select_wildcard_with_repeated_column() {
-    let sql = "SELECT *, age FROM person";
-    let err = logical_plan(sql).expect_err("query should have failed");
-    assert_eq!(
-        "Error during planning: Projections require unique expression names but the expression \"person.age\" at position 3 and \"person.age\" at position 8 have the same name. Consider aliasing (\"AS\") one of them.",
-        err.strip_backtrace()
-    );
-}
-
-#[test]
 fn select_wildcard_with_repeated_column_but_is_aliased() {
     quick_test(
-            "SELECT *, first_name AS fn from person",
-            "Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀, person.first_name AS fn\
+        "SELECT *, first_name AS fn from person",
+        "Projection: *, person.first_name AS fn\
             \n  TableScan: person",
-        );
+    );
 }
 
 #[test]
@@ -796,7 +860,7 @@ fn where_selection_with_ambiguous_column() {
 #[test]
 fn natural_join() {
     let sql = "SELECT * FROM lineitem a NATURAL JOIN lineitem b";
-    let expected = "Projection: a.l_item_id, a.l_description, a.price\
+    let expected = "Projection: *\
                         \n  Inner Join: Using a.l_item_id = b.l_item_id, a.l_description = b.l_description, a.price = b.price\
                         \n    SubqueryAlias: a\
                         \n      TableScan: lineitem\
@@ -832,7 +896,7 @@ fn natural_right_join() {
 #[test]
 fn natural_join_no_common_becomes_cross_join() {
     let sql = "SELECT * FROM person a NATURAL JOIN lineitem b";
-    let expected = "Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀, b.l_item_id, b.l_description, b.price\
+    let expected = "Projection: *\
                         \n  CrossJoin:\
                         \n    SubqueryAlias: a\
                         \n      TableScan: person\
@@ -844,8 +908,7 @@ fn natural_join_no_common_becomes_cross_join() {
 #[test]
 fn using_join_multiple_keys() {
     let sql = "SELECT * FROM person a join person b using (id, age)";
-    let expected = "Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀, \
-        b.first_name, b.last_name, b.state, b.salary, b.birth_date, b.😀\
+    let expected = "Projection: *\
                         \n  Inner Join: Using a.id = b.id, a.age = b.age\
                         \n    SubqueryAlias: a\
                         \n      TableScan: person\
@@ -859,8 +922,7 @@ fn using_join_multiple_keys_subquery() {
     let sql =
         "SELECT age FROM (SELECT * FROM person a join person b using (id, age, state))";
     let expected = "Projection: a.age\
-                        \n  Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀, \
-        b.first_name, b.last_name, b.salary, b.birth_date, b.😀\
+                        \n  Projection: *\
                         \n    Inner Join: Using a.id = b.id, a.age = b.age, a.state = b.state\
                         \n      SubqueryAlias: a\
                         \n        TableScan: person\
@@ -872,8 +934,7 @@ fn using_join_multiple_keys_subquery() {
 #[test]
 fn using_join_multiple_keys_qualified_wildcard_select() {
     let sql = "SELECT a.* FROM person a join person b using (id, age)";
-    let expected =
-        "Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀\
+    let expected = "Projection: a.*\
                         \n  Inner Join: Using a.id = b.id, a.age = b.age\
                         \n    SubqueryAlias: a\
                         \n      TableScan: person\
@@ -885,8 +946,7 @@ fn using_join_multiple_keys_qualified_wildcard_select() {
 #[test]
 fn using_join_multiple_keys_select_all_columns() {
     let sql = "SELECT a.*, b.* FROM person a join person b using (id, age)";
-    let expected = "Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀, \
-        b.id, b.first_name, b.last_name, b.age, b.state, b.salary, b.birth_date, b.😀\
+    let expected = "Projection: a.*, b.*\
                         \n  Inner Join: Using a.id = b.id, a.age = b.age\
                         \n    SubqueryAlias: a\
                         \n      TableScan: person\
@@ -898,9 +958,7 @@ fn using_join_multiple_keys_select_all_columns() {
 #[test]
 fn using_join_multiple_keys_multiple_joins() {
     let sql = "SELECT * FROM person a join person b using (id, age, state) join person c using (id, age, state)";
-    let expected = "Projection: a.id, a.first_name, a.last_name, a.age, a.state, a.salary, a.birth_date, a.😀, \
-        b.first_name, b.last_name, b.salary, b.birth_date, b.😀, \
-        c.first_name, c.last_name, c.salary, c.birth_date, c.😀\
+    let expected = "Projection: *\
                         \n  Inner Join: Using a.id = c.id, a.age = c.age, a.state = c.state\
                         \n    Inner Join: Using a.id = b.id, a.age = b.age, a.state = b.state\
                         \n      SubqueryAlias: a\
@@ -944,7 +1002,7 @@ fn select_with_having_refers_to_invalid_column() {
                    HAVING first_name = 'M'";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-            "Error during planning: HAVING clause references non-aggregate values: Expression person.first_name could not be resolved from available columns: person.id, MAX(person.age)",
+            "Error during planning: HAVING clause references non-aggregate values: Expression person.first_name could not be resolved from available columns: person.id, max(person.age)",
             err.strip_backtrace()
         );
 }
@@ -968,7 +1026,7 @@ fn select_with_having_with_aggregate_not_in_select() {
                    HAVING MAX(age) > 100";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-            "Error during planning: Projection references non-aggregate values: Expression person.first_name could not be resolved from available columns: MAX(person.age)",
+            "Error during planning: Projection references non-aggregate values: Expression person.first_name could not be resolved from available columns: max(person.age)",
             err.strip_backtrace()
         );
 }
@@ -978,21 +1036,21 @@ fn select_aggregate_with_having_that_reuses_aggregate() {
     let sql = "SELECT MAX(age)
                    FROM person
                    HAVING MAX(age) < 30";
-    let expected = "Projection: MAX(person.age)\
-                        \n  Filter: MAX(person.age) < Int64(30)\
-                        \n    Aggregate: groupBy=[[]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: max(person.age)\
+                        \n  Filter: max(person.age) < Int64(30)\
+                        \n    Aggregate: groupBy=[[]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
 
 #[test]
 fn select_aggregate_with_having_with_aggregate_not_in_select() {
-    let sql = "SELECT MAX(age)
+    let sql = "SELECT max(age)
                    FROM person
-                   HAVING MAX(first_name) > 'M'";
-    let expected = "Projection: MAX(person.age)\
-                        \n  Filter: MAX(person.first_name) > Utf8(\"M\")\
-                        \n    Aggregate: groupBy=[[]], aggr=[[MAX(person.age), MAX(person.first_name)]]\
+                   HAVING max(first_name) > 'M'";
+    let expected = "Projection: max(person.age)\
+                        \n  Filter: max(person.first_name) > Utf8(\"M\")\
+                        \n    Aggregate: groupBy=[[]], aggr=[[max(person.age), max(person.first_name)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1015,21 +1073,21 @@ fn select_aggregate_aliased_with_having_referencing_aggregate_by_its_alias() {
                    FROM person
                    HAVING max_age < 30";
     // FIXME: add test for having in execution
-    let expected = "Projection: MAX(person.age) AS max_age\
-                        \n  Filter: MAX(person.age) < Int64(30)\
-                        \n    Aggregate: groupBy=[[]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: max(person.age) AS max_age\
+                        \n  Filter: max(person.age) < Int64(30)\
+                        \n    Aggregate: groupBy=[[]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
 
 #[test]
 fn select_aggregate_aliased_with_having_that_reuses_aggregate_but_not_by_its_alias() {
-    let sql = "SELECT MAX(age) as max_age
+    let sql = "SELECT max(age) as max_age
                    FROM person
-                   HAVING MAX(age) < 30";
-    let expected = "Projection: MAX(person.age) AS max_age\
-                        \n  Filter: MAX(person.age) < Int64(30)\
-                        \n    Aggregate: groupBy=[[]], aggr=[[MAX(person.age)]]\
+                   HAVING max(age) < 30";
+    let expected = "Projection: max(person.age) AS max_age\
+                        \n  Filter: max(person.age) < Int64(30)\
+                        \n    Aggregate: groupBy=[[]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1040,23 +1098,23 @@ fn select_aggregate_with_group_by_with_having() {
                    FROM person
                    GROUP BY first_name
                    HAVING first_name = 'M'";
-    let expected = "Projection: person.first_name, MAX(person.age)\
+    let expected = "Projection: person.first_name, max(person.age)\
                         \n  Filter: person.first_name = Utf8(\"M\")\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
 
 #[test]
 fn select_aggregate_with_group_by_with_having_and_where() {
-    let sql = "SELECT first_name, MAX(age)
+    let sql = "SELECT first_name, max(age)
                    FROM person
                    WHERE id > 5
                    GROUP BY first_name
                    HAVING MAX(age) < 100";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) < Int64(100)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) < Int64(100)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      Filter: person.id > Int64(5)\
                         \n        TableScan: person";
     quick_test(sql, expected);
@@ -1069,9 +1127,9 @@ fn select_aggregate_with_group_by_with_having_and_where_filtering_on_aggregate_c
                    WHERE id > 5 AND age > 18
                    GROUP BY first_name
                    HAVING MAX(age) < 100";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) < Int64(100)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) < Int64(100)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      Filter: person.id > Int64(5) AND person.age > Int64(18)\
                         \n        TableScan: person";
     quick_test(sql, expected);
@@ -1083,9 +1141,9 @@ fn select_aggregate_with_group_by_with_having_using_column_by_alias() {
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 2 AND fn = 'M'";
-    let expected = "Projection: person.first_name AS fn, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(2) AND person.first_name = Utf8(\"M\")\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name AS fn, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(2) AND person.first_name = Utf8(\"M\")\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1097,9 +1155,9 @@ fn select_aggregate_with_group_by_with_having_using_columns_with_and_without_the
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 2 AND max_age < 5 AND first_name = 'M' AND fn = 'N'";
-    let expected = "Projection: person.first_name AS fn, MAX(person.age) AS max_age\
-                        \n  Filter: MAX(person.age) > Int64(2) AND MAX(person.age) < Int64(5) AND person.first_name = Utf8(\"M\") AND person.first_name = Utf8(\"N\")\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name AS fn, max(person.age) AS max_age\
+                        \n  Filter: max(person.age) > Int64(2) AND max(person.age) < Int64(5) AND person.first_name = Utf8(\"M\") AND person.first_name = Utf8(\"N\")\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1110,9 +1168,9 @@ fn select_aggregate_with_group_by_with_having_that_reuses_aggregate() {
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 100";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(100)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(100)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1125,7 +1183,7 @@ fn select_aggregate_with_group_by_with_having_referencing_column_not_in_group_by
                    HAVING MAX(age) > 10 AND last_name = 'M'";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: HAVING clause references non-aggregate values: Expression person.last_name could not be resolved from available columns: person.first_name, MAX(person.age)",
+        "Error during planning: HAVING clause references non-aggregate values: Expression person.last_name could not be resolved from available columns: person.first_name, max(person.age)",
         err.strip_backtrace()
     );
 }
@@ -1136,22 +1194,22 @@ fn select_aggregate_with_group_by_with_having_that_reuses_aggregate_multiple_tim
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 100 AND MAX(age) < 200";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(100) AND MAX(person.age) < Int64(200)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(100) AND max(person.age) < Int64(200)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
 
 #[test]
-fn select_aggregate_with_group_by_with_having_using_aggreagate_not_in_select() {
+fn select_aggregate_with_group_by_with_having_using_aggregate_not_in_select() {
     let sql = "SELECT first_name, MAX(age)
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 100 AND MIN(id) < 50";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(100) AND MIN(person.id) < Int64(50)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age), MIN(person.id)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(100) AND min(person.id) < Int64(50)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age), min(person.id)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1163,9 +1221,9 @@ fn select_aggregate_aliased_with_group_by_with_having_referencing_aggregate_by_i
                    FROM person
                    GROUP BY first_name
                    HAVING max_age > 100";
-    let expected = "Projection: person.first_name, MAX(person.age) AS max_age\
-                        \n  Filter: MAX(person.age) > Int64(100)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age) AS max_age\
+                        \n  Filter: max(person.age) > Int64(100)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1177,23 +1235,23 @@ fn select_aggregate_compound_aliased_with_group_by_with_having_referencing_compo
                    FROM person
                    GROUP BY first_name
                    HAVING max_age_plus_one > 100";
-    let expected = "Projection: person.first_name, MAX(person.age) + Int64(1) AS max_age_plus_one\
-                        \n  Filter: MAX(person.age) + Int64(1) > Int64(100)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: person.first_name, max(person.age) + Int64(1) AS max_age_plus_one\
+                        \n  Filter: max(person.age) + Int64(1) > Int64(100)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
 
 #[test]
-fn select_aggregate_with_group_by_with_having_using_derived_column_aggreagate_not_in_select(
+fn select_aggregate_with_group_by_with_having_using_derived_column_aggregate_not_in_select(
 ) {
     let sql = "SELECT first_name, MAX(age)
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 100 AND MIN(id - 2) < 50";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(100) AND MIN(person.id - Int64(2)) < Int64(50)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age), MIN(person.id - Int64(2))]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(100) AND min(person.id - Int64(2)) < Int64(50)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age), min(person.id - Int64(2))]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1204,9 +1262,9 @@ fn select_aggregate_with_group_by_with_having_using_count_star_not_in_select() {
                    FROM person
                    GROUP BY first_name
                    HAVING MAX(age) > 100 AND count(*) < 50";
-    let expected = "Projection: person.first_name, MAX(person.age)\
-                        \n  Filter: MAX(person.age) > Int64(100) AND count(*) < Int64(50)\
-                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.age), count(*)]]\
+    let expected = "Projection: person.first_name, max(person.age)\
+                        \n  Filter: max(person.age) > Int64(100) AND count(*) < Int64(50)\
+                        \n    Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.age), count(*)]]\
                         \n      TableScan: person";
     quick_test(sql, expected);
 }
@@ -1231,13 +1289,13 @@ fn select_binary_expr_nested() {
 fn select_wildcard_with_groupby() {
     quick_test(
             r#"SELECT * FROM person GROUP BY id, first_name, last_name, age, state, salary, birth_date, "😀""#,
-            "Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀\
+            "Projection: *\
              \n  Aggregate: groupBy=[[person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀]], aggr=[[]]\
              \n    TableScan: person",
         );
     quick_test(
             "SELECT * FROM (SELECT first_name, last_name FROM person) AS a GROUP BY first_name, last_name",
-            "Projection: a.first_name, a.last_name\
+            "Projection: *\
             \n  Aggregate: groupBy=[[a.first_name, a.last_name]], aggr=[[]]\
             \n    SubqueryAlias: a\
             \n      Projection: person.first_name, person.last_name\
@@ -1249,8 +1307,8 @@ fn select_wildcard_with_groupby() {
 fn select_simple_aggregate() {
     quick_test(
         "SELECT MIN(age) FROM person",
-        "Projection: MIN(person.age)\
-            \n  Aggregate: groupBy=[[]], aggr=[[MIN(person.age)]]\
+        "Projection: min(person.age)\
+            \n  Aggregate: groupBy=[[]], aggr=[[min(person.age)]]\
             \n    TableScan: person",
     );
 }
@@ -1277,7 +1335,7 @@ fn select_simple_aggregate_repeated_aggregate() {
     let sql = "SELECT MIN(age), MIN(age) FROM person";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projections require unique expression names but the expression \"MIN(person.age)\" at position 0 and \"MIN(person.age)\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
+        "Error during planning: Projections require unique expression names but the expression \"min(person.age)\" at position 0 and \"min(person.age)\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
         err.strip_backtrace()
     );
 }
@@ -1286,8 +1344,8 @@ fn select_simple_aggregate_repeated_aggregate() {
 fn select_simple_aggregate_repeated_aggregate_with_single_alias() {
     quick_test(
         "SELECT MIN(age), MIN(age) AS a FROM person",
-        "Projection: MIN(person.age), MIN(person.age) AS a\
-             \n  Aggregate: groupBy=[[]], aggr=[[MIN(person.age)]]\
+        "Projection: min(person.age), min(person.age) AS a\
+             \n  Aggregate: groupBy=[[]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1296,8 +1354,8 @@ fn select_simple_aggregate_repeated_aggregate_with_single_alias() {
 fn select_simple_aggregate_repeated_aggregate_with_unique_aliases() {
     quick_test(
         "SELECT MIN(age) AS a, MIN(age) AS b FROM person",
-        "Projection: MIN(person.age) AS a, MIN(person.age) AS b\
-             \n  Aggregate: groupBy=[[]], aggr=[[MIN(person.age)]]\
+        "Projection: min(person.age) AS a, min(person.age) AS b\
+             \n  Aggregate: groupBy=[[]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1318,7 +1376,7 @@ fn select_simple_aggregate_repeated_aggregate_with_repeated_aliases() {
     let sql = "SELECT MIN(age) AS a, MIN(age) AS a FROM person";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projections require unique expression names but the expression \"MIN(person.age) AS a\" at position 0 and \"MIN(person.age) AS a\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
+        "Error during planning: Projections require unique expression names but the expression \"min(person.age) AS a\" at position 0 and \"min(person.age) AS a\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
         err.strip_backtrace()
     );
 }
@@ -1327,8 +1385,8 @@ fn select_simple_aggregate_repeated_aggregate_with_repeated_aliases() {
 fn select_simple_aggregate_with_groupby() {
     quick_test(
         "SELECT state, MIN(age), MAX(age) FROM person GROUP BY state",
-        "Projection: person.state, MIN(person.age), MAX(person.age)\
-            \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age), MAX(person.age)]]\
+        "Projection: person.state, min(person.age), max(person.age)\
+            \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age), max(person.age)]]\
             \n    TableScan: person",
     );
 }
@@ -1337,8 +1395,8 @@ fn select_simple_aggregate_with_groupby() {
 fn select_simple_aggregate_with_groupby_with_aliases() {
     quick_test(
         "SELECT state AS a, MIN(age) AS b FROM person GROUP BY state",
-        "Projection: person.state AS a, MIN(person.age) AS b\
-             \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age)]]\
+        "Projection: person.state AS a, min(person.age) AS b\
+             \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1348,7 +1406,7 @@ fn select_simple_aggregate_with_groupby_with_aliases_repeated() {
     let sql = "SELECT state AS a, MIN(age) AS a FROM person GROUP BY state";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projections require unique expression names but the expression \"person.state AS a\" at position 0 and \"MIN(person.age) AS a\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
+        "Error during planning: Projections require unique expression names but the expression \"person.state AS a\" at position 0 and \"min(person.age) AS a\" at position 1 have the same name. Consider aliasing (\"AS\") one of them.",
         err.strip_backtrace()
     );
 }
@@ -1357,8 +1415,8 @@ fn select_simple_aggregate_with_groupby_with_aliases_repeated() {
 fn select_simple_aggregate_with_groupby_column_unselected() {
     quick_test(
         "SELECT MIN(age), MAX(age) FROM person GROUP BY state",
-        "Projection: MIN(person.age), MAX(person.age)\
-             \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age), MAX(person.age)]]\
+        "Projection: min(person.age), max(person.age)\
+             \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age), max(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1400,7 +1458,7 @@ fn recursive_ctes() {
         select * from numbers;";
     quick_test(
         sql,
-        "Projection: numbers.n\
+        "Projection: *\
     \n  SubqueryAlias: numbers\
     \n    RecursiveQuery: is_distinct=false\
     \n      Projection: Int64(1) AS n\
@@ -1422,8 +1480,9 @@ fn recursive_ctes_disabled() {
         select * from numbers;";
 
     // manually setting up test here so that we can disable recursive ctes
-    let mut context = MockContextProvider::default();
-    context.options_mut().execution.enable_recursive_ctes = false;
+    let mut state = MockSessionState::default();
+    state.config_options.execution.enable_recursive_ctes = false;
+    let context = MockContextProvider { state };
 
     let planner = SqlToRel::new_with_options(&context, ParserOptions::default());
     let result = DFParser::parse_sql_with_dialect(sql, &GenericDialect {});
@@ -1442,8 +1501,8 @@ fn recursive_ctes_disabled() {
 fn select_simple_aggregate_with_groupby_and_column_is_in_aggregate_and_groupby() {
     quick_test(
         "SELECT MAX(first_name) FROM person GROUP BY first_name",
-        "Projection: MAX(person.first_name)\
-             \n  Aggregate: groupBy=[[person.first_name]], aggr=[[MAX(person.first_name)]]\
+        "Projection: max(person.first_name)\
+             \n  Aggregate: groupBy=[[person.first_name]], aggr=[[max(person.first_name)]]\
              \n    TableScan: person",
     );
 }
@@ -1485,8 +1544,8 @@ fn select_simple_aggregate_with_groupby_position_out_of_range() {
 fn select_simple_aggregate_with_groupby_can_use_alias() {
     quick_test(
         "SELECT state AS a, MIN(age) AS b FROM person GROUP BY a",
-        "Projection: person.state AS a, MIN(person.age) AS b\
-             \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age)]]\
+        "Projection: person.state AS a, min(person.age) AS b\
+             \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1496,7 +1555,7 @@ fn select_simple_aggregate_with_groupby_aggregate_repeated() {
     let sql = "SELECT state, MIN(age), MIN(age) FROM person GROUP BY state";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projections require unique expression names but the expression \"MIN(person.age)\" at position 1 and \"MIN(person.age)\" at position 2 have the same name. Consider aliasing (\"AS\") one of them.",
+        "Error during planning: Projections require unique expression names but the expression \"min(person.age)\" at position 1 and \"min(person.age)\" at position 2 have the same name. Consider aliasing (\"AS\") one of them.",
         err.strip_backtrace()
     );
 }
@@ -1505,8 +1564,8 @@ fn select_simple_aggregate_with_groupby_aggregate_repeated() {
 fn select_simple_aggregate_with_groupby_aggregate_repeated_and_one_has_alias() {
     quick_test(
         "SELECT state, MIN(age), MIN(age) AS ma FROM person GROUP BY state",
-        "Projection: person.state, MIN(person.age), MIN(person.age) AS ma\
-             \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age)]]\
+        "Projection: person.state, min(person.age), min(person.age) AS ma\
+             \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     )
 }
@@ -1515,8 +1574,8 @@ fn select_simple_aggregate_with_groupby_aggregate_repeated_and_one_has_alias() {
 fn select_simple_aggregate_with_groupby_non_column_expression_unselected() {
     quick_test(
         "SELECT MIN(first_name) FROM person GROUP BY age + 1",
-        "Projection: MIN(person.first_name)\
-             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[MIN(person.first_name)]]\
+        "Projection: min(person.first_name)\
+             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[min(person.first_name)]]\
              \n    TableScan: person",
     );
 }
@@ -1525,14 +1584,14 @@ fn select_simple_aggregate_with_groupby_non_column_expression_unselected() {
 fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resolvable() {
     quick_test(
         "SELECT age + 1, MIN(first_name) FROM person GROUP BY age + 1",
-        "Projection: person.age + Int64(1), MIN(person.first_name)\
-             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[MIN(person.first_name)]]\
+        "Projection: person.age + Int64(1), min(person.first_name)\
+             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[min(person.first_name)]]\
              \n    TableScan: person",
     );
     quick_test(
         "SELECT MIN(first_name), age + 1 FROM person GROUP BY age + 1",
-        "Projection: MIN(person.first_name), person.age + Int64(1)\
-             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[MIN(person.first_name)]]\
+        "Projection: min(person.first_name), person.age + Int64(1)\
+             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[min(person.first_name)]]\
              \n    TableScan: person",
     );
 }
@@ -1541,8 +1600,8 @@ fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resol
 fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_resolvable() {
     quick_test(
             "SELECT ((age + 1) / 2) * (age + 1), MIN(first_name) FROM person GROUP BY age + 1",
-            "Projection: person.age + Int64(1) / Int64(2) * person.age + Int64(1), MIN(person.first_name)\
-             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[MIN(person.first_name)]]\
+            "Projection: person.age + Int64(1) / Int64(2) * person.age + Int64(1), min(person.first_name)\
+             \n  Aggregate: groupBy=[[person.age + Int64(1)]], aggr=[[min(person.first_name)]]\
              \n    TableScan: person",
         );
 }
@@ -1554,7 +1613,7 @@ fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_not_res
     let sql = "SELECT ((age + 1) / 2) * (age + 9), MIN(first_name) FROM person GROUP BY age + 1";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), MIN(person.first_name)",
+        "Error during planning: Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), min(person.first_name)",
             err.strip_backtrace()
         );
 }
@@ -1564,7 +1623,7 @@ fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_sel
     let sql = "SELECT age, MIN(first_name) FROM person GROUP BY age + 1";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), MIN(person.first_name)",
+        "Error during planning: Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), min(person.first_name)",
             err.strip_backtrace()
         );
 }
@@ -1573,8 +1632,8 @@ fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_sel
 fn select_simple_aggregate_nested_in_binary_expr_with_groupby() {
     quick_test(
         "SELECT state, MIN(age) < 10 FROM person GROUP BY state",
-        "Projection: person.state, MIN(person.age) < Int64(10)\
-             \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age)]]\
+        "Projection: person.state, min(person.age) < Int64(10)\
+             \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age)]]\
              \n    TableScan: person",
     );
 }
@@ -1583,8 +1642,8 @@ fn select_simple_aggregate_nested_in_binary_expr_with_groupby() {
 fn select_simple_aggregate_and_nested_groupby_column() {
     quick_test(
         "SELECT age + 1, MAX(first_name) FROM person GROUP BY age",
-        "Projection: person.age + Int64(1), MAX(person.first_name)\
-             \n  Aggregate: groupBy=[[person.age]], aggr=[[MAX(person.first_name)]]\
+        "Projection: person.age + Int64(1), max(person.first_name)\
+             \n  Aggregate: groupBy=[[person.age]], aggr=[[max(person.first_name)]]\
              \n    TableScan: person",
     );
 }
@@ -1593,8 +1652,8 @@ fn select_simple_aggregate_and_nested_groupby_column() {
 fn select_aggregate_compounded_with_groupby_column() {
     quick_test(
         "SELECT age + MIN(salary) FROM person GROUP BY age",
-        "Projection: person.age + MIN(person.salary)\
-             \n  Aggregate: groupBy=[[person.age]], aggr=[[MIN(person.salary)]]\
+        "Projection: person.age + min(person.salary)\
+             \n  Aggregate: groupBy=[[person.age]], aggr=[[min(person.salary)]]\
              \n    TableScan: person",
     );
 }
@@ -1603,8 +1662,8 @@ fn select_aggregate_compounded_with_groupby_column() {
 fn select_aggregate_with_non_column_inner_expression_with_groupby() {
     quick_test(
         "SELECT state, MIN(age + 1) FROM person GROUP BY state",
-        "Projection: person.state, MIN(person.age + Int64(1))\
-            \n  Aggregate: groupBy=[[person.state]], aggr=[[MIN(person.age + Int64(1))]]\
+        "Projection: person.state, min(person.age + Int64(1))\
+            \n  Aggregate: groupBy=[[person.state]], aggr=[[min(person.age + Int64(1))]]\
             \n    TableScan: person",
     );
 }
@@ -1612,10 +1671,10 @@ fn select_aggregate_with_non_column_inner_expression_with_groupby() {
 #[test]
 fn test_wildcard() {
     quick_test(
-            "SELECT * from person",
-            "Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀\
+        "SELECT * from person",
+        "Projection: *\
             \n  TableScan: person",
-        );
+    );
 }
 
 #[test]
@@ -1792,8 +1851,8 @@ fn select_group_by() {
 #[test]
 fn select_group_by_columns_not_in_select() {
     let sql = "SELECT MAX(age) FROM person GROUP BY state";
-    let expected = "Projection: MAX(person.age)\
-                        \n  Aggregate: groupBy=[[person.state]], aggr=[[MAX(person.age)]]\
+    let expected = "Projection: max(person.age)\
+                        \n  Aggregate: groupBy=[[person.state]], aggr=[[max(person.age)]]\
                         \n    TableScan: person";
 
     quick_test(sql, expected);
@@ -1823,8 +1882,8 @@ fn select_group_by_needs_projection() {
 #[test]
 fn select_7480_1() {
     let sql = "SELECT c1, MIN(c12) FROM aggregate_test_100 GROUP BY c1, c13";
-    let expected = "Projection: aggregate_test_100.c1, MIN(aggregate_test_100.c12)\
-                       \n  Aggregate: groupBy=[[aggregate_test_100.c1, aggregate_test_100.c13]], aggr=[[MIN(aggregate_test_100.c12)]]\
+    let expected = "Projection: aggregate_test_100.c1, min(aggregate_test_100.c12)\
+                       \n  Aggregate: groupBy=[[aggregate_test_100.c1, aggregate_test_100.c13]], aggr=[[min(aggregate_test_100.c12)]]\
                        \n    TableScan: aggregate_test_100";
     quick_test(sql, expected);
 }
@@ -1834,7 +1893,7 @@ fn select_7480_2() {
     let sql = "SELECT c1, c13, MIN(c12) FROM aggregate_test_100 GROUP BY c1";
     let err = logical_plan(sql).expect_err("query should have failed");
     assert_eq!(
-        "Error during planning: Projection references non-aggregate values: Expression aggregate_test_100.c13 could not be resolved from available columns: aggregate_test_100.c1, MIN(aggregate_test_100.c12)",
+        "Error during planning: Projection references non-aggregate values: Expression aggregate_test_100.c13 could not be resolved from available columns: aggregate_test_100.c1, min(aggregate_test_100.c12)",
         err.strip_backtrace()
     );
 }
@@ -2043,7 +2102,7 @@ fn project_wildcard_on_join_with_using() {
             FROM lineitem \
             JOIN lineitem as lineitem2 \
             USING (l_item_id)";
-    let expected = "Projection: lineitem.l_item_id, lineitem.l_description, lineitem.price, lineitem2.l_description, lineitem2.price\
+    let expected = "Projection: *\
         \n  Inner Join: Using lineitem.l_item_id = lineitem2.l_item_id\
         \n    TableScan: lineitem\
         \n    SubqueryAlias: lineitem2\
@@ -2102,153 +2161,11 @@ fn union_all() {
 }
 
 #[test]
-fn union_with_different_column_names() {
-    let sql = "SELECT order_id from orders UNION ALL SELECT customer_id FROM orders";
-    let expected = "Union\
-            \n  Projection: orders.order_id\
-            \n    TableScan: orders\
-            \n  Projection: orders.customer_id AS order_id\
-            \n    TableScan: orders";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_values_with_no_alias() {
-    let sql = "SELECT 1, 2 UNION ALL SELECT 3, 4";
-    let expected = "Union\
-            \n  Projection: Int64(1) AS Int64(1), Int64(2) AS Int64(2)\
-            \n    EmptyRelation\
-            \n  Projection: Int64(3) AS Int64(1), Int64(4) AS Int64(2)\
-            \n    EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_incompatible_data_type() {
-    let sql = "SELECT interval '1 year 1 day' UNION ALL SELECT 1";
-    let err = logical_plan(sql)
-        .expect_err("query should have failed")
-        .strip_backtrace();
-    assert_eq!(
-       "Error during planning: UNION Column Int64(1) (type: Int64) is not compatible with column IntervalMonthDayNano(\"IntervalMonthDayNano { months: 12, days: 1, nanoseconds: 0 }\") (type: Interval(MonthDayNano))",
-       err
-    );
-}
-
-#[test]
-fn union_with_different_decimal_data_types() {
-    let sql = "SELECT 1 a UNION ALL SELECT 1.1 a";
-    let expected = "Union\
-            \n  Projection: CAST(Int64(1) AS Float64) AS a\
-            \n    EmptyRelation\
-            \n  Projection: Float64(1.1) AS a\
-            \n    EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_null() {
-    let sql = "SELECT NULL a UNION ALL SELECT 1.1 a";
-    let expected = "Union\
-            \n  Projection: CAST(NULL AS Float64) AS a\
-            \n    EmptyRelation\
-            \n  Projection: Float64(1.1) AS a\
-            \n    EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_float_and_string() {
-    let sql = "SELECT 'a' a UNION ALL SELECT 1.1 a";
-    let expected = "Union\
-            \n  Projection: Utf8(\"a\") AS a\
-            \n    EmptyRelation\
-            \n  Projection: CAST(Float64(1.1) AS Utf8) AS a\
-            \n    EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_multiply_cols() {
-    let sql = "SELECT 'a' a, 1 b UNION ALL SELECT 1.1 a, 1.1 b";
-    let expected = "Union\
-            \n  Projection: Utf8(\"a\") AS a, CAST(Int64(1) AS Float64) AS b\
-            \n    EmptyRelation\
-            \n  Projection: CAST(Float64(1.1) AS Utf8) AS a, Float64(1.1) AS b\
-            \n    EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn sorted_union_with_different_types_and_group_by() {
-    let sql = "SELECT a FROM (select 1 a) x GROUP BY 1 UNION ALL (SELECT a FROM (select 1.1 a) x GROUP BY 1) ORDER BY 1";
-    let expected = "Sort: x.a ASC NULLS LAST\
-        \n  Union\
-        \n    Projection: CAST(x.a AS Float64) AS a\
-        \n      Aggregate: groupBy=[[x.a]], aggr=[[]]\
-        \n        SubqueryAlias: x\
-        \n          Projection: Int64(1) AS a\
-        \n            EmptyRelation\
-        \n    Projection: x.a\
-        \n      Aggregate: groupBy=[[x.a]], aggr=[[]]\
-        \n        SubqueryAlias: x\
-        \n          Projection: Float64(1.1) AS a\
-        \n            EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_binary_expr_and_cast() {
-    let sql = "SELECT cast(0.0 + a as integer) FROM (select 1 a) x GROUP BY 1 UNION ALL (SELECT 2.1 + a FROM (select 1 a) x GROUP BY 1)";
-    let expected = "Union\
-        \n  Projection: CAST(Float64(0) + x.a AS Float64) AS Float64(0) + x.a\
-        \n    Aggregate: groupBy=[[CAST(Float64(0) + x.a AS Int32)]], aggr=[[]]\
-        \n      SubqueryAlias: x\
-        \n        Projection: Int64(1) AS a\
-        \n          EmptyRelation\
-        \n  Projection: Float64(2.1) + x.a AS Float64(0) + x.a\
-        \n    Aggregate: groupBy=[[Float64(2.1) + x.a]], aggr=[[]]\
-        \n      SubqueryAlias: x\
-        \n        Projection: Int64(1) AS a\
-        \n          EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_aliases() {
-    let sql = "SELECT a as a1 FROM (select 1 a) x GROUP BY 1 UNION ALL (SELECT a as a1 FROM (select 1.1 a) x GROUP BY 1)";
-    let expected = "Union\
-        \n  Projection: CAST(x.a AS Float64) AS a1\
-        \n    Aggregate: groupBy=[[x.a]], aggr=[[]]\
-        \n      SubqueryAlias: x\
-        \n        Projection: Int64(1) AS a\
-        \n          EmptyRelation\
-        \n  Projection: x.a AS a1\
-        \n    Aggregate: groupBy=[[x.a]], aggr=[[]]\
-        \n      SubqueryAlias: x\
-        \n        Projection: Float64(1.1) AS a\
-        \n          EmptyRelation";
-    quick_test(sql, expected);
-}
-
-#[test]
-fn union_with_incompatible_data_types() {
-    let sql = "SELECT 'a' a UNION ALL SELECT true a";
-    let err = logical_plan(sql)
-        .expect_err("query should have failed")
-        .strip_backtrace();
-    assert_eq!(
-        "Error during planning: UNION Column a (type: Boolean) is not compatible with column a (type: Utf8)",
-        err
-    );
-}
-
-#[test]
 fn empty_over() {
     let sql = "SELECT order_id, MAX(order_id) OVER () from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
-        \n  WindowAggr: windowExpr=[[MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id, max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n  WindowAggr: windowExpr=[[max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2257,8 +2174,8 @@ fn empty_over() {
 fn empty_over_with_alias() {
     let sql = "SELECT order_id oid, MAX(order_id) OVER () max_oid from orders";
     let expected = "\
-        Projection: orders.order_id AS oid, MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid\
-        \n  WindowAggr: windowExpr=[[MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id AS oid, max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid\
+        \n  WindowAggr: windowExpr=[[max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2267,8 +2184,8 @@ fn empty_over_with_alias() {
 fn empty_over_dup_with_alias() {
     let sql = "SELECT order_id oid, MAX(order_id) OVER () max_oid, MAX(order_id) OVER () max_oid_dup from orders";
     let expected = "\
-        Projection: orders.order_id AS oid, MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid, MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid_dup\
-        \n  WindowAggr: windowExpr=[[MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id AS oid, max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid, max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS max_oid_dup\
+        \n  WindowAggr: windowExpr=[[max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2277,9 +2194,9 @@ fn empty_over_dup_with_alias() {
 fn empty_over_dup_with_different_sort() {
     let sql = "SELECT order_id oid, MAX(order_id) OVER (), MAX(order_id) OVER (ORDER BY order_id) from orders";
     let expected = "\
-        Projection: orders.order_id AS oid, MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MAX(orders.order_id) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
-        \n    WindowAggr: windowExpr=[[MAX(orders.order_id) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id AS oid, max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, max(orders.order_id) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.order_id) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        \n    WindowAggr: windowExpr=[[max(orders.order_id) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2288,8 +2205,8 @@ fn empty_over_dup_with_different_sort() {
 fn empty_over_plus() {
     let sql = "SELECT order_id, MAX(qty * 1.1) OVER () from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty * Float64(1.1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty * Float64(1.1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id, max(orders.qty * Float64(1.1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n  WindowAggr: windowExpr=[[max(orders.qty * Float64(1.1)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2298,8 +2215,8 @@ fn empty_over_plus() {
 fn empty_over_multiple() {
     let sql = "SELECT order_id, MAX(qty) OVER (), min(qty) over (), avg(qty) OVER () from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MIN(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, avg(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MIN(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, avg(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id, max(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, min(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, avg(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, min(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, avg(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2317,8 +2234,8 @@ fn empty_over_multiple() {
 fn over_partition_by() {
     let sql = "SELECT order_id, MAX(qty) OVER (PARTITION BY order_id) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
+        Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2339,9 +2256,9 @@ fn over_partition_by() {
 fn over_order_by() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2350,9 +2267,9 @@ fn over_order_by() {
 fn over_order_by_with_window_frame_double_end() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id ROWS BETWEEN 3 PRECEDING and 3 FOLLOWING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING, MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING, min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2361,9 +2278,9 @@ fn over_order_by_with_window_frame_double_end() {
 fn over_order_by_with_window_frame_single_end() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id ROWS 3 PRECEDING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND CURRENT ROW, MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND CURRENT ROW, min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] ROWS BETWEEN 3 PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2372,9 +2289,9 @@ fn over_order_by_with_window_frame_single_end() {
 fn over_order_by_with_window_frame_single_end_groups() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id GROUPS 3 PRECEDING), MIN(qty) OVER (ORDER BY order_id DESC) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] GROUPS BETWEEN 3 PRECEDING AND CURRENT ROW, MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] GROUPS BETWEEN 3 PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] GROUPS BETWEEN 3 PRECEDING AND CURRENT ROW, min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] GROUPS BETWEEN 3 PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id DESC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2395,9 +2312,9 @@ fn over_order_by_with_window_frame_single_end_groups() {
 fn over_order_by_two_sort_keys() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id), MIN(qty) OVER (ORDER BY (order_id + 1)) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, MIN(orders.qty) ORDER BY [orders.order_id + Int64(1) ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id + Int64(1) ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, min(orders.qty) ORDER BY [orders.order_id + Int64(1) ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id + Int64(1) ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2419,10 +2336,10 @@ fn over_order_by_two_sort_keys() {
 fn over_order_by_sort_keys_sorting() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY qty, order_id), sum(qty) OVER (), MIN(qty) OVER (ORDER BY order_id, qty) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
         \n  WindowAggr: windowExpr=[[sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
-        \n    WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n      WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n      WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n        TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2442,10 +2359,10 @@ fn over_order_by_sort_keys_sorting() {
 fn over_order_by_sort_keys_sorting_prefix_compacting() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY order_id), sum(qty) OVER (), MIN(qty) OVER (ORDER BY order_id, qty) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        Projection: orders.order_id, max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
         \n  WindowAggr: windowExpr=[[sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
-        \n    WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n      WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n      WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n        TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2471,10 +2388,10 @@ fn over_order_by_sort_keys_sorting_global_order_compacting() {
     let sql = "SELECT order_id, MAX(qty) OVER (ORDER BY qty, order_id), sum(qty) OVER (), MIN(qty) OVER (ORDER BY order_id, qty) from orders ORDER BY order_id";
     let expected = "\
         Sort: orders.order_id ASC NULLS LAST\
-        \n  Projection: orders.order_id, MAX(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  Projection: orders.order_id, max(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING, min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
         \n    WindowAggr: windowExpr=[[sum(orders.qty) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\
-        \n      WindowAggr: windowExpr=[[MAX(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n        WindowAggr: windowExpr=[[MIN(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n      WindowAggr: windowExpr=[[max(orders.qty) ORDER BY [orders.qty ASC NULLS LAST, orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n        WindowAggr: windowExpr=[[min(orders.qty) ORDER BY [orders.order_id ASC NULLS LAST, orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n          TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2493,8 +2410,8 @@ fn over_partition_by_order_by() {
     let sql =
         "SELECT order_id, MAX(qty) OVER (PARTITION BY order_id ORDER BY qty) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2513,8 +2430,8 @@ fn over_partition_by_order_by_no_dup() {
     let sql =
         "SELECT order_id, MAX(qty) OVER (PARTITION BY order_id, qty ORDER BY qty) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n    TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2536,9 +2453,9 @@ fn over_partition_by_order_by_mix_up() {
     let sql =
             "SELECT order_id, MAX(qty) OVER (PARTITION BY order_id, qty ORDER BY qty), MIN(qty) OVER (PARTITION BY qty ORDER BY order_id) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, MIN(orders.qty) PARTITION BY [orders.qty] ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MIN(orders.qty) PARTITION BY [orders.qty] ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, min(orders.qty) PARTITION BY [orders.qty] ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[min(orders.qty) PARTITION BY [orders.qty] ORDER BY [orders.order_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2559,9 +2476,9 @@ fn over_partition_by_order_by_mix_up_prefix() {
     let sql =
             "SELECT order_id, MAX(qty) OVER (PARTITION BY order_id ORDER BY qty), MIN(qty) OVER (PARTITION BY order_id, qty ORDER BY price) from orders";
     let expected = "\
-        Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, MIN(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.price ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
-        \n  WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
-        \n    WindowAggr: windowExpr=[[MIN(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.price ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, min(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.price ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+        \n  WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id] ORDER BY [orders.qty ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
+        \n    WindowAggr: windowExpr=[[min(orders.qty) PARTITION BY [orders.order_id, orders.qty] ORDER BY [orders.price ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]\
         \n      TableScan: orders";
     quick_test(sql, expected);
 }
@@ -2654,7 +2571,8 @@ fn logical_plan_with_options(sql: &str, options: ParserOptions) -> Result<Logica
 }
 
 fn logical_plan_with_dialect(sql: &str, dialect: &dyn Dialect) -> Result<LogicalPlan> {
-    let context = MockContextProvider::default().with_udaf(sum_udaf());
+    let state = MockSessionState::default().with_aggregate_function(sum_udaf());
+    let context = MockContextProvider { state };
     let planner = SqlToRel::new(&context);
     let result = DFParser::parse_sql_with_dialect(sql, dialect);
     let mut ast = result?;
@@ -2666,36 +2584,44 @@ fn logical_plan_with_dialect_and_options(
     dialect: &dyn Dialect,
     options: ParserOptions,
 ) -> Result<LogicalPlan> {
-    let context = MockContextProvider::default()
-        .with_udf(unicode::character_length().as_ref().clone())
-        .with_udf(string::concat().as_ref().clone())
-        .with_udf(make_udf(
+    let state = MockSessionState::default()
+        .with_scalar_function(Arc::new(unicode::character_length().as_ref().clone()))
+        .with_scalar_function(Arc::new(string::concat().as_ref().clone()))
+        .with_scalar_function(Arc::new(make_udf(
             "nullif",
             vec![DataType::Int32, DataType::Int32],
             DataType::Int32,
-        ))
-        .with_udf(make_udf(
+        )))
+        .with_scalar_function(Arc::new(make_udf(
             "round",
             vec![DataType::Float64, DataType::Int64],
             DataType::Float32,
-        ))
-        .with_udf(make_udf(
+        )))
+        .with_scalar_function(Arc::new(make_udf(
             "arrow_cast",
             vec![DataType::Int64, DataType::Utf8],
             DataType::Float64,
-        ))
-        .with_udf(make_udf(
+        )))
+        .with_scalar_function(Arc::new(make_udf(
             "date_trunc",
             vec![DataType::Utf8, DataType::Timestamp(Nanosecond, None)],
             DataType::Int32,
-        ))
-        .with_udf(make_udf("sqrt", vec![DataType::Int64], DataType::Int64))
-        .with_udaf(sum_udaf())
-        .with_udaf(approx_median_udaf())
-        .with_udaf(count_udaf())
-        .with_udaf(avg_udaf())
-        .with_udaf(grouping_udaf());
+        )))
+        .with_scalar_function(Arc::new(make_udf(
+            "sqrt",
+            vec![DataType::Int64],
+            DataType::Int64,
+        )))
+        .with_aggregate_function(sum_udaf())
+        .with_aggregate_function(approx_median_udaf())
+        .with_aggregate_function(count_udaf())
+        .with_aggregate_function(avg_udaf())
+        .with_aggregate_function(min_udaf())
+        .with_aggregate_function(max_udaf())
+        .with_aggregate_function(grouping_udaf())
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
 
+    let context = MockContextProvider { state };
     let planner = SqlToRel::new_with_options(&context, options);
     let result = DFParser::parse_sql_with_dialect(sql, dialect);
     let mut ast = result?;
@@ -2753,7 +2679,7 @@ fn quick_test(sql: &str, expected: &str) {
 
 fn quick_test_with_options(sql: &str, expected: &str, options: ParserOptions) {
     let plan = logical_plan_with_options(sql, options).unwrap();
-    assert_eq!(format!("{plan:?}"), expected);
+    assert_eq!(format!("{plan}"), expected);
 }
 
 fn prepare_stmt_quick_test(
@@ -2765,7 +2691,7 @@ fn prepare_stmt_quick_test(
 
     let assert_plan = plan.clone();
     // verify plan
-    assert_eq!(format!("{assert_plan:?}"), expected_plan);
+    assert_eq!(format!("{assert_plan}"), expected_plan);
 
     // verify data types
     if let LogicalPlan::Prepare(Prepare { data_types, .. }) = assert_plan {
@@ -2783,7 +2709,7 @@ fn prepare_stmt_replace_params_quick_test(
 ) -> LogicalPlan {
     // replace params
     let plan = plan.with_param_values(param_values).unwrap();
-    assert_eq!(format!("{plan:?}"), expected_plan);
+    assert_eq!(format!("{plan}"), expected_plan);
 
     plan
 }
@@ -2921,7 +2847,7 @@ fn exists_subquery_wildcard() {
     let expected = "Projection: p.id\
         \n  Filter: EXISTS (<subquery>)\
         \n    Subquery:\
-        \n      Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀\
+        \n      Projection: *\
         \n        Filter: person.last_name = outer_ref(p.last_name) AND person.state = outer_ref(p.state)\
         \n          TableScan: person\
         \n    SubqueryAlias: p\
@@ -2967,8 +2893,8 @@ fn scalar_subquery() {
 
     let expected = "Projection: p.id, (<subquery>)\
         \n  Subquery:\
-        \n    Projection: MAX(person.id)\
-        \n      Aggregate: groupBy=[[]], aggr=[[MAX(person.id)]]\
+        \n    Projection: max(person.id)\
+        \n      Aggregate: groupBy=[[]], aggr=[[max(person.id)]]\
         \n        Filter: person.last_name = outer_ref(p.last_name)\
         \n          TableScan: person\
         \n  SubqueryAlias: p\
@@ -3008,13 +2934,13 @@ fn subquery_references_cte() {
         cte AS (SELECT * FROM person) \
         SELECT * FROM person WHERE EXISTS (SELECT * FROM cte WHERE id = person.id)";
 
-    let expected = "Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀\
+    let expected = "Projection: *\
         \n  Filter: EXISTS (<subquery>)\
         \n    Subquery:\
-        \n      Projection: cte.id, cte.first_name, cte.last_name, cte.age, cte.state, cte.salary, cte.birth_date, cte.😀\
+        \n      Projection: *\
         \n        Filter: cte.id = outer_ref(person.id)\
         \n          SubqueryAlias: cte\
-        \n            Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀\
+        \n            Projection: *\
         \n              TableScan: person\
         \n    TableScan: person";
 
@@ -3029,7 +2955,7 @@ fn cte_with_no_column_names() {
         ) \
         SELECT * FROM numbers;";
 
-    let expected = "Projection: numbers.a, numbers.b, numbers.c\
+    let expected = "Projection: *\
         \n  SubqueryAlias: numbers\
         \n    Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS c\
         \n      EmptyRelation";
@@ -3045,7 +2971,7 @@ fn cte_with_column_names() {
         ) \
         SELECT * FROM numbers;";
 
-    let expected = "Projection: numbers.a, numbers.b, numbers.c\
+    let expected = "Projection: *\
         \n  SubqueryAlias: numbers\
         \n    Projection: Int64(1) AS a, Int64(2) AS b, Int64(3) AS c\
         \n      Projection: Int64(1), Int64(2), Int64(3)\
@@ -3063,7 +2989,7 @@ fn cte_with_column_aliases_precedence() {
         ) \
         SELECT * FROM numbers;";
 
-    let expected = "Projection: numbers.a, numbers.b, numbers.c\
+    let expected = "Projection: *\
         \n  SubqueryAlias: numbers\
         \n    Projection: x AS a, y AS b, z AS c\
         \n      Projection: Int64(1) AS x, Int64(2) AS y, Int64(3) AS z\
@@ -3178,6 +3104,114 @@ fn join_on_complex_condition() {
 }
 
 #[test]
+fn lateral_constant() {
+    let sql = "SELECT * FROM j1, LATERAL (SELECT 1) AS j2";
+    let expected = "Projection: *\
+            \n  CrossJoin:\
+            \n    TableScan: j1\
+            \n    SubqueryAlias: j2\
+            \n      Subquery:\
+            \n        Projection: Int64(1)\
+            \n          EmptyRelation";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn lateral_comma_join() {
+    let sql = "SELECT j1_string, j2_string FROM
+            j1, \
+            LATERAL (SELECT * FROM j2 WHERE j1_id < j2_id) AS j2";
+    let expected = "Projection: j1.j1_string, j2.j2_string\
+            \n  CrossJoin:\
+            \n    TableScan: j1\
+            \n    SubqueryAlias: j2\
+            \n      Subquery:\
+            \n        Projection: *\
+            \n          Filter: outer_ref(j1.j1_id) < j2.j2_id\
+            \n            TableScan: j2";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn lateral_comma_join_referencing_join_rhs() {
+    let sql = "SELECT * FROM\
+            \n  j1 JOIN (j2 JOIN j3 ON(j2_id = j3_id - 2)) ON(j1_id = j2_id),\
+            \n  LATERAL (SELECT * FROM j3 WHERE j3_string = j2_string) as j4;";
+    let expected = "Projection: *\
+            \n  CrossJoin:\
+            \n    Inner Join:  Filter: j1.j1_id = j2.j2_id\
+            \n      TableScan: j1\
+            \n      Inner Join:  Filter: j2.j2_id = j3.j3_id - Int64(2)\
+            \n        TableScan: j2\
+            \n        TableScan: j3\
+            \n    SubqueryAlias: j4\
+            \n      Subquery:\
+            \n        Projection: *\
+            \n          Filter: j3.j3_string = outer_ref(j2.j2_string)\
+            \n            TableScan: j3";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn lateral_comma_join_with_shadowing() {
+    // The j1_id on line 3 references the (closest) j1 definition from line 2.
+    let sql = "\
+            SELECT * FROM j1, LATERAL (\
+              SELECT * FROM j1, LATERAL (\
+                SELECT * FROM j2 WHERE j1_id = j2_id\
+              ) as j2\
+            ) as j2;";
+    let expected = "Projection: *\
+            \n  CrossJoin:\
+            \n    TableScan: j1\
+            \n    SubqueryAlias: j2\
+            \n      Subquery:\
+            \n        Projection: *\
+            \n          CrossJoin:\
+            \n            TableScan: j1\
+            \n            SubqueryAlias: j2\
+            \n              Subquery:\
+            \n                Projection: *\
+            \n                  Filter: outer_ref(j1.j1_id) = j2.j2_id\
+            \n                    TableScan: j2";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn lateral_left_join() {
+    let sql = "SELECT j1_string, j2_string FROM \
+            j1 \
+            LEFT JOIN LATERAL (SELECT * FROM j2 WHERE j1_id < j2_id) AS j2 ON(true);";
+    let expected = "Projection: j1.j1_string, j2.j2_string\
+            \n  Left Join:  Filter: Boolean(true)\
+            \n    TableScan: j1\
+            \n    SubqueryAlias: j2\
+            \n      Subquery:\
+            \n        Projection: *\
+            \n          Filter: outer_ref(j1.j1_id) < j2.j2_id\
+            \n            TableScan: j2";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn lateral_nested_left_join() {
+    let sql = "SELECT * FROM 
+            j1, \
+            (j2 LEFT JOIN LATERAL (SELECT * FROM j3 WHERE j1_id + j2_id = j3_id) AS j3 ON(true))";
+    let expected = "Projection: *\
+            \n  CrossJoin:\
+            \n    TableScan: j1\
+            \n    Left Join:  Filter: Boolean(true)\
+            \n      TableScan: j2\
+            \n      SubqueryAlias: j3\
+            \n        Subquery:\
+            \n          Projection: *\
+            \n            Filter: outer_ref(j1.j1_id) + outer_ref(j2.j2_id) = j3.j3_id\
+            \n              TableScan: j3";
+    quick_test(sql, expected);
+}
+
+#[test]
 fn hive_aggregate_with_filter() -> Result<()> {
     let dialect = &HiveDialect {};
     let sql = "SELECT sum(age) FILTER (WHERE age > 4) FROM person";
@@ -3271,7 +3305,7 @@ fn test_offset_before_limit() {
 #[test]
 fn test_distribute_by() {
     let sql = "select id from person distribute by state";
-    let expected = "Repartition: DistributeBy(state)\
+    let expected = "Repartition: DistributeBy(person.state)\
         \n  Projection: person.id\
         \n    TableScan: person";
     quick_test(sql, expected);
@@ -3444,7 +3478,7 @@ fn test_select_all_inner_join() {
             INNER JOIN orders \
             ON orders.customer_id * 2 = person.id + 10";
 
-    let expected = "Projection: person.id, person.first_name, person.last_name, person.age, person.state, person.salary, person.birth_date, person.😀, orders.order_id, orders.customer_id, orders.o_item_id, orders.qty, orders.price, orders.delivered\
+    let expected = "Projection: *\
             \n  Inner Join:  Filter: orders.customer_id * Int64(2) = person.id + Int64(10)\
             \n    TableScan: person\
             \n    TableScan: orders";
@@ -3627,7 +3661,7 @@ fn test_prepare_statement_to_plan_panic_prepare_wrong_syntax() {
     let sql = "PREPARE AS SELECT id, age  FROM person WHERE age = $foo";
     assert_eq!(
         logical_plan(sql).unwrap_err().strip_backtrace(),
-        "SQL error: ParserError(\"Expected AS, found: SELECT\")"
+        "SQL error: ParserError(\"Expected: AS, found: SELECT\")"
     )
 }
 
@@ -3668,7 +3702,7 @@ fn test_non_prepare_statement_should_infer_types() {
 
 #[test]
 #[should_panic(
-    expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
+    expected = "value: SQL(ParserError(\"Expected: [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
 )]
 fn test_prepare_statement_to_plan_panic_is_param() {
     let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age is $1";
@@ -3779,7 +3813,7 @@ fn test_prepare_statement_to_plan_params_as_constants() {
     ///////////////////
     // replace params with values
     let param_values = vec![ScalarValue::Int32(Some(10))];
-    let expected_plan = "Projection: Int32(10)\n  EmptyRelation";
+    let expected_plan = "Projection: Int32(10) AS $1\n  EmptyRelation";
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
 
@@ -3795,7 +3829,8 @@ fn test_prepare_statement_to_plan_params_as_constants() {
     ///////////////////
     // replace params with values
     let param_values = vec![ScalarValue::Int32(Some(10))];
-    let expected_plan = "Projection: Int64(1) + Int32(10)\n  EmptyRelation";
+    let expected_plan =
+        "Projection: Int64(1) + Int32(10) AS Int64(1) + $1\n  EmptyRelation";
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
 
@@ -3814,7 +3849,9 @@ fn test_prepare_statement_to_plan_params_as_constants() {
         ScalarValue::Int32(Some(10)),
         ScalarValue::Float64(Some(10.0)),
     ];
-    let expected_plan = "Projection: Int64(1) + Int32(10) + Float64(10)\n  EmptyRelation";
+    let expected_plan =
+        "Projection: Int64(1) + Int32(10) + Float64(10) AS Int64(1) + $1 + $2\
+        \n  EmptyRelation";
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
 }
@@ -3927,8 +3964,8 @@ fn test_prepare_statement_infer_types_subquery() {
 Projection: person.id, person.age
   Filter: person.age = (<subquery>)
     Subquery:
-      Projection: MAX(person.age)
-        Aggregate: groupBy=[[]], aggr=[[MAX(person.age)]]
+      Projection: max(person.age)
+        Aggregate: groupBy=[[]], aggr=[[max(person.age)]]
           Filter: person.id = $1
             TableScan: person
     TableScan: person
@@ -3948,8 +3985,8 @@ Projection: person.id, person.age
 Projection: person.id, person.age
   Filter: person.age = (<subquery>)
     Subquery:
-      Projection: MAX(person.age)
-        Aggregate: groupBy=[[]], aggr=[[MAX(person.age)]]
+      Projection: max(person.age)
+        Aggregate: groupBy=[[]], aggr=[[max(person.age)]]
           Filter: person.id = UInt32(10)
             TableScan: person
     TableScan: person
@@ -4029,7 +4066,7 @@ fn test_prepare_statement_insert_infer() {
                         \n  Projection: column1 AS id, column2 AS first_name, column3 AS last_name, \
                                     CAST(NULL AS Int32) AS age, CAST(NULL AS Utf8) AS state, CAST(NULL AS Float64) AS salary, \
                                     CAST(NULL AS Timestamp(Nanosecond, None)) AS birth_date, CAST(NULL AS Int32) AS 😀\
-                        \n    Values: (UInt32(1), Utf8(\"Alan\"), Utf8(\"Turing\"))";
+                        \n    Values: (UInt32(1) AS $1, Utf8(\"Alan\") AS $2, Utf8(\"Turing\") AS $3)";
     let plan = plan.replace_params_with_values(&param_values).unwrap();
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
@@ -4110,7 +4147,7 @@ fn test_prepare_statement_to_plan_multi_params() {
         ScalarValue::from("xyz"),
     ];
     let expected_plan =
-            "Projection: person.id, person.age, Utf8(\"xyz\")\
+            "Projection: person.id, person.age, Utf8(\"xyz\") AS $6\
         \n  Filter: person.age IN ([Int32(10), Int32(20)]) AND person.salary > Float64(100) AND person.salary < Float64(200) OR person.first_name < Utf8(\"abc\")\
         \n    TableScan: person";
 
@@ -4161,7 +4198,7 @@ fn test_prepare_statement_to_plan_value_list() {
     let sql = "PREPARE my_plan(STRING, STRING) AS SELECT * FROM (VALUES(1, $1), (2, $2)) AS t (num, letter);";
 
     let expected_plan = "Prepare: \"my_plan\" [Utf8, Utf8] \
-        \n  Projection: t.num, t.letter\
+        \n  Projection: *\
         \n    SubqueryAlias: t\
         \n      Projection: column1 AS num, column2 AS letter\
         \n        Values: (Int64(1), $1), (Int64(2), $2)";
@@ -4176,10 +4213,10 @@ fn test_prepare_statement_to_plan_value_list() {
         ScalarValue::from("a".to_string()),
         ScalarValue::from("b".to_string()),
     ];
-    let expected_plan = "Projection: t.num, t.letter\
+    let expected_plan = "Projection: *\
         \n  SubqueryAlias: t\
         \n    Projection: column1 AS num, column2 AS letter\
-        \n      Values: (Int64(1), Utf8(\"a\")), (Int64(2), Utf8(\"b\"))";
+        \n      Values: (Int64(1), Utf8(\"a\") AS $1), (Int64(2), Utf8(\"b\") AS $2)";
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
 }
@@ -4226,7 +4263,7 @@ fn test_table_alias() {
           (select age from person) t2 \
         ) as f";
 
-    let expected = "Projection: f.id, f.age\
+    let expected = "Projection: *\
         \n  SubqueryAlias: f\
         \n    CrossJoin:\
         \n      SubqueryAlias: t1\
@@ -4243,7 +4280,7 @@ fn test_table_alias() {
           (select age from person) t2 \
         ) as f (c1, c2)";
 
-    let expected = "Projection: f.c1, f.c2\
+    let expected = "Projection: *\
         \n  SubqueryAlias: f\
         \n    Projection: t1.id AS c1, t2.age AS c2\
         \n      CrossJoin:\
@@ -4321,7 +4358,7 @@ fn test_field_not_found_window_function() {
 
     let qualified_sql =
         "SELECT order_id, MAX(qty) OVER (PARTITION BY orders.order_id) from orders";
-    let expected = "Projection: orders.order_id, MAX(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\n  WindowAggr: windowExpr=[[MAX(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\n    TableScan: orders";
+    let expected = "Projection: orders.order_id, max(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\n  WindowAggr: windowExpr=[[max(orders.qty) PARTITION BY [orders.order_id] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]\n    TableScan: orders";
     quick_test(qualified_sql, expected);
 }
 
@@ -4347,8 +4384,37 @@ fn test_parse_escaped_string_literal_value() {
     let sql = r"SELECT character_length(E'\000') AS len";
     assert_eq!(
         logical_plan(sql).unwrap_err().strip_backtrace(),
-        "SQL error: TokenizerError(\"Unterminated encoded string literal at Line: 1, Column 25\")"
+        "SQL error: TokenizerError(\"Unterminated encoded string literal at Line: 1, Column: 25\")"
     )
+}
+
+#[test]
+fn plan_create_index() {
+    let sql =
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON test USING btree (name, age DESC)";
+    let plan = logical_plan_with_options(sql, ParserOptions::default()).unwrap();
+    match plan {
+        LogicalPlan::Ddl(DdlStatement::CreateIndex(CreateIndex {
+            name,
+            table,
+            using,
+            columns,
+            unique,
+            if_not_exists,
+            ..
+        })) => {
+            assert_eq!(name, Some("idx_name".to_string()));
+            assert_eq!(format!("{table}"), "test");
+            assert_eq!(using, Some("btree".to_string()));
+            assert_eq!(
+                columns,
+                vec![col("name").sort(true, false), col("age").sort(false, true),]
+            );
+            assert!(unique);
+            assert!(if_not_exists);
+        }
+        _ => panic!("wrong plan type"),
+    }
 }
 
 fn assert_field_not_found(err: DataFusionError, name: &str) {

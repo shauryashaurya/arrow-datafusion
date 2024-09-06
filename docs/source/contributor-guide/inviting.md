@@ -59,7 +59,7 @@ the person. Here is an example:
 To: private@datafusion.apache.org
 Subject: [DISCUSS] $PERSONS_NAME for Committer
 
-$PERSONS_NAME has been an active contributor to the Datafusion community for the
+$PERSONS_NAME has been an active contributor to the DataFusion community for the
 last 6 months[1][2], helping others, answering questions, and improving the
 project's code.
 
@@ -341,7 +341,7 @@ The DataFusion PMC Chair then sends a NOTICE to `board@apache.org` (cc'ing
 ```
 To: board@apache.org
 Cc: private@datafusion.apache.org
-Subject: [NOTICE] $NEW_PMC_MEMBER for DataFusion PMC
+Subject: [NOTICE] $NEW_PMC_MEMBER to join DataFusion PMC
 
 DataFusion proposes to invite $NEW_PMC_MEMBER ($NEW_PMC_MEMBER_APACHE_ID) to join the PMC.
 

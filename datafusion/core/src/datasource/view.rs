@@ -17,21 +17,23 @@
 
 //! View data source which uses a LogicalPlan as it's input.
 
-use std::{any::Any, sync::Arc};
-
-use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
-use datafusion_common::Column;
-use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use crate::{
     error::Result,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
 };
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion_catalog::Session;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::Column;
+use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use datafusion_optimizer::analyzer::expand_wildcard_rule::ExpandWildcardRule;
+use datafusion_optimizer::Analyzer;
 
 use crate::datasource::{TableProvider, TableType};
-use crate::execution::context::SessionState;
 
 /// An implementation of `TableProvider` that uses another logical plan.
 pub struct ViewTable {
@@ -50,6 +52,7 @@ impl ViewTable {
         logical_plan: LogicalPlan,
         definition: Option<String>,
     ) -> Result<Self> {
+        let logical_plan = Self::apply_required_rule(logical_plan)?;
         let table_schema = logical_plan.schema().as_ref().to_owned().into();
 
         let view = Self {
@@ -59,6 +62,15 @@ impl ViewTable {
         };
 
         Ok(view)
+    }
+
+    fn apply_required_rule(logical_plan: LogicalPlan) -> Result<LogicalPlan> {
+        let options = ConfigOptions::default();
+        Analyzer::with_rules(vec![Arc::new(ExpandWildcardRule::new())]).execute_and_check(
+            logical_plan,
+            &options,
+            |_, _| {},
+        )
     }
 
     /// Get definition ref
@@ -78,8 +90,8 @@ impl TableProvider for ViewTable {
         self
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        Some(&self.logical_plan)
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        Some(Cow::Borrowed(&self.logical_plan))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -103,7 +115,7 @@ impl TableProvider for ViewTable {
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -232,6 +244,26 @@ mod tests {
 
         assert_batches_eq!(expected, &results);
 
+        let view_sql =
+            "CREATE VIEW replace_xyz AS SELECT * REPLACE (column1*2 as column1) FROM xyz";
+        session_ctx.sql(view_sql).await?.collect().await?;
+
+        let results = session_ctx
+            .sql("SELECT * FROM replace_xyz")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+---------+---------+---------+",
+            "| column1 | column2 | column3 |",
+            "+---------+---------+---------+",
+            "| 2       | 2       | 3       |",
+            "| 8       | 5       | 6       |",
+            "+---------+---------+---------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
         Ok(())
     }
 

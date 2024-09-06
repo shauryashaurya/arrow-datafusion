@@ -22,9 +22,7 @@ use std::{
     borrow::Cow, collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, vec,
 };
 
-use super::{
-    get_projected_output_ordering, statistics::MinMaxStatistics, FileGroupPartitioner,
-};
+use super::{get_projected_output_ordering, statistics::MinMaxStatistics};
 use crate::datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl};
 use crate::{error::Result, scalar::ScalarValue};
 
@@ -56,7 +54,7 @@ pub fn wrap_partition_type_in_dict(val_type: DataType) -> DataType {
 }
 
 /// Convert a [`ScalarValue`] of partition columns to a type, as
-/// decribed in the documentation of [`wrap_partition_type_in_dict`],
+/// described in the documentation of [`wrap_partition_type_in_dict`],
 /// which can wrap the types.
 pub fn wrap_partition_value_in_dict(val: ScalarValue) -> ScalarValue {
     ScalarValue::Dictionary(Box::new(DataType::UInt16), Box::new(val))
@@ -244,7 +242,7 @@ impl FileScanConfig {
         }
 
         let table_stats = Statistics {
-            num_rows: self.statistics.num_rows.clone(),
+            num_rows: self.statistics.num_rows,
             // TODO correct byte size?
             total_byte_size: Precision::Absent,
             column_statistics: table_cols_stats,
@@ -294,19 +292,6 @@ impl FileScanConfig {
                 .copied()
                 .collect()
         })
-    }
-
-    #[allow(missing_docs)]
-    #[deprecated(since = "33.0.0", note = "Use SessionContext::new_with_config")]
-    pub fn repartition_file_groups(
-        file_groups: Vec<Vec<PartitionedFile>>,
-        target_partitions: usize,
-        repartition_file_min_size: usize,
-    ) -> Option<Vec<Vec<PartitionedFile>>> {
-        FileGroupPartitioner::new()
-            .with_target_partitions(target_partitions)
-            .with_repartition_file_min_size(repartition_file_min_size)
-            .repartition_file_groups(&file_groups)
     }
 
     /// Attempts to do a bin-packing on files into file groups, such that any two files
@@ -682,7 +667,7 @@ mod tests {
             vec![table_partition_col.clone()],
         );
 
-        // verify the proj_schema inlcudes the last column and exactly the same the field it is defined
+        // verify the proj_schema includes the last column and exactly the same the field it is defined
         let (proj_schema, _proj_statistics, _) = conf.project();
         assert_eq!(proj_schema.fields().len(), file_schema.fields().len() + 1);
         assert_eq!(
@@ -908,7 +893,7 @@ mod tests {
             schema.clone(),
             Some(vec![0, 3, 5, schema.fields().len()]),
             Statistics::new_unknown(&schema),
-            to_partition_cols(partition_cols.clone()),
+            to_partition_cols(partition_cols),
         )
         .projected_file_schema();
 
@@ -941,7 +926,7 @@ mod tests {
             schema.clone(),
             None,
             Statistics::new_unknown(&schema),
-            to_partition_cols(partition_cols.clone()),
+            to_partition_cols(partition_cols),
         )
         .projected_file_schema();
 
@@ -979,7 +964,7 @@ mod tests {
             name: &'static str,
             file_schema: Schema,
             files: Vec<File>,
-            sort: Vec<datafusion_expr::Expr>,
+            sort: Vec<datafusion_expr::SortExpr>,
             expected_result: Result<Vec<Vec<&'static str>>, &'static str>,
         }
 

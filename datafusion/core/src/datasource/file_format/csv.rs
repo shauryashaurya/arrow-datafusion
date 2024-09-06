@@ -46,11 +46,12 @@ use datafusion_common::{
     exec_err, not_impl_err, DataFusionError, GetExt, DEFAULT_CSV_EXTENSION,
 };
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::metrics::MetricsSet;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
@@ -58,7 +59,8 @@ use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore}
 #[derive(Default)]
 /// Factory struct used to create [CsvFormatFactory]
 pub struct CsvFormatFactory {
-    options: Option<CsvOptions>,
+    /// the options for csv file read
+    pub options: Option<CsvOptions>,
 }
 
 impl CsvFormatFactory {
@@ -72,6 +74,14 @@ impl CsvFormatFactory {
         Self {
             options: Some(options),
         }
+    }
+}
+
+impl fmt::Debug for CsvFormatFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CsvFormatFactory")
+            .field("options", &self.options)
+            .finish()
     }
 }
 
@@ -102,6 +112,10 @@ impl FileFormatFactory for CsvFormatFactory {
 
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(CsvFormat::default())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -233,6 +247,25 @@ impl CsvFormat {
         self
     }
 
+    /// The character used to indicate the end of a row.
+    /// - default to None (CRLF)
+    pub fn with_terminator(mut self, terminator: Option<u8>) -> Self {
+        self.options.terminator = terminator;
+        self
+    }
+
+    /// Specifies whether newlines in (quoted) values are supported.
+    ///
+    /// Parsing newlines in quoted values may be affected by execution behaviour such as
+    /// parallel file scanning. Setting this to `true` ensures that newlines in values are
+    /// parsed successfully, which may reduce performance.
+    ///
+    /// The default behaviour depends on the `datafusion.catalog.newlines_in_values` setting.
+    pub fn with_newlines_in_values(mut self, newlines_in_values: bool) -> Self {
+        self.options.newlines_in_values = Some(newlines_in_values);
+        self
+    }
+
     /// Set a `FileCompressionType` of CSV
     /// - defaults to `FileCompressionType::UNCOMPRESSED`
     pub fn with_file_compression_type(
@@ -319,34 +352,60 @@ impl FileFormat for CsvFormat {
         conf: FileScanConfig,
         _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let exec = CsvExec::new(
-            conf,
-            // If format options does not specify whether there is a header,
-            // we consult configuration options.
-            self.options
-                .has_header
-                .unwrap_or(state.config_options().catalog.has_header),
-            self.options.delimiter,
-            self.options.quote,
-            self.options.escape,
-            self.options.comment,
-            self.options.compression.into(),
-        );
+        // Consult configuration options for default values
+        let has_header = self
+            .options
+            .has_header
+            .unwrap_or(state.config_options().catalog.has_header);
+        let newlines_in_values = self
+            .options
+            .newlines_in_values
+            .unwrap_or(state.config_options().catalog.newlines_in_values);
+
+        let exec = CsvExec::builder(conf)
+            .with_has_header(has_header)
+            .with_delimeter(self.options.delimiter)
+            .with_quote(self.options.quote)
+            .with_terminator(self.options.terminator)
+            .with_escape(self.options.escape)
+            .with_comment(self.options.comment)
+            .with_newlines_in_values(newlines_in_values)
+            .with_file_compression_type(self.options.compression.into())
+            .build();
         Ok(Arc::new(exec))
     }
 
     async fn create_writer_physical_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        _state: &SessionState,
+        state: &SessionState,
         conf: FileSinkConfig,
-        order_requirements: Option<Vec<PhysicalSortRequirement>>,
+        order_requirements: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for CSV");
         }
 
-        let writer_options = CsvWriterOptions::try_from(&self.options)?;
+        // `has_header` and `newlines_in_values` fields of CsvOptions may inherit
+        // their values from session from configuration settings. To support
+        // this logic, writer options are built from the copy of `self.options`
+        // with updated values of these special fields.
+        let has_header = self
+            .options()
+            .has_header
+            .unwrap_or(state.config_options().catalog.has_header);
+        let newlines_in_values = self
+            .options()
+            .newlines_in_values
+            .unwrap_or(state.config_options().catalog.newlines_in_values);
+
+        let options = self
+            .options()
+            .clone()
+            .with_has_header(has_header)
+            .with_newlines_in_values(newlines_in_values);
+
+        let writer_options = CsvWriterOptions::try_from(&options)?;
 
         let sink_schema = conf.output_schema().clone();
         let sink = Arc::new(CsvSink::new(conf, writer_options));
@@ -629,9 +688,10 @@ mod tests {
     use datafusion_common::cast::as_string_array;
     use datafusion_common::internal_err;
     use datafusion_common::stats::Precision;
-    use datafusion_execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::{col, lit};
 
+    use crate::execution::session_state::SessionStateBuilder;
     use chrono::DateTime;
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
@@ -644,7 +704,7 @@ mod tests {
         let session_ctx = SessionContext::new_with_config(config);
         let state = session_ctx.state();
         let task_ctx = state.task_ctx();
-        // skip column 9 that overflows the automaticly discovered column type of i64 (u64 would work)
+        // skip column 9 that overflows the automatically discovered column type of i64 (u64 would work)
         let projection = Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]);
         let exec =
             get_exec(&state, "aggregate_test_100.csv", projection, None, true).await?;
@@ -811,10 +871,14 @@ mod tests {
     async fn query_compress_data(
         file_compression_type: FileCompressionType,
     ) -> Result<()> {
-        let runtime = Arc::new(RuntimeEnv::new(RuntimeConfig::new()).unwrap());
+        let runtime = Arc::new(RuntimeEnvBuilder::new().build()?);
         let mut cfg = SessionConfig::new();
         cfg.options_mut().catalog.has_header = true;
-        let session_state = SessionState::new_with_config_rt(cfg, runtime);
+        let session_state = SessionStateBuilder::new()
+            .with_config(cfg)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .build();
         let integration = LocalFileSystem::new_with_prefix(arrow_test_data()).unwrap();
         let path = Path::from("csv/aggregate_test_100.csv");
         let csv = CsvFormat::default().with_has_header(true);
@@ -1047,6 +1111,41 @@ mod tests {
         Ok(())
     }
 
+    #[rstest(n_partitions, case(1), case(2), case(3), case(4))]
+    #[tokio::test]
+    async fn test_csv_parallel_newlines_in_values(n_partitions: usize) -> Result<()> {
+        let config = SessionConfig::new()
+            .with_repartition_file_scans(true)
+            .with_repartition_file_min_size(0)
+            .with_target_partitions(n_partitions);
+        let csv_options = CsvReadOptions::default()
+            .has_header(true)
+            .newlines_in_values(true);
+        let ctx = SessionContext::new_with_config(config);
+        let testdata = arrow_test_data();
+        ctx.register_csv(
+            "aggr",
+            &format!("{testdata}/csv/aggregate_test_100.csv"),
+            csv_options,
+        )
+        .await?;
+
+        let query = "select sum(c3) from aggr;";
+        let query_result = ctx.sql(query).await?.collect().await?;
+        let actual_partitions = count_query_csv_partitions(&ctx, query).await?;
+
+        #[rustfmt::skip]
+        let expected = ["+--------------+",
+            "| sum(aggr.c3) |",
+            "+--------------+",
+            "| 781          |",
+            "+--------------+"];
+        assert_batches_eq!(expected, &query_result);
+        assert_eq!(1, actual_partitions); // csv won't be scanned in parallel when newlines_in_values is set
+
+        Ok(())
+    }
+
     /// Read a single empty csv file in parallel
     ///
     /// empty_0_byte.csv:
@@ -1246,11 +1345,8 @@ mod tests {
             "+-----------------------+",
             "| 50                    |",
             "+-----------------------+"];
-        let file_size = if cfg!(target_os = "windows") {
-            30 // new line on Win is '\r\n'
-        } else {
-            20
-        };
+
+        let file_size = std::fs::metadata("tests/data/one_col.csv")?.len() as usize;
         // A 20-Byte file at most get partitioned into 20 chunks
         let expected_partitions = if n_partitions <= file_size {
             n_partitions

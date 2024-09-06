@@ -23,8 +23,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use super::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, SendableRecordBatchStream,
+    execute_input_stream, DisplayAs, DisplayFormatType, ExecutionPlan,
+    ExecutionPlanProperties, Partitioning, PlanProperties, SendableRecordBatchStream,
 };
 use crate::metrics::MetricsSet;
 use crate::stream::RecordBatchStreamAdapter;
@@ -33,13 +33,12 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow_array::{ArrayRef, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use datafusion_common::{exec_err, internal_err, Result};
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{
-    Distribution, EquivalenceProperties, PhysicalSortRequirement,
-};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 
 use async_trait::async_trait;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::StreamExt;
 
 /// `DataSink` implements writing streams of [`RecordBatch`]es to
@@ -90,7 +89,7 @@ pub struct DataSinkExec {
     /// Schema describing the structure of the output data.
     count_schema: SchemaRef,
     /// Optional required sort order for output data.
-    sort_order: Option<Vec<PhysicalSortRequirement>>,
+    sort_order: Option<LexRequirement>,
     cache: PlanProperties,
 }
 
@@ -106,7 +105,7 @@ impl DataSinkExec {
         input: Arc<dyn ExecutionPlan>,
         sink: Arc<dyn DataSink>,
         sink_schema: SchemaRef,
-        sort_order: Option<Vec<PhysicalSortRequirement>>,
+        sort_order: Option<LexRequirement>,
     ) -> Self {
         let count_schema = make_count_schema();
         let cache = Self::create_schema(&input, count_schema);
@@ -117,46 +116,6 @@ impl DataSinkExec {
             count_schema: make_count_schema(),
             sort_order,
             cache,
-        }
-    }
-
-    fn execute_input_stream(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-
-        debug_assert_eq!(
-            self.sink_schema.fields().len(),
-            self.input.schema().fields().len()
-        );
-
-        // Find input columns that may violate the not null constraint.
-        let risky_columns: Vec<_> = self
-            .sink_schema
-            .fields()
-            .iter()
-            .zip(self.input.schema().fields().iter())
-            .enumerate()
-            .filter_map(|(i, (sink_field, input_field))| {
-                if !sink_field.is_nullable() && input_field.is_nullable() {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if risky_columns.is_empty() {
-            Ok(input_stream)
-        } else {
-            // Check not null constraint on the input stream
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                self.sink_schema.clone(),
-                input_stream
-                    .map(move |batch| check_not_null_contraits(batch?, &risky_columns)),
-            )))
         }
     }
 
@@ -171,7 +130,7 @@ impl DataSinkExec {
     }
 
     /// Optional sort order for output data
-    pub fn sort_order(&self) -> &Option<Vec<PhysicalSortRequirement>> {
+    pub fn sort_order(&self) -> &Option<LexRequirement> {
         &self.sort_order
     }
 
@@ -229,7 +188,7 @@ impl ExecutionPlan for DataSinkExec {
         vec![Distribution::SinglePartition; self.children().len()]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         // The required input ordering is set externally (e.g. by a `ListingTable`).
         // Otherwise, there is no specific requirement (i.e. `sort_expr` is `None`).
         vec![self.sort_order.as_ref().cloned()]
@@ -252,9 +211,9 @@ impl ExecutionPlan for DataSinkExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
-            children[0].clone(),
-            self.sink.clone(),
-            self.sink_schema.clone(),
+            Arc::clone(&children[0]),
+            Arc::clone(&self.sink),
+            Arc::clone(&self.sink_schema),
             self.sort_order.clone(),
         )))
     }
@@ -269,10 +228,15 @@ impl ExecutionPlan for DataSinkExec {
         if partition != 0 {
             return internal_err!("DataSinkExec can only be called on partition 0!");
         }
-        let data = self.execute_input_stream(0, context.clone())?;
+        let data = execute_input_stream(
+            Arc::clone(&self.input),
+            Arc::clone(&self.sink_schema),
+            0,
+            Arc::clone(&context),
+        )?;
 
-        let count_schema = self.count_schema.clone();
-        let sink = self.sink.clone();
+        let count_schema = Arc::clone(&self.count_schema);
+        let sink = Arc::clone(&self.sink);
 
         let stream = futures::stream::once(async move {
             sink.write_all(data, &context).await.map(make_count_batch)
@@ -313,28 +277,4 @@ fn make_count_schema() -> SchemaRef {
         DataType::UInt64,
         false,
     )]))
-}
-
-fn check_not_null_contraits(
-    batch: RecordBatch,
-    column_indices: &Vec<usize>,
-) -> Result<RecordBatch> {
-    for &index in column_indices {
-        if batch.num_columns() <= index {
-            return exec_err!(
-                "Invalid batch column count {} expected > {}",
-                batch.num_columns(),
-                index
-            );
-        }
-
-        if batch.column(index).null_count() > 0 {
-            return exec_err!(
-                "Invalid batch column at '{}' has null but schema specifies non-nullable",
-                index
-            );
-        }
-    }
-
-    Ok(batch)
 }

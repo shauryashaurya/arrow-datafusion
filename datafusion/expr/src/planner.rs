@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`ContextProvider`] and [`UserDefinedSQLPlanner`] APIs to customize SQL query planning
+//! [`ContextProvider`] and [`ExprPlanner`] APIs to customize SQL query planning
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion_common::{
     config::ConfigOptions, file_options::file_type::FileType, not_impl_err, DFSchema,
     Result, TableReference,
@@ -60,6 +60,11 @@ pub trait ContextProvider {
         not_impl_err!("Recursive CTE is not implemented")
     }
 
+    /// Getter for expr planners
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        &[]
+    }
+
     /// Getter for a UDF description
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>>;
     /// Getter for a UDAF description
@@ -83,7 +88,7 @@ pub trait ContextProvider {
 }
 
 /// This trait allows users to customize the behavior of the SQL planner
-pub trait UserDefinedSQLPlanner: Send + Sync {
+pub trait ExprPlanner: Send + Sync {
     /// Plan the binary operation between two expressions, returns original
     /// BinaryExpr if not possible
     fn plan_binary_op(
@@ -161,6 +166,44 @@ pub trait UserDefinedSQLPlanner: Send + Sync {
     ) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Original(args))
     }
+
+    /// Plans an overlay expression eg `overlay(str PLACING substr FROM pos [FOR count])`
+    ///
+    /// Returns origin expression arguments if not possible
+    fn plan_overlay(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Original(args))
+    }
+
+    /// Plan a make_map expression, e.g., `make_map(key1, value1, key2, value2, ...)`
+    ///
+    /// Returns origin expression arguments if not possible
+    fn plan_make_map(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Original(args))
+    }
+
+    /// Plans compound identifier eg `db.schema.table` for non-empty nested names
+    ///
+    /// Note:
+    /// Currently compound identifier for outer query schema is not supported.
+    ///
+    /// Returns planned expression
+    fn plan_compound_identifier(
+        &self,
+        _field: &Field,
+        _qualifier: Option<&TableReference>,
+        _nested_names: &[String],
+    ) -> Result<PlannerResult<Vec<Expr>>> {
+        not_impl_err!(
+            "Default planner compound identifier hasn't been implemented for ExprPlanner"
+        )
+    }
+
+    /// Plans `ANY` expression, e.g., `expr = ANY(array_expr)`
+    ///
+    /// Returns origin binary expression if not possible
+    fn plan_any(&self, expr: RawBinaryExpr) -> Result<PlannerResult<RawBinaryExpr>> {
+        Ok(PlannerResult::Original(expr))
+    }
 }
 
 /// An operator with two arguments to plan
@@ -168,7 +211,7 @@ pub trait UserDefinedSQLPlanner: Send + Sync {
 /// Note `left` and `right` are DataFusion [`Expr`]s but the `op` is the SQL AST
 /// operator.
 ///
-/// This structure is used by [`UserDefinedSQLPlanner`] to plan operators with
+/// This structure is used by [`ExprPlanner`] to plan operators with
 /// custom expressions.
 #[derive(Debug, Clone)]
 pub struct RawBinaryExpr {
@@ -179,7 +222,7 @@ pub struct RawBinaryExpr {
 
 /// An expression with GetFieldAccess to plan
 ///
-/// This structure is used by [`UserDefinedSQLPlanner`] to plan operators with
+/// This structure is used by [`ExprPlanner`] to plan operators with
 /// custom expressions.
 #[derive(Debug, Clone)]
 pub struct RawFieldAccessExpr {
@@ -189,7 +232,7 @@ pub struct RawFieldAccessExpr {
 
 /// A Dictionary literal expression `{ key: value, ...}`
 ///
-/// This structure is used by [`UserDefinedSQLPlanner`] to plan operators with
+/// This structure is used by [`ExprPlanner`] to plan operators with
 /// custom expressions.
 #[derive(Debug, Clone)]
 pub struct RawDictionaryExpr {
@@ -197,7 +240,7 @@ pub struct RawDictionaryExpr {
     pub values: Vec<Expr>,
 }
 
-/// Result of planning a raw expr with [`UserDefinedSQLPlanner`]
+/// Result of planning a raw expr with [`ExprPlanner`]
 #[derive(Debug, Clone)]
 pub enum PlannerResult<T> {
     /// The raw expression was successfully planned as a new [`Expr`]

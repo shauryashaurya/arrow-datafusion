@@ -17,20 +17,20 @@
 
 use arrow_schema::DataType;
 use arrow_schema::TimeUnit;
-use datafusion_expr::planner::PlannerResult;
-use datafusion_expr::planner::RawDictionaryExpr;
-use datafusion_expr::planner::RawFieldAccessExpr;
+use datafusion_expr::planner::{
+    PlannerResult, RawBinaryExpr, RawDictionaryExpr, RawFieldAccessExpr,
+};
 use sqlparser::ast::{
-    CastKind, DictionaryField, Expr as SQLExpr, StructField, Subscript, TrimWhereField,
-    Value,
+    BinaryOperator, CastKind, DictionaryField, Expr as SQLExpr, MapEntry, StructField,
+    Subscript, TrimWhereField, Value,
 };
 
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, Result,
-    ScalarValue,
+    ScalarValue, TableReference,
 };
-use datafusion_expr::expr::InList;
 use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::expr::{InList, WildcardOptions};
 use datafusion_expr::{
     lit, Between, BinaryExpr, Cast, Expr, ExprSchemable, GetFieldAccess, Like, Literal,
     Operator, TryCast,
@@ -104,14 +104,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     fn build_logical_expr(
         &self,
-        op: sqlparser::ast::BinaryOperator,
+        op: BinaryOperator,
         left: Expr,
         right: Expr,
         schema: &DFSchema,
     ) -> Result<Expr> {
         // try extension planers
-        let mut binary_expr = datafusion_expr::planner::RawBinaryExpr { op, left, right };
-        for planner in self.planners.iter() {
+        let mut binary_expr = RawBinaryExpr { op, left, right };
+        for planner in self.context_provider.get_expr_planners() {
             match planner.plan_binary_op(binary_expr, schema)? {
                 PlannerResult::Planned(expr) => {
                     return Ok(expr);
@@ -122,7 +122,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
         }
 
-        let datafusion_expr::planner::RawBinaryExpr { op, left, right } = binary_expr;
+        let RawBinaryExpr { op, left, right } = binary_expr;
         Ok(Expr::BinaryExpr(BinaryExpr::new(
             Box::new(left),
             self.parse_sql_binary_op(op)?,
@@ -178,13 +178,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLExpr::Value(value) => {
                 self.parse_value(value, planner_context.prepare_param_data_types())
             }
-            SQLExpr::Extract { field, expr } => {
+            SQLExpr::Extract { field, expr, .. } => {
                 let mut extract_args = vec![
                     Expr::Literal(ScalarValue::from(format!("{field}"))),
                     self.sql_expr_to_logical_expr(*expr, schema, planner_context)?,
                 ];
 
-                for planner in self.planners.iter() {
+                for planner in self.context_provider.get_expr_planners() {
                     match planner.plan_extract(extract_args)? {
                         PlannerResult::Planned(expr) => return Ok(expr),
                         PlannerResult::Original(args) => {
@@ -193,7 +193,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     }
                 }
 
-                not_impl_err!("Extract not supported by UserDefinedExtensionPlanners: {extract_args:?}")
+                not_impl_err!("Extract not supported by ExprPlanner: {extract_args:?}")
             }
 
             SQLExpr::Array(arr) => self.sql_array_literal(arr.elem, schema),
@@ -283,7 +283,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 };
 
                 let mut field_access_expr = RawFieldAccessExpr { expr, field_access };
-                for planner in self.planners.iter() {
+                for planner in self.context_provider.get_expr_planners() {
                     match planner.plan_field_access(field_access_expr, schema)? {
                         PlannerResult::Planned(expr) => return Ok(expr),
                         PlannerResult::Original(expr) => {
@@ -292,7 +292,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     }
                 }
 
-                not_impl_err!("GetFieldAccess not supported by UserDefinedExtensionPlanners: {field_access_expr:?}")
+                not_impl_err!(
+                    "GetFieldAccess not supported by ExprPlanner: {field_access_expr:?}"
+                )
             }
 
             SQLExpr::CompoundIdentifier(ids) => {
@@ -626,6 +628,48 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLExpr::Dictionary(fields) => {
                 self.try_plan_dictionary_literal(fields, schema, planner_context)
             }
+            SQLExpr::Map(map) => {
+                self.try_plan_map_literal(map.entries, schema, planner_context)
+            }
+            SQLExpr::AnyOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                let mut binary_expr = RawBinaryExpr {
+                    op: compare_op,
+                    left: self.sql_expr_to_logical_expr(
+                        *left,
+                        schema,
+                        planner_context,
+                    )?,
+                    right: self.sql_expr_to_logical_expr(
+                        *right,
+                        schema,
+                        planner_context,
+                    )?,
+                };
+                for planner in self.context_provider.get_expr_planners() {
+                    match planner.plan_any(binary_expr)? {
+                        PlannerResult::Planned(expr) => {
+                            return Ok(expr);
+                        }
+                        PlannerResult::Original(expr) => {
+                            binary_expr = expr;
+                        }
+                    }
+                }
+                not_impl_err!("AnyOp not supported by ExprPlanner: {binary_expr:?}")
+            }
+            SQLExpr::Wildcard => Ok(Expr::Wildcard {
+                qualifier: None,
+                options: WildcardOptions::default(),
+            }),
+            SQLExpr::QualifiedWildcard(object_name) => Ok(Expr::Wildcard {
+                qualifier: Some(TableReference::from(object_name.to_string())),
+                options: WildcardOptions::default(),
+            }),
+            SQLExpr::Tuple(values) => self.parse_tuple(schema, planner_context, values),
             _ => not_impl_err!("Unsupported ast node in sqltorel: {sql:?}"),
         }
     }
@@ -635,7 +679,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         &self,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
-        values: Vec<sqlparser::ast::Expr>,
+        values: Vec<SQLExpr>,
         fields: Vec<StructField>,
     ) -> Result<Expr> {
         if !fields.is_empty() {
@@ -651,13 +695,30 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             self.create_struct_expr(values, schema, planner_context)?
         };
 
-        for planner in self.planners.iter() {
+        for planner in self.context_provider.get_expr_planners() {
             match planner.plan_struct_literal(create_struct_args, is_named_struct)? {
                 PlannerResult::Planned(expr) => return Ok(expr),
                 PlannerResult::Original(args) => create_struct_args = args,
             }
         }
-        not_impl_err!("Struct not supported by UserDefinedExtensionPlanners: {create_struct_args:?}")
+        not_impl_err!("Struct not supported by ExprPlanner: {create_struct_args:?}")
+    }
+
+    fn parse_tuple(
+        &self,
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+        values: Vec<SQLExpr>,
+    ) -> Result<Expr> {
+        match values.first() {
+            Some(SQLExpr::Identifier(_)) | Some(SQLExpr::Value(_)) => {
+                self.parse_struct(schema, planner_context, values, vec![])
+            }
+            None => not_impl_err!("Empty tuple not supported yet"),
+            _ => {
+                not_impl_err!("Only identifiers and literals are supported in tuples")
+            }
+        }
     }
 
     fn sql_position_to_expr(
@@ -671,7 +732,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             self.sql_expr_to_logical_expr(substr_expr, schema, planner_context)?;
         let fullstr = self.sql_expr_to_logical_expr(str_expr, schema, planner_context)?;
         let mut position_args = vec![fullstr, substr];
-        for planner in self.planners.iter() {
+        for planner in self.context_provider.get_expr_planners() {
             match planner.plan_position(position_args)? {
                 PlannerResult::Planned(expr) => return Ok(expr),
                 PlannerResult::Original(args) => {
@@ -680,9 +741,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
         }
 
-        not_impl_err!(
-            "Position not supported by UserDefinedExtensionPlanners: {position_args:?}"
-        )
+        not_impl_err!("Position not supported by ExprPlanner: {position_args:?}")
     }
 
     fn try_plan_dictionary_literal(
@@ -703,7 +762,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         let mut raw_expr = RawDictionaryExpr { keys, values };
 
-        for planner in self.planners.iter() {
+        for planner in self.context_provider.get_expr_planners() {
             match planner.plan_dictionary_literal(raw_expr, schema)? {
                 PlannerResult::Planned(expr) => {
                     return Ok(expr);
@@ -711,7 +770,29 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 PlannerResult::Original(expr) => raw_expr = expr,
             }
         }
-        not_impl_err!("Unsupported dictionary literal: {raw_expr:?}")
+        not_impl_err!("Dictionary not supported by ExprPlanner: {raw_expr:?}")
+    }
+
+    fn try_plan_map_literal(
+        &self,
+        entries: Vec<MapEntry>,
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Expr> {
+        let mut exprs: Vec<_> = entries
+            .into_iter()
+            .flat_map(|entry| vec![entry.key, entry.value].into_iter())
+            .map(|expr| self.sql_expr_to_logical_expr(*expr, schema, planner_context))
+            .collect::<Result<Vec<_>>>()?;
+        for planner in self.context_provider.get_expr_planners() {
+            match planner.plan_make_map(exprs)? {
+                PlannerResult::Planned(expr) => {
+                    return Ok(expr);
+                }
+                PlannerResult::Original(expr) => exprs = expr,
+            }
+        }
+        not_impl_err!("MAP not supported by ExprPlanner: {exprs:?}")
     }
 
     // Handles a call to struct(...) where the arguments are named. For example
@@ -914,18 +995,12 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        let fun = self
-            .context_provider
-            .get_function_meta("overlay")
-            .ok_or_else(|| {
-                internal_datafusion_err!("Unable to find expected 'overlay' function")
-            })?;
         let arg = self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
         let what_arg =
             self.sql_expr_to_logical_expr(overlay_what, schema, planner_context)?;
         let from_arg =
             self.sql_expr_to_logical_expr(overlay_from, schema, planner_context)?;
-        let args = match overlay_for {
+        let mut overlay_args = match overlay_for {
             Some(for_expr) => {
                 let for_expr =
                     self.sql_expr_to_logical_expr(*for_expr, schema, planner_context)?;
@@ -933,7 +1008,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
             None => vec![arg, what_arg, from_arg],
         };
-        Ok(Expr::ScalarFunction(ScalarFunction::new_udf(fun, args)))
+        for planner in self.context_provider.get_expr_planners() {
+            match planner.plan_overlay(overlay_args)? {
+                PlannerResult::Planned(expr) => return Ok(expr),
+                PlannerResult::Original(args) => overlay_args = args,
+            }
+        }
+        not_impl_err!("Overlay not supported by ExprPlanner: {overlay_args:?}")
     }
 }
 
@@ -981,7 +1062,7 @@ mod tests {
     impl ContextProvider for TestContextProvider {
         fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
             match self.tables.get(name.table()) {
-                Some(table) => Ok(table.clone()),
+                Some(table) => Ok(Arc::clone(table)),
                 _ => plan_err!("Table not found: {}", name.table()),
             }
         }

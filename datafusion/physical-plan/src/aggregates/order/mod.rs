@@ -25,12 +25,12 @@ mod full;
 mod partial;
 
 use crate::InputOrderMode;
-pub(crate) use full::GroupOrderingFull;
-pub(crate) use partial::GroupOrderingPartial;
+pub use full::GroupOrderingFull;
+pub use partial::GroupOrderingPartial;
 
 /// Ordering information for each group in the hash table
 #[derive(Debug)]
-pub(crate) enum GroupOrdering {
+pub enum GroupOrdering {
     /// Groups are not ordered
     None,
     /// Groups are ordered by some pre-set of the group keys
@@ -87,7 +87,7 @@ impl GroupOrdering {
     /// Called when new groups are added in a batch
     ///
     /// * `total_num_groups`: total number of groups (so max
-    /// group_index is total_num_groups - 1).
+    ///   group_index is total_num_groups - 1).
     ///
     /// * `group_values`: group key values for *each row* in the batch
     ///
@@ -117,7 +117,7 @@ impl GroupOrdering {
     }
 
     /// Return the size of memory used by the ordering state, in bytes
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         std::mem::size_of::<Self>()
             + match self {
                 GroupOrdering::None => 0,

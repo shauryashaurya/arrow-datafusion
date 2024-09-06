@@ -31,7 +31,7 @@ use crate::{
 
 use arrow::array::{
     downcast_array, new_null_array, Array, BooleanBufferBuilder, UInt32Array,
-    UInt32BufferBuilder, UInt32Builder, UInt64Array, UInt64BufferBuilder,
+    UInt32Builder, UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{Field, Schema, SchemaBuilder, UInt32Type, UInt64Type};
@@ -66,7 +66,7 @@ use parking_lot::Mutex;
 /// E.g. 1 -> [3, 6, 8] indicates that the column values map to rows 3, 6 and 8 for hash value 1
 /// As the key is a hash value, we need to check possible hash collisions in the probe stage
 /// During this stage it might be the case that a row is contained the same hashmap value,
-/// but the values don't match. Those are checked in the [`equal_rows_arr`](crate::joins::hash_join::equal_rows_arr) method.
+/// but the values don't match. Those are checked in the `equal_rows_arr` method.
 ///
 /// The indices (values) are stored in a separate chained list stored in the `Vec<u64>`.
 ///
@@ -145,7 +145,7 @@ impl JoinHashMap {
 pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 
 // Macro for traversing chained values with limit.
-// Early returns in case of reacing output tuples limit.
+// Early returns in case of reaching output tuples limit.
 macro_rules! chain_traverse {
     (
         $input_indices:ident, $match_indices:ident, $hash_values:ident, $next_chain:ident,
@@ -163,8 +163,8 @@ macro_rules! chain_traverse {
             } else {
                 i
             };
-            $match_indices.append(match_row_idx);
-            $input_indices.append($input_idx as u32);
+            $match_indices.push(match_row_idx);
+            $input_indices.push($input_idx as u32);
             $remaining_output -= 1;
             // Follow the chain to get the next index value
             let next = $next_chain[match_row_idx as usize];
@@ -238,9 +238,9 @@ pub trait JoinHashMapType {
         &self,
         iter: impl Iterator<Item = (usize, &'a u64)>,
         deleted_offset: Option<usize>,
-    ) -> (UInt32BufferBuilder, UInt64BufferBuilder) {
-        let mut input_indices = UInt32BufferBuilder::new(0);
-        let mut match_indices = UInt64BufferBuilder::new(0);
+    ) -> (Vec<u32>, Vec<u64>) {
+        let mut input_indices = vec![];
+        let mut match_indices = vec![];
 
         let hash_map = self.get_map();
         let next_chain = self.get_list();
@@ -261,8 +261,8 @@ pub trait JoinHashMapType {
                     } else {
                         i
                     };
-                    match_indices.append(match_row_idx);
-                    input_indices.append(row_idx as u32);
+                    match_indices.push(match_row_idx);
+                    input_indices.push(row_idx as u32);
                     // Follow the chain to get the next index value
                     let next = next_chain[match_row_idx as usize];
                     if next == 0 {
@@ -289,13 +289,9 @@ pub trait JoinHashMapType {
         deleted_offset: Option<usize>,
         limit: usize,
         offset: JoinHashMapOffset,
-    ) -> (
-        UInt32BufferBuilder,
-        UInt64BufferBuilder,
-        Option<JoinHashMapOffset>,
-    ) {
-        let mut input_indices = UInt32BufferBuilder::new(0);
-        let mut match_indices = UInt64BufferBuilder::new(0);
+    ) -> (Vec<u32>, Vec<u64>, Option<JoinHashMapOffset>) {
+        let mut input_indices = vec![];
+        let mut match_indices = vec![];
 
         let mut remaining_output = limit;
 
@@ -440,7 +436,7 @@ pub fn adjust_right_output_partitioning(
         Partitioning::Hash(exprs, size) => {
             let new_exprs = exprs
                 .iter()
-                .map(|expr| add_offset_to_expr(expr.clone(), left_columns_len))
+                .map(|expr| add_offset_to_expr(Arc::clone(expr), left_columns_len))
                 .collect();
             Partitioning::Hash(new_exprs, *size)
         }
@@ -456,12 +452,10 @@ fn replace_on_columns_of_right_ordering(
 ) -> Result<()> {
     for (left_col, right_col) in on_columns {
         for item in right_ordering.iter_mut() {
-            let new_expr = item
-                .expr
-                .clone()
+            let new_expr = Arc::clone(&item.expr)
                 .transform(|e| {
                     if e.eq(right_col) {
-                        Ok(Transformed::yes(left_col.clone()))
+                        Ok(Transformed::yes(Arc::clone(left_col)))
                     } else {
                         Ok(Transformed::no(e))
                     }
@@ -479,12 +473,12 @@ fn offset_ordering(
     offset: usize,
 ) -> Vec<PhysicalSortExpr> {
     match join_type {
-        // In the case below, right ordering should be offseted with the left
+        // In the case below, right ordering should be offsetted with the left
         // side length, since we append the right table to the left table.
         JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => ordering
             .iter()
             .map(|sort_expr| PhysicalSortExpr {
-                expr: add_offset_to_expr(sort_expr.expr.clone(), offset),
+                expr: add_offset_to_expr(Arc::clone(&sort_expr.expr), offset),
                 options: sort_expr.options,
             })
             .collect(),
@@ -829,12 +823,12 @@ fn estimate_join_cardinality(
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
             let ij_cardinality = estimate_inner_join_cardinality(
                 Statistics {
-                    num_rows: left_stats.num_rows.clone(),
+                    num_rows: left_stats.num_rows,
                     total_byte_size: Precision::Absent,
                     column_statistics: left_col_stats,
                 },
                 Statistics {
-                    num_rows: right_stats.num_rows.clone(),
+                    num_rows: right_stats.num_rows,
                     total_byte_size: Precision::Absent,
                     column_statistics: right_col_stats,
                 },
@@ -912,7 +906,7 @@ fn estimate_inner_join_cardinality(
     left_stats: Statistics,
     right_stats: Statistics,
 ) -> Option<Precision<usize>> {
-    // Immediatedly return if inputs considered as non-overlapping
+    // Immediately return if inputs considered as non-overlapping
     if let Some(estimation) = estimate_disjoint_inputs(&left_stats, &right_stats) {
         return Some(estimation);
     };
@@ -1026,7 +1020,7 @@ fn max_distinct_count(
     stats: &ColumnStatistics,
 ) -> Precision<usize> {
     match &stats.distinct_count {
-        dc @ (Precision::Exact(_) | Precision::Inexact(_)) => dc.clone(),
+        &dc @ (Precision::Exact(_) | Precision::Inexact(_)) => dc,
         _ => {
             // The number can never be greater than the number of rows we have
             // minus the nulls (since they don't count as distinct values).
@@ -1122,7 +1116,7 @@ impl<T: 'static> OnceFut<T> {
             OnceFutState::Ready(r) => Poll::Ready(
                 r.as_ref()
                     .map(|r| r.as_ref())
-                    .map_err(|e| DataFusionError::External(Box::new(e.clone()))),
+                    .map_err(|e| DataFusionError::External(Box::new(Arc::clone(e)))),
             ),
         }
     }
@@ -2056,9 +2050,7 @@ mod tests {
             );
             assert_eq!(
                 partial_join_stats.map(|s| s.column_statistics),
-                expected_cardinality
-                    .clone()
-                    .map(|_| [left_col_stats, right_col_stats].concat())
+                expected_cardinality.map(|_| [left_col_stats, right_col_stats].concat())
             );
         }
         Ok(())
@@ -2421,7 +2413,7 @@ mod tests {
         );
         assert!(
             absent_outer_estimation.is_none(),
-            "Expected \"None\" esimated SemiJoin cardinality for absent outer num_rows"
+            "Expected \"None\" estimated SemiJoin cardinality for absent outer num_rows"
         );
 
         let absent_inner_estimation = estimate_join_cardinality(
@@ -2439,7 +2431,7 @@ mod tests {
             &join_on,
         ).expect("Expected non-empty PartialJoinStatistics for SemiJoin with absent inner num_rows");
 
-        assert_eq!(absent_inner_estimation.num_rows, 500, "Expected outer.num_rows esimated SemiJoin cardinality for absent inner num_rows");
+        assert_eq!(absent_inner_estimation.num_rows, 500, "Expected outer.num_rows estimated SemiJoin cardinality for absent inner num_rows");
 
         let absent_inner_estimation = estimate_join_cardinality(
             &JoinType::LeftSemi,
@@ -2451,11 +2443,11 @@ mod tests {
             Statistics {
                 num_rows: Absent,
                 total_byte_size: Absent,
-                column_statistics: dummy_column_stats.clone(),
+                column_statistics: dummy_column_stats,
             },
             &join_on,
         );
-        assert!(absent_inner_estimation.is_none(), "Expected \"None\" esimated SemiJoin cardinality for absent outer and inner num_rows");
+        assert!(absent_inner_estimation.is_none(), "Expected \"None\" estimated SemiJoin cardinality for absent outer and inner num_rows");
 
         Ok(())
     }

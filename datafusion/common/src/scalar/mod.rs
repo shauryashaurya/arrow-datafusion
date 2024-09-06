@@ -17,7 +17,9 @@
 
 //! [`ScalarValue`]: stores single  values
 
+mod consts;
 mod struct_builder;
+
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
@@ -34,7 +36,7 @@ use crate::cast::{
     as_decimal128_array, as_decimal256_array, as_dictionary_array,
     as_fixed_size_binary_array, as_fixed_size_list_array,
 };
-use crate::error::{DataFusionError, Result, _internal_err, _not_impl_err};
+use crate::error::{DataFusionError, Result, _exec_err, _internal_err, _not_impl_err};
 use crate::hash_utils::create_hashes;
 use crate::utils::{
     array_into_fixed_size_list_array, array_into_large_list_array, array_into_list_array,
@@ -799,9 +801,13 @@ fn dict_from_scalar<K: ArrowDictionaryKeyType>(
     let values_array = value.to_array_of_size(1)?;
 
     // Create a key array with `size` elements, each of 0
-    let key_array: PrimitiveArray<K> = std::iter::repeat(Some(K::default_value()))
-        .take(size)
-        .collect();
+    let key_array: PrimitiveArray<K> = std::iter::repeat(if value.is_null() {
+        None
+    } else {
+        Some(K::default_value())
+    })
+    .take(size)
+    .collect();
 
     // create a new DictionaryArray
     //
@@ -1007,6 +1013,123 @@ impl ScalarValue {
         }
     }
 
+    /// Returns a [`ScalarValue`] representing PI
+    pub fn new_pi(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(std::f32::consts::PI)),
+            DataType::Float64 => Ok(ScalarValue::from(std::f64::consts::PI)),
+            _ => _internal_err!("PI is not supported for data type: {:?}", datatype),
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing PI's upper bound
+    pub fn new_pi_upper(datatype: &DataType) -> Result<ScalarValue> {
+        // TODO: replace the constants with next_up/next_down when
+        // they are stabilized: https://doc.rust-lang.org/std/primitive.f64.html#method.next_up
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(consts::PI_UPPER_F32)),
+            DataType::Float64 => Ok(ScalarValue::from(consts::PI_UPPER_F64)),
+            _ => {
+                _internal_err!("PI_UPPER is not supported for data type: {:?}", datatype)
+            }
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing -PI's lower bound
+    pub fn new_negative_pi_lower(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(consts::NEGATIVE_PI_LOWER_F32)),
+            DataType::Float64 => Ok(ScalarValue::from(consts::NEGATIVE_PI_LOWER_F64)),
+            _ => {
+                _internal_err!("-PI_LOWER is not supported for data type: {:?}", datatype)
+            }
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing FRAC_PI_2's upper bound
+    pub fn new_frac_pi_2_upper(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(consts::FRAC_PI_2_UPPER_F32)),
+            DataType::Float64 => Ok(ScalarValue::from(consts::FRAC_PI_2_UPPER_F64)),
+            _ => {
+                _internal_err!(
+                    "PI_UPPER/2 is not supported for data type: {:?}",
+                    datatype
+                )
+            }
+        }
+    }
+
+    // Returns a [`ScalarValue`] representing FRAC_PI_2's lower bound
+    pub fn new_neg_frac_pi_2_lower(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => {
+                Ok(ScalarValue::from(consts::NEGATIVE_FRAC_PI_2_LOWER_F32))
+            }
+            DataType::Float64 => {
+                Ok(ScalarValue::from(consts::NEGATIVE_FRAC_PI_2_LOWER_F64))
+            }
+            _ => {
+                _internal_err!(
+                    "-PI/2_LOWER is not supported for data type: {:?}",
+                    datatype
+                )
+            }
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing -PI
+    pub fn new_negative_pi(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(-std::f32::consts::PI)),
+            DataType::Float64 => Ok(ScalarValue::from(-std::f64::consts::PI)),
+            _ => _internal_err!("-PI is not supported for data type: {:?}", datatype),
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing PI/2
+    pub fn new_frac_pi_2(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(std::f32::consts::FRAC_PI_2)),
+            DataType::Float64 => Ok(ScalarValue::from(std::f64::consts::FRAC_PI_2)),
+            _ => _internal_err!("PI/2 is not supported for data type: {:?}", datatype),
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing -PI/2
+    pub fn new_neg_frac_pi_2(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(-std::f32::consts::FRAC_PI_2)),
+            DataType::Float64 => Ok(ScalarValue::from(-std::f64::consts::FRAC_PI_2)),
+            _ => _internal_err!("-PI/2 is not supported for data type: {:?}", datatype),
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing infinity
+    pub fn new_infinity(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(f32::INFINITY)),
+            DataType::Float64 => Ok(ScalarValue::from(f64::INFINITY)),
+            _ => {
+                _internal_err!("Infinity is not supported for data type: {:?}", datatype)
+            }
+        }
+    }
+
+    /// Returns a [`ScalarValue`] representing negative infinity
+    pub fn new_neg_infinity(datatype: &DataType) -> Result<ScalarValue> {
+        match datatype {
+            DataType::Float32 => Ok(ScalarValue::from(f32::NEG_INFINITY)),
+            DataType::Float64 => Ok(ScalarValue::from(f64::NEG_INFINITY)),
+            _ => {
+                _internal_err!(
+                    "Negative Infinity is not supported for data type: {:?}",
+                    datatype
+                )
+            }
+        }
+    }
+
     /// Create a zero value in the given type.
     pub fn new_zero(datatype: &DataType) -> Result<ScalarValue> {
         Ok(match datatype {
@@ -1063,7 +1186,6 @@ impl ScalarValue {
 
     /// Create an one value in the given type.
     pub fn new_one(datatype: &DataType) -> Result<ScalarValue> {
-        assert!(datatype.is_primitive());
         Ok(match datatype {
             DataType::Int8 => ScalarValue::Int8(Some(1)),
             DataType::Int16 => ScalarValue::Int16(Some(1)),
@@ -1086,7 +1208,6 @@ impl ScalarValue {
 
     /// Create a negative one value in the given type.
     pub fn new_negative_one(datatype: &DataType) -> Result<ScalarValue> {
-        assert!(datatype.is_primitive());
         Ok(match datatype {
             DataType::Int8 | DataType::UInt8 => ScalarValue::Int8(Some(-1)),
             DataType::Int16 | DataType::UInt16 => ScalarValue::Int16(Some(-1)),
@@ -1104,7 +1225,6 @@ impl ScalarValue {
     }
 
     pub fn new_ten(datatype: &DataType) -> Result<ScalarValue> {
-        assert!(datatype.is_primitive());
         Ok(match datatype {
             DataType::Int8 => ScalarValue::Int8(Some(10)),
             DataType::Int16 => ScalarValue::Int16(Some(10)),
@@ -1459,7 +1579,10 @@ impl ScalarValue {
             ScalarValue::DurationMillisecond(v) => v.is_none(),
             ScalarValue::DurationMicrosecond(v) => v.is_none(),
             ScalarValue::DurationNanosecond(v) => v.is_none(),
-            ScalarValue::Union(v, _, _) => v.is_none(),
+            ScalarValue::Union(v, _, _) => match v {
+                Some((_, s)) => s.is_null(),
+                None => true,
+            },
             ScalarValue::Dictionary(_, v) => v.is_null(),
         }
     }
@@ -1584,9 +1707,7 @@ impl ScalarValue {
         // figure out the type based on the first element
         let data_type = match scalars.peek() {
             None => {
-                return _internal_err!(
-                    "Empty iterator passed to ScalarValue::iter_to_array"
-                );
+                return _exec_err!("Empty iterator passed to ScalarValue::iter_to_array");
             }
             Some(sv) => sv.data_type(),
         };
@@ -1600,7 +1721,7 @@ impl ScalarValue {
                         if let ScalarValue::$SCALAR_TY(v) = sv {
                             Ok(v)
                         } else {
-                            _internal_err!(
+                            _exec_err!(
                                 "Inconsistent types in ScalarValue::iter_to_array. \
                                     Expected {:?}, got {:?}",
                                 data_type, sv
@@ -1620,7 +1741,7 @@ impl ScalarValue {
                         if let ScalarValue::$SCALAR_TY(v, _) = sv {
                             Ok(v)
                         } else {
-                            _internal_err!(
+                            _exec_err!(
                                 "Inconsistent types in ScalarValue::iter_to_array. \
                                     Expected {:?}, got {:?}",
                                 data_type, sv
@@ -1642,7 +1763,7 @@ impl ScalarValue {
                         if let ScalarValue::$SCALAR_TY(v) = sv {
                             Ok(v)
                         } else {
-                            _internal_err!(
+                            _exec_err!(
                                 "Inconsistent types in ScalarValue::iter_to_array. \
                                     Expected {:?}, got {:?}",
                                 data_type, sv
@@ -1679,8 +1800,10 @@ impl ScalarValue {
             DataType::UInt16 => build_array_primitive!(UInt16Array, UInt16),
             DataType::UInt32 => build_array_primitive!(UInt32Array, UInt32),
             DataType::UInt64 => build_array_primitive!(UInt64Array, UInt64),
+            DataType::Utf8View => build_array_string!(StringViewArray, Utf8View),
             DataType::Utf8 => build_array_string!(StringArray, Utf8),
             DataType::LargeUtf8 => build_array_string!(LargeStringArray, LargeUtf8),
+            DataType::BinaryView => build_array_string!(BinaryViewArray, BinaryView),
             DataType::Binary => build_array_string!(BinaryArray, Binary),
             DataType::LargeBinary => build_array_string!(LargeBinaryArray, LargeBinary),
             DataType::Date32 => build_array_primitive!(Date32Array, Date32),
@@ -1755,8 +1878,11 @@ impl ScalarValue {
                 if let Some(DataType::FixedSizeList(f, l)) = first_non_null_data_type {
                     for array in arrays.iter_mut() {
                         if array.is_null(0) {
-                            *array =
-                                Arc::new(FixedSizeListArray::new_null(f.clone(), l, 1));
+                            *array = Arc::new(FixedSizeListArray::new_null(
+                                Arc::clone(&f),
+                                l,
+                                1,
+                            ));
                         }
                     }
                 }
@@ -1765,6 +1891,7 @@ impl ScalarValue {
             }
             DataType::List(_)
             | DataType::LargeList(_)
+            | DataType::Map(_, _)
             | DataType::Struct(_)
             | DataType::Union(_, _) => {
                 let arrays = scalars.map(|s| s.to_array()).collect::<Result<Vec<_>>>()?;
@@ -1779,11 +1906,11 @@ impl ScalarValue {
                             if &inner_key_type == key_type {
                                 Ok(*scalar)
                             } else {
-                                _internal_err!("Expected inner key type of {key_type} but found: {inner_key_type}, value was ({scalar:?})")
+                                _exec_err!("Expected inner key type of {key_type} but found: {inner_key_type}, value was ({scalar:?})")
                             }
                         }
                         _ => {
-                            _internal_err!(
+                            _exec_err!(
                                 "Expected scalar of type {value_type} but found: {scalar} {scalar:?}"
                             )
                         }
@@ -1811,7 +1938,7 @@ impl ScalarValue {
                         if let ScalarValue::FixedSizeBinary(_, v) = sv {
                             Ok(v)
                         } else {
-                            _internal_err!(
+                            _exec_err!(
                                 "Inconsistent types in ScalarValue::iter_to_array. \
                                 Expected {data_type:?}, got {sv:?}"
                             )
@@ -1833,13 +1960,10 @@ impl ScalarValue {
             | DataType::Time32(TimeUnit::Nanosecond)
             | DataType::Time64(TimeUnit::Second)
             | DataType::Time64(TimeUnit::Millisecond)
-            | DataType::Map(_, _)
             | DataType::RunEndEncoded(_, _)
-            | DataType::Utf8View
-            | DataType::BinaryView
             | DataType::ListView(_)
             | DataType::LargeListView(_) => {
-                return _internal_err!(
+                return _not_impl_err!(
                     "Unsupported creation of {:?} array from ScalarValue {:?}",
                     data_type,
                     scalars.peek()
@@ -1976,6 +2100,16 @@ impl ScalarValue {
         data_type: &DataType,
     ) -> Arc<ListArray> {
         Self::new_list(values, data_type, true)
+    }
+
+    /// Create ListArray with Null with specific data type
+    ///
+    /// - new_null_list(i32, nullable, 1): `ListArray[NULL]`
+    pub fn new_null_list(data_type: DataType, nullable: bool, null_len: usize) -> Self {
+        let data_type = DataType::List(Field::new_list_field(data_type, nullable).into());
+        Self::List(Arc::new(ListArray::from(ArrayData::new_null(
+            &data_type, null_len,
+        ))))
     }
 
     /// Converts `IntoIterator<Item = ScalarValue>` where each element has type corresponding to
@@ -2662,7 +2796,17 @@ impl ScalarValue {
             DataType::Duration(TimeUnit::Nanosecond) => {
                 typed_cast!(array, index, DurationNanosecondArray, DurationNanosecond)?
             }
-
+            DataType::Map(_, _) => {
+                let a = array.slice(index, 1);
+                Self::Map(Arc::new(a.as_map().to_owned()))
+            }
+            DataType::Union(fields, mode) => {
+                let array = as_union_array(array);
+                let ti = array.type_id(index);
+                let index = array.value_offset(index);
+                let value = ScalarValue::try_from_array(array.child(ti), index)?;
+                ScalarValue::Union(Some((ti, Box::new(value))), fields.clone(), *mode)
+            }
             other => {
                 return _not_impl_err!(
                     "Can't create a scalar from array of type \"{other:?}\""
@@ -2898,8 +3042,15 @@ impl ScalarValue {
             ScalarValue::DurationNanosecond(val) => {
                 eq_array_primitive!(array, index, DurationNanosecondArray, val)?
             }
-            ScalarValue::Union(_, _, _) => {
-                return _not_impl_err!("Union is not supported yet")
+            ScalarValue::Union(value, _, _) => {
+                let array = as_union_array(array);
+                let ti = array.type_id(index);
+                let index = array.value_offset(index);
+                if let Some((ti_v, value)) = value {
+                    ti_v == &ti && value.eq_array(array.child(ti), index)?
+                } else {
+                    array.child(ti).is_null(index)
+                }
             }
             ScalarValue::Dictionary(key_type, v) => {
                 let (values_array, values_index) = match key_type.as_ref() {
@@ -3295,16 +3446,16 @@ impl TryFrom<&DataType> for ScalarValue {
             ),
             // `ScalaValue::List` contains single element `ListArray`.
             DataType::List(field_ref) => ScalarValue::List(Arc::new(
-                GenericListArray::new_null(field_ref.clone(), 1),
+                GenericListArray::new_null(Arc::clone(field_ref), 1),
             )),
             // `ScalarValue::LargeList` contains single element `LargeListArray`.
             DataType::LargeList(field_ref) => ScalarValue::LargeList(Arc::new(
-                GenericListArray::new_null(field_ref.clone(), 1),
+                GenericListArray::new_null(Arc::clone(field_ref), 1),
             )),
             // `ScalaValue::FixedSizeList` contains single element `FixedSizeList`.
             DataType::FixedSizeList(field_ref, fixed_length) => {
                 ScalarValue::FixedSizeList(Arc::new(FixedSizeListArray::new_null(
-                    field_ref.clone(),
+                    Arc::clone(field_ref),
                     *fixed_length,
                     1,
                 )))
@@ -3380,14 +3531,15 @@ impl fmt::Display for ScalarValue {
             | ScalarValue::FixedSizeBinary(_, e)
             | ScalarValue::LargeBinary(e)
             | ScalarValue::BinaryView(e) => match e {
-                Some(l) => write!(
-                    f,
-                    "{}",
-                    l.iter()
-                        .map(|v| format!("{v}"))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )?,
+                Some(bytes) => {
+                    // print up to first 10 bytes, with trailing ... if needed
+                    for b in bytes.iter().take(10) {
+                        write!(f, "{b:02X}")?;
+                    }
+                    if bytes.len() > 10 {
+                        write!(f, "...")?;
+                    }
+                }
                 None => write!(f, "NULL")?,
             },
             ScalarValue::List(arr) => fmt_list(arr.to_owned() as ArrayRef, f)?,
@@ -3511,6 +3663,16 @@ fn fmt_list(arr: ArrayRef, f: &mut fmt::Formatter) -> fmt::Result {
 
 impl fmt::Debug for ScalarValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn fmt_binary(data: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "{}",
+                data.iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
         match self {
             ScalarValue::Decimal128(_, _, _) => write!(f, "Decimal128({self})"),
             ScalarValue::Decimal256(_, _, _) => write!(f, "Decimal256({self})"),
@@ -3545,17 +3707,31 @@ impl fmt::Debug for ScalarValue {
             ScalarValue::LargeUtf8(None) => write!(f, "LargeUtf8({self})"),
             ScalarValue::LargeUtf8(Some(_)) => write!(f, "LargeUtf8(\"{self}\")"),
             ScalarValue::Binary(None) => write!(f, "Binary({self})"),
-            ScalarValue::Binary(Some(_)) => write!(f, "Binary(\"{self}\")"),
+            ScalarValue::Binary(Some(b)) => {
+                write!(f, "Binary(\"")?;
+                fmt_binary(b.as_slice(), f)?;
+                write!(f, "\")")
+            }
             ScalarValue::BinaryView(None) => write!(f, "BinaryView({self})"),
-            ScalarValue::BinaryView(Some(_)) => write!(f, "BinaryView(\"{self}\")"),
+            ScalarValue::BinaryView(Some(b)) => {
+                write!(f, "BinaryView(\"")?;
+                fmt_binary(b.as_slice(), f)?;
+                write!(f, "\")")
+            }
             ScalarValue::FixedSizeBinary(size, None) => {
                 write!(f, "FixedSizeBinary({size}, {self})")
             }
-            ScalarValue::FixedSizeBinary(size, Some(_)) => {
-                write!(f, "FixedSizeBinary({size}, \"{self}\")")
+            ScalarValue::FixedSizeBinary(size, Some(b)) => {
+                write!(f, "Binary({size}, \"")?;
+                fmt_binary(b.as_slice(), f)?;
+                write!(f, "\")")
             }
             ScalarValue::LargeBinary(None) => write!(f, "LargeBinary({self})"),
-            ScalarValue::LargeBinary(Some(_)) => write!(f, "LargeBinary(\"{self}\")"),
+            ScalarValue::LargeBinary(Some(b)) => {
+                write!(f, "LargeBinary(\"")?;
+                fmt_binary(b.as_slice(), f)?;
+                write!(f, "\")")
+            }
             ScalarValue::FixedSizeList(_) => write!(f, "FixedSizeList({self})"),
             ScalarValue::List(_) => write!(f, "List({self})"),
             ScalarValue::LargeList(_) => write!(f, "LargeList({self})"),
@@ -3743,11 +3919,11 @@ mod tests {
         let expected = StructArray::from(vec![
             (
                 Arc::new(Field::new("b", DataType::Boolean, false)),
-                boolean.clone() as ArrayRef,
+                Arc::clone(&boolean) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("c", DataType::Int32, false)),
-                int.clone() as ArrayRef,
+                Arc::clone(&int) as ArrayRef,
             ),
         ]);
 
@@ -3789,11 +3965,11 @@ mod tests {
         let struct_array = StructArray::from(vec![
             (
                 Arc::new(Field::new("b", DataType::Boolean, false)),
-                boolean.clone() as ArrayRef,
+                Arc::clone(&boolean) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("c", DataType::Int32, false)),
-                int.clone() as ArrayRef,
+                Arc::clone(&int) as ArrayRef,
             ),
         ]);
         let sv = ScalarValue::Struct(Arc::new(struct_array));
@@ -3807,11 +3983,11 @@ mod tests {
         let struct_array = StructArray::from(vec![
             (
                 Arc::new(Field::new("b", DataType::Boolean, false)),
-                boolean.clone() as ArrayRef,
+                Arc::clone(&boolean) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("c", DataType::Int32, false)),
-                int.clone() as ArrayRef,
+                Arc::clone(&int) as ArrayRef,
             ),
         ]);
 
@@ -3843,7 +4019,7 @@ mod tests {
     fn test_to_array_of_size_for_fsl() {
         let values = Int32Array::from_iter([Some(1), None, Some(2)]);
         let field = Arc::new(Field::new("item", DataType::Int32, true));
-        let arr = FixedSizeListArray::new(field.clone(), 3, Arc::new(values), None);
+        let arr = FixedSizeListArray::new(Arc::clone(&field), 3, Arc::new(values), None);
         let sv = ScalarValue::FixedSizeList(Arc::new(arr));
         let actual_arr = sv
             .to_array_of_size(2)
@@ -3929,13 +4105,13 @@ mod tests {
     fn test_iter_to_array_fixed_size_list() {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let f1 = Arc::new(FixedSizeListArray::new(
-            field.clone(),
+            Arc::clone(&field),
             3,
             Arc::new(Int32Array::from(vec![1, 2, 3])),
             None,
         ));
         let f2 = Arc::new(FixedSizeListArray::new(
-            field.clone(),
+            Arc::clone(&field),
             3,
             Arc::new(Int32Array::from(vec![4, 5, 6])),
             None,
@@ -3943,7 +4119,7 @@ mod tests {
         let f_nulls = Arc::new(FixedSizeListArray::new_null(field, 1, 1));
 
         let scalars = vec![
-            ScalarValue::FixedSizeList(f_nulls.clone()),
+            ScalarValue::FixedSizeList(Arc::clone(&f_nulls)),
             ScalarValue::FixedSizeList(f1),
             ScalarValue::FixedSizeList(f2),
             ScalarValue::FixedSizeList(f_nulls),
@@ -4194,7 +4370,7 @@ mod tests {
             .strip_backtrace();
         assert_eq!(
             err,
-            "Arrow error: Compute error: Overflow happened on: 2147483647 - -2147483648"
+            "Arrow error: Arithmetic overflow: Overflow happened on: 2147483647 - -2147483648"
         )
     }
 
@@ -4215,7 +4391,7 @@ mod tests {
             .sub_checked(&int_value_2)
             .unwrap_err()
             .strip_backtrace();
-        assert_eq!(err, "Arrow error: Compute error: Overflow happened on: 9223372036854775807 - -9223372036854775808")
+        assert_eq!(err, "Arrow error: Arithmetic overflow: Overflow happened on: 9223372036854775807 - -9223372036854775808")
     }
 
     #[test]
@@ -4768,7 +4944,7 @@ mod tests {
         let data_type =
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
 
-        assert_eq!(non_null_list_scalar.data_type(), data_type.clone());
+        assert_eq!(non_null_list_scalar.data_type(), data_type);
         assert_eq!(null_list_scalar.data_type(), data_type);
     }
 
@@ -4777,7 +4953,7 @@ mod tests {
         let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
 
         // Test for List
-        let data_type = &DataType::List(inner_field.clone());
+        let data_type = &DataType::List(Arc::clone(&inner_field));
         let scalar: ScalarValue = data_type.try_into().unwrap();
         let expected = ScalarValue::List(
             new_null_array(data_type, 1)
@@ -4789,7 +4965,7 @@ mod tests {
         assert!(expected.is_null());
 
         // Test for LargeList
-        let data_type = &DataType::LargeList(inner_field.clone());
+        let data_type = &DataType::LargeList(Arc::clone(&inner_field));
         let scalar: ScalarValue = data_type.try_into().unwrap();
         let expected = ScalarValue::LargeList(
             new_null_array(data_type, 1)
@@ -4801,7 +4977,7 @@ mod tests {
         assert!(expected.is_null());
 
         // Test for FixedSizeList(5)
-        let data_type = &DataType::FixedSizeList(inner_field.clone(), 5);
+        let data_type = &DataType::FixedSizeList(Arc::clone(&inner_field), 5);
         let scalar: ScalarValue = data_type.try_into().unwrap();
         let expected = ScalarValue::FixedSizeList(
             new_null_array(data_type, 1)
@@ -5209,35 +5385,35 @@ mod tests {
         let field_f = Arc::new(Field::new("f", DataType::Int64, false));
         let field_d = Arc::new(Field::new(
             "D",
-            DataType::Struct(vec![field_e.clone(), field_f.clone()].into()),
+            DataType::Struct(vec![Arc::clone(&field_e), Arc::clone(&field_f)].into()),
             false,
         ));
 
         let struct_array = StructArray::from(vec![
             (
-                field_e.clone(),
+                Arc::clone(&field_e),
                 Arc::new(Int16Array::from(vec![2])) as ArrayRef,
             ),
             (
-                field_f.clone(),
+                Arc::clone(&field_f),
                 Arc::new(Int64Array::from(vec![3])) as ArrayRef,
             ),
         ]);
 
         let struct_array = StructArray::from(vec![
             (
-                field_a.clone(),
+                Arc::clone(&field_a),
                 Arc::new(Int32Array::from(vec![23])) as ArrayRef,
             ),
             (
-                field_b.clone(),
+                Arc::clone(&field_b),
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
             ),
             (
-                field_c.clone(),
+                Arc::clone(&field_c),
                 Arc::new(StringArray::from(vec!["Hello"])) as ArrayRef,
             ),
-            (field_d.clone(), Arc::new(struct_array) as ArrayRef),
+            (Arc::clone(&field_d), Arc::new(struct_array) as ArrayRef),
         ]);
         let scalar = ScalarValue::Struct(Arc::new(struct_array));
 
@@ -5247,26 +5423,26 @@ mod tests {
 
         let expected = Arc::new(StructArray::from(vec![
             (
-                field_a.clone(),
+                Arc::clone(&field_a),
                 Arc::new(Int32Array::from(vec![23, 23])) as ArrayRef,
             ),
             (
-                field_b.clone(),
+                Arc::clone(&field_b),
                 Arc::new(BooleanArray::from(vec![false, false])) as ArrayRef,
             ),
             (
-                field_c.clone(),
+                Arc::clone(&field_c),
                 Arc::new(StringArray::from(vec!["Hello", "Hello"])) as ArrayRef,
             ),
             (
-                field_d.clone(),
+                Arc::clone(&field_d),
                 Arc::new(StructArray::from(vec![
                     (
-                        field_e.clone(),
+                        Arc::clone(&field_e),
                         Arc::new(Int16Array::from(vec![2, 2])) as ArrayRef,
                     ),
                     (
-                        field_f.clone(),
+                        Arc::clone(&field_f),
                         Arc::new(Int64Array::from(vec![3, 3])) as ArrayRef,
                     ),
                 ])) as ArrayRef,
@@ -5345,26 +5521,26 @@ mod tests {
 
         let expected = Arc::new(StructArray::from(vec![
             (
-                field_a.clone(),
+                Arc::clone(&field_a),
                 Arc::new(Int32Array::from(vec![23, 7, -1000])) as ArrayRef,
             ),
             (
-                field_b.clone(),
+                Arc::clone(&field_b),
                 Arc::new(BooleanArray::from(vec![false, true, true])) as ArrayRef,
             ),
             (
-                field_c.clone(),
+                Arc::clone(&field_c),
                 Arc::new(StringArray::from(vec!["Hello", "World", "!!!!!"])) as ArrayRef,
             ),
             (
-                field_d.clone(),
+                Arc::clone(&field_d),
                 Arc::new(StructArray::from(vec![
                     (
-                        field_e.clone(),
+                        Arc::clone(&field_e),
                         Arc::new(Int16Array::from(vec![2, 4, 6])) as ArrayRef,
                     ),
                     (
-                        field_f.clone(),
+                        Arc::clone(&field_f),
                         Arc::new(Int64Array::from(vec![3, 5, 7])) as ArrayRef,
                     ),
                 ])) as ArrayRef,
@@ -5372,6 +5548,112 @@ mod tests {
         ])) as ArrayRef;
 
         assert_eq!(&array, &expected);
+    }
+
+    #[test]
+    fn test_scalar_union_sparse() {
+        let field_a = Arc::new(Field::new("A", DataType::Int32, true));
+        let field_b = Arc::new(Field::new("B", DataType::Boolean, true));
+        let field_c = Arc::new(Field::new("C", DataType::Utf8, true));
+        let fields = UnionFields::from_iter([(0, field_a), (1, field_b), (2, field_c)]);
+
+        let mut values_a = vec![None; 6];
+        values_a[0] = Some(42);
+        let mut values_b = vec![None; 6];
+        values_b[1] = Some(true);
+        let mut values_c = vec![None; 6];
+        values_c[2] = Some("foo");
+        let children: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(values_a)),
+            Arc::new(BooleanArray::from(values_b)),
+            Arc::new(StringArray::from(values_c)),
+        ];
+
+        let type_ids = ScalarBuffer::from(vec![0, 1, 2, 0, 1, 2]);
+        let array: ArrayRef = Arc::new(
+            UnionArray::try_new(fields.clone(), type_ids, None, children)
+                .expect("UnionArray"),
+        );
+
+        let expected = [
+            (0, ScalarValue::from(42)),
+            (1, ScalarValue::from(true)),
+            (2, ScalarValue::from("foo")),
+            (0, ScalarValue::Int32(None)),
+            (1, ScalarValue::Boolean(None)),
+            (2, ScalarValue::Utf8(None)),
+        ];
+
+        for (i, (ti, value)) in expected.into_iter().enumerate() {
+            let is_null = value.is_null();
+            let value = Some((ti, Box::new(value)));
+            let expected = ScalarValue::Union(value, fields.clone(), UnionMode::Sparse);
+            let actual = ScalarValue::try_from_array(&array, i).expect("try_from_array");
+
+            assert_eq!(
+                actual, expected,
+                "[{i}] {actual} was not equal to {expected}"
+            );
+
+            assert!(
+                expected.eq_array(&array, i).expect("eq_array"),
+                "[{i}] {expected}.eq_array was false"
+            );
+
+            if is_null {
+                assert!(actual.is_null(), "[{i}] {actual} was not null")
+            }
+        }
+    }
+
+    #[test]
+    fn test_scalar_union_dense() {
+        let field_a = Arc::new(Field::new("A", DataType::Int32, true));
+        let field_b = Arc::new(Field::new("B", DataType::Boolean, true));
+        let field_c = Arc::new(Field::new("C", DataType::Utf8, true));
+        let fields = UnionFields::from_iter([(0, field_a), (1, field_b), (2, field_c)]);
+        let children: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![Some(42), None])),
+            Arc::new(BooleanArray::from(vec![Some(true), None])),
+            Arc::new(StringArray::from(vec![Some("foo"), None])),
+        ];
+
+        let type_ids = ScalarBuffer::from(vec![0, 1, 2, 0, 1, 2]);
+        let offsets = ScalarBuffer::from(vec![0, 0, 0, 1, 1, 1]);
+        let array: ArrayRef = Arc::new(
+            UnionArray::try_new(fields.clone(), type_ids, Some(offsets), children)
+                .expect("UnionArray"),
+        );
+
+        let expected = [
+            (0, ScalarValue::from(42)),
+            (1, ScalarValue::from(true)),
+            (2, ScalarValue::from("foo")),
+            (0, ScalarValue::Int32(None)),
+            (1, ScalarValue::Boolean(None)),
+            (2, ScalarValue::Utf8(None)),
+        ];
+
+        for (i, (ti, value)) in expected.into_iter().enumerate() {
+            let is_null = value.is_null();
+            let value = Some((ti, Box::new(value)));
+            let expected = ScalarValue::Union(value, fields.clone(), UnionMode::Dense);
+            let actual = ScalarValue::try_from_array(&array, i).expect("try_from_array");
+
+            assert_eq!(
+                actual, expected,
+                "[{i}] {actual} was not equal to {expected}"
+            );
+
+            assert!(
+                expected.eq_array(&array, i).expect("eq_array"),
+                "[{i}] {expected}.eq_array was false"
+            );
+
+            if is_null {
+                assert!(actual.is_null(), "[{i}] {actual} was not null")
+            }
+        }
     }
 
     #[test]
@@ -5428,11 +5710,11 @@ mod tests {
         let array = as_struct_array(&array).unwrap();
         let expected = StructArray::from(vec![
             (
-                field_a.clone(),
+                Arc::clone(&field_a),
                 Arc::new(StringArray::from(vec!["First", "Second", "Third"])) as ArrayRef,
             ),
             (
-                field_primitive_list.clone(),
+                Arc::clone(&field_primitive_list),
                 Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
                     Some(vec![Some(1), Some(2), Some(3)]),
                     Some(vec![Some(4), Some(5)]),
@@ -5445,13 +5727,13 @@ mod tests {
 
         // Define list-of-structs scalars
 
-        let nl0_array = ScalarValue::iter_to_array(vec![s0.clone(), s1.clone()]).unwrap();
+        let nl0_array = ScalarValue::iter_to_array(vec![s0, s1.clone()]).unwrap();
         let nl0 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl0_array)));
 
-        let nl1_array = ScalarValue::iter_to_array(vec![s2.clone()]).unwrap();
+        let nl1_array = ScalarValue::iter_to_array(vec![s2]).unwrap();
         let nl1 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl1_array)));
 
-        let nl2_array = ScalarValue::iter_to_array(vec![s1.clone()]).unwrap();
+        let nl2_array = ScalarValue::iter_to_array(vec![s1]).unwrap();
         let nl2 = ScalarValue::List(Arc::new(array_into_list_array_nullable(nl2_array)));
 
         // iter_to_array for list-of-struct
@@ -5676,16 +5958,12 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         );
 
-        // needs https://github.com/apache/arrow-rs/issues/5893
-        /*
         check_scalar_cast(ScalarValue::Utf8(None), DataType::Utf8View);
         check_scalar_cast(ScalarValue::from("foo"), DataType::Utf8View);
         check_scalar_cast(
             ScalarValue::from("larger than 12 bytes string"),
             DataType::Utf8View,
         );
-
-         */
     }
 
     // mimics how casting work on scalar values by `casting` `scalar` to `desired_type`
@@ -5735,7 +6013,7 @@ mod tests {
                     let root_err = err.find_root();
                     match  root_err{
                         DataFusionError::ArrowError(
-                            ArrowError::ComputeError(_),
+                            ArrowError::ArithmeticOverflow(_),
                             _,
                         ) => {}
                         _ => return Err(err),
@@ -6192,18 +6470,18 @@ mod tests {
 
         let struct_value = vec![
             (
-                fields[0].clone(),
+                Arc::clone(&fields[0]),
                 Arc::new(UInt64Array::from(vec![Some(1)])) as ArrayRef,
             ),
             (
-                fields[1].clone(),
+                Arc::clone(&fields[1]),
                 Arc::new(StructArray::from(vec![
                     (
-                        fields_b[0].clone(),
+                        Arc::clone(&fields_b[0]),
                         Arc::new(UInt64Array::from(vec![Some(2)])) as ArrayRef,
                     ),
                     (
-                        fields_b[1].clone(),
+                        Arc::clone(&fields_b[1]),
                         Arc::new(UInt64Array::from(vec![Some(3)])) as ArrayRef,
                     ),
                 ])) as ArrayRef,
@@ -6212,19 +6490,19 @@ mod tests {
 
         let struct_value_with_nulls = vec![
             (
-                fields[0].clone(),
+                Arc::clone(&fields[0]),
                 Arc::new(UInt64Array::from(vec![Some(1)])) as ArrayRef,
             ),
             (
-                fields[1].clone(),
+                Arc::clone(&fields[1]),
                 Arc::new(StructArray::from((
                     vec![
                         (
-                            fields_b[0].clone(),
+                            Arc::clone(&fields_b[0]),
                             Arc::new(UInt64Array::from(vec![Some(2)])) as ArrayRef,
                         ),
                         (
-                            fields_b[1].clone(),
+                            Arc::clone(&fields_b[1]),
                             Arc::new(UInt64Array::from(vec![Some(3)])) as ArrayRef,
                         ),
                     ],
@@ -6386,6 +6664,43 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_display() {
+        let no_binary_value = ScalarValue::Binary(None);
+        assert_eq!(format!("{no_binary_value}"), "NULL");
+        let small_binary_value = ScalarValue::Binary(Some(vec![1u8, 2, 3]));
+        assert_eq!(format!("{small_binary_value}"), "010203");
+        let large_binary_value =
+            ScalarValue::Binary(Some(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]));
+        assert_eq!(format!("{large_binary_value}"), "0102030405060708090A...");
+
+        let no_binary_value = ScalarValue::BinaryView(None);
+        assert_eq!(format!("{no_binary_value}"), "NULL");
+        let small_binary_value = ScalarValue::BinaryView(Some(vec![1u8, 2, 3]));
+        assert_eq!(format!("{small_binary_value}"), "010203");
+        let large_binary_value =
+            ScalarValue::BinaryView(Some(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]));
+        assert_eq!(format!("{large_binary_value}"), "0102030405060708090A...");
+
+        let no_binary_value = ScalarValue::LargeBinary(None);
+        assert_eq!(format!("{no_binary_value}"), "NULL");
+        let small_binary_value = ScalarValue::LargeBinary(Some(vec![1u8, 2, 3]));
+        assert_eq!(format!("{small_binary_value}"), "010203");
+        let large_binary_value =
+            ScalarValue::LargeBinary(Some(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]));
+        assert_eq!(format!("{large_binary_value}"), "0102030405060708090A...");
+
+        let no_binary_value = ScalarValue::FixedSizeBinary(3, None);
+        assert_eq!(format!("{no_binary_value}"), "NULL");
+        let small_binary_value = ScalarValue::FixedSizeBinary(3, Some(vec![1u8, 2, 3]));
+        assert_eq!(format!("{small_binary_value}"), "010203");
+        let large_binary_value = ScalarValue::FixedSizeBinary(
+            11,
+            Some(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        );
+        assert_eq!(format!("{large_binary_value}"), "0102030405060708090A...");
+    }
+
+    #[test]
     fn test_build_timestamp_millisecond_list() {
         let values = vec![ScalarValue::TimestampMillisecond(Some(1), None)];
         let arr = ScalarValue::new_list_nullable(
@@ -6513,5 +6828,45 @@ mod tests {
             }
         }
         intervals
+    }
+
+    fn union_fields() -> UnionFields {
+        [
+            (0, Arc::new(Field::new("A", DataType::Int32, true))),
+            (1, Arc::new(Field::new("B", DataType::Float64, true))),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn sparse_scalar_union_is_null() {
+        let sparse_scalar = ScalarValue::Union(
+            Some((0_i8, Box::new(ScalarValue::Int32(None)))),
+            union_fields(),
+            UnionMode::Sparse,
+        );
+        assert!(sparse_scalar.is_null());
+    }
+
+    #[test]
+    fn dense_scalar_union_is_null() {
+        let dense_scalar = ScalarValue::Union(
+            Some((0_i8, Box::new(ScalarValue::Int32(None)))),
+            union_fields(),
+            UnionMode::Dense,
+        );
+        assert!(dense_scalar.is_null());
+    }
+
+    #[test]
+    fn null_dictionary_scalar_produces_null_dictionary_array() {
+        let dictionary_scalar = ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Null),
+        );
+        assert!(dictionary_scalar.is_null());
+        let dictionary_array = dictionary_scalar.to_array().unwrap();
+        assert!(dictionary_array.is_null(0));
     }
 }

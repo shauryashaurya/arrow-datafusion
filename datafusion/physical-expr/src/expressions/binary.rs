@@ -33,6 +33,7 @@ use arrow::compute::kernels::comparison::{
 use arrow::compute::kernels::concat_elements::concat_elements_utf8;
 use arrow::compute::{cast, ilike, like, nilike, nlike};
 use arrow::datatypes::*;
+use arrow_schema::ArrowError;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{internal_err, Result, ScalarValue};
 use datafusion_expr::interval_arithmetic::{apply_operator, Interval};
@@ -41,6 +42,7 @@ use datafusion_expr::type_coercion::binary::get_result_type;
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr_common::datum::{apply, apply_cmp, apply_cmp_for_nested};
 
+use crate::expressions::binary::kernels::concat_elements_utf8view;
 use kernels::{
     bitwise_and_dyn, bitwise_and_dyn_scalar, bitwise_or_dyn, bitwise_or_dyn_scalar,
     bitwise_shift_left_dyn, bitwise_shift_left_dyn_scalar, bitwise_shift_right_dyn,
@@ -53,6 +55,8 @@ pub struct BinaryExpr {
     left: Arc<dyn PhysicalExpr>,
     op: Operator,
     right: Arc<dyn PhysicalExpr>,
+    /// Specifies whether an error is returned on overflow or not
+    fail_on_overflow: bool,
 }
 
 impl BinaryExpr {
@@ -62,7 +66,22 @@ impl BinaryExpr {
         op: Operator,
         right: Arc<dyn PhysicalExpr>,
     ) -> Self {
-        Self { left, op, right }
+        Self {
+            left,
+            op,
+            right,
+            fail_on_overflow: false,
+        }
+    }
+
+    /// Create new binary expression with explicit fail_on_overflow value
+    pub fn with_fail_on_overflow(self, fail_on_overflow: bool) -> Self {
+        Self {
+            left: self.left,
+            op: self.op,
+            right: self.right,
+            fail_on_overflow,
+        }
     }
 
     /// Get the left side of the binary expression
@@ -114,41 +133,16 @@ impl std::fmt::Display for BinaryExpr {
     }
 }
 
-/// Invoke a compute kernel on a pair of binary data arrays
-macro_rules! compute_utf8_op {
-    ($LEFT:expr, $RIGHT:expr, $OP:ident, $DT:ident) => {{
-        let ll = $LEFT
-            .as_any()
-            .downcast_ref::<$DT>()
-            .expect("compute_op failed to downcast left side array");
-        let rr = $RIGHT
-            .as_any()
-            .downcast_ref::<$DT>()
-            .expect("compute_op failed to downcast right side array");
-        Ok(Arc::new(paste::expr! {[<$OP _utf8>]}(&ll, &rr)?))
-    }};
-}
-
-macro_rules! binary_string_array_op {
-    ($LEFT:expr, $RIGHT:expr, $OP:ident) => {{
-        match $LEFT.data_type() {
-            DataType::Utf8 => compute_utf8_op!($LEFT, $RIGHT, $OP, StringArray),
-            DataType::LargeUtf8 => compute_utf8_op!($LEFT, $RIGHT, $OP, LargeStringArray),
-            other => internal_err!(
-                "Data type {:?} not supported for binary operation '{}' on string arrays",
-                other, stringify!($OP)
-            ),
-        }
-    }};
-}
-
 /// Invoke a boolean kernel on a pair of arrays
-macro_rules! boolean_op {
-    ($LEFT:expr, $RIGHT:expr, $OP:ident) => {{
-        let ll = as_boolean_array($LEFT).expect("boolean_op failed to downcast array");
-        let rr = as_boolean_array($RIGHT).expect("boolean_op failed to downcast array");
-        Ok(Arc::new($OP(&ll, &rr)?))
-    }};
+#[inline]
+fn boolean_op(
+    left: &dyn Array,
+    right: &dyn Array,
+    op: impl FnOnce(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>,
+) -> Result<Arc<(dyn Array + 'static)>, ArrowError> {
+    let ll = as_boolean_array(left).expect("boolean_op failed to downcast left array");
+    let rr = as_boolean_array(right).expect("boolean_op failed to downcast right array");
+    op(ll, rr).map(|t| Arc::new(t) as _)
 }
 
 macro_rules! binary_string_array_flag_op {
@@ -269,12 +263,15 @@ impl PhysicalExpr for BinaryExpr {
             if right_data_type != left_data_type {
                 return internal_err!("type mismatch");
             }
-            return apply_cmp_for_nested(&self.op, &lhs, &rhs);
+            return apply_cmp_for_nested(self.op, &lhs, &rhs);
         }
 
         match self.op {
+            Operator::Plus if self.fail_on_overflow => return apply(&lhs, &rhs, add),
             Operator::Plus => return apply(&lhs, &rhs, add_wrapping),
+            Operator::Minus if self.fail_on_overflow => return apply(&lhs, &rhs, sub),
             Operator::Minus => return apply(&lhs, &rhs, sub_wrapping),
+            Operator::Multiply if self.fail_on_overflow => return apply(&lhs, &rhs, mul),
             Operator::Multiply => return apply(&lhs, &rhs, mul_wrapping),
             Operator::Divide => return apply(&lhs, &rhs, div),
             Operator::Modulo => return apply(&lhs, &rhs, rem),
@@ -298,10 +295,14 @@ impl PhysicalExpr for BinaryExpr {
         // Attempt to use special kernels if one input is scalar and the other is an array
         let scalar_result = match (&lhs, &rhs) {
             (ColumnarValue::Array(array), ColumnarValue::Scalar(scalar)) => {
-                // if left is array and right is literal - use scalar operations
-                self.evaluate_array_scalar(array, scalar.clone())?.map(|r| {
-                    r.and_then(|a| to_result_type_array(&self.op, a, &result_type))
-                })
+                // if left is array and right is literal(not NULL) - use scalar operations
+                if scalar.is_null() {
+                    None
+                } else {
+                    self.evaluate_array_scalar(array, scalar.clone())?.map(|r| {
+                        r.and_then(|a| to_result_type_array(&self.op, a, &result_type))
+                    })
+                }
             }
             (_, _) => None, // default to array implementation
         };
@@ -327,11 +328,10 @@ impl PhysicalExpr for BinaryExpr {
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(BinaryExpr::new(
-            Arc::clone(&children[0]),
-            self.op.clone(),
-            Arc::clone(&children[1]),
-        )))
+        Ok(Arc::new(
+            BinaryExpr::new(Arc::clone(&children[0]), self.op, Arc::clone(&children[1]))
+                .with_fail_on_overflow(self.fail_on_overflow),
+        ))
     }
 
     fn evaluate_bounds(&self, children: &[&Interval]) -> Result<Interval> {
@@ -496,7 +496,12 @@ impl PartialEq<dyn Any> for BinaryExpr {
     fn eq(&self, other: &dyn Any) -> bool {
         down_cast_any_ref(other)
             .downcast_ref::<Self>()
-            .map(|x| self.left.eq(&x.left) && self.op == x.op && self.right.eq(&x.right))
+            .map(|x| {
+                self.left.eq(&x.left)
+                    && self.op == x.op
+                    && self.right.eq(&x.right)
+                    && self.fail_on_overflow.eq(&x.fail_on_overflow)
+            })
             .unwrap_or(false)
     }
 }
@@ -595,7 +600,7 @@ impl BinaryExpr {
             | NotLikeMatch | NotILikeMatch => unreachable!(),
             And => {
                 if left_data_type == &DataType::Boolean {
-                    boolean_op!(&left, &right, and_kleene)
+                    Ok(boolean_op(&left, &right, and_kleene)?)
                 } else {
                     internal_err!(
                         "Cannot evaluate binary expression {:?} with types {:?} and {:?}",
@@ -607,7 +612,7 @@ impl BinaryExpr {
             }
             Or => {
                 if left_data_type == &DataType::Boolean {
-                    boolean_op!(&left, &right, or_kleene)
+                    Ok(boolean_op(&left, &right, or_kleene)?)
                 } else {
                     internal_err!(
                         "Cannot evaluate binary expression {:?} with types {:?} and {:?}",
@@ -634,12 +639,34 @@ impl BinaryExpr {
             BitwiseXor => bitwise_xor_dyn(left, right),
             BitwiseShiftRight => bitwise_shift_right_dyn(left, right),
             BitwiseShiftLeft => bitwise_shift_left_dyn(left, right),
-            StringConcat => binary_string_array_op!(left, right, concat_elements),
+            StringConcat => concat_elements(left, right),
             AtArrow | ArrowAt => {
                 unreachable!("ArrowAt and AtArrow should be rewritten to function")
             }
         }
     }
+}
+
+fn concat_elements(left: Arc<dyn Array>, right: Arc<dyn Array>) -> Result<ArrayRef> {
+    Ok(match left.data_type() {
+        DataType::Utf8 => Arc::new(concat_elements_utf8(
+            left.as_string::<i32>(),
+            right.as_string::<i32>(),
+        )?),
+        DataType::LargeUtf8 => Arc::new(concat_elements_utf8(
+            left.as_string::<i64>(),
+            right.as_string::<i64>(),
+        )?),
+        DataType::Utf8View => Arc::new(concat_elements_utf8view(
+            left.as_string_view(),
+            right.as_string_view(),
+        )?),
+        other => {
+            return internal_err!(
+                "Data type {other:?} not supported for binary operation 'concat_elements' on string arrays"
+            );
+        }
+    })
 }
 
 /// Create a binary expression whose arguments are correctly coerced.
@@ -657,8 +684,7 @@ pub fn binary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{col, lit, try_cast, Literal};
-
+    use crate::expressions::{col, lit, try_cast, Column, Literal};
     use datafusion_common::plan_datafusion_err;
     use datafusion_expr::type_coercion::binary::get_input_types;
 
@@ -2476,6 +2502,111 @@ mod tests {
     }
 
     #[test]
+    fn regex_with_nulls() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let a = Arc::new(StringArray::from(vec![
+            Some("abc"),
+            None,
+            Some("abc"),
+            None,
+            Some("abc"),
+        ])) as ArrayRef;
+        let b = Arc::new(StringArray::from(vec![
+            Some("^a"),
+            Some("^A"),
+            None,
+            None,
+            Some("^(b|c)"),
+        ])) as ArrayRef;
+
+        let regex_expected =
+            BooleanArray::from(vec![Some(true), None, None, None, Some(false)]);
+        let regex_not_expected =
+            BooleanArray::from(vec![Some(false), None, None, None, Some(true)]);
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexMatch,
+            regex_expected.clone(),
+        )?;
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexIMatch,
+            regex_expected.clone(),
+        )?;
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexNotMatch,
+            regex_not_expected.clone(),
+        )?;
+        apply_logic_op(
+            &Arc::new(schema),
+            &a,
+            &b,
+            Operator::RegexNotIMatch,
+            regex_not_expected.clone(),
+        )?;
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::LargeUtf8, true),
+            Field::new("b", DataType::LargeUtf8, true),
+        ]);
+        let a = Arc::new(LargeStringArray::from(vec![
+            Some("abc"),
+            None,
+            Some("abc"),
+            None,
+            Some("abc"),
+        ])) as ArrayRef;
+        let b = Arc::new(LargeStringArray::from(vec![
+            Some("^a"),
+            Some("^A"),
+            None,
+            None,
+            Some("^(b|c)"),
+        ])) as ArrayRef;
+
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexMatch,
+            regex_expected.clone(),
+        )?;
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexIMatch,
+            regex_expected,
+        )?;
+        apply_logic_op(
+            &Arc::new(schema.clone()),
+            &a,
+            &b,
+            Operator::RegexNotMatch,
+            regex_not_expected.clone(),
+        )?;
+        apply_logic_op(
+            &Arc::new(schema),
+            &a,
+            &b,
+            Operator::RegexNotIMatch,
+            regex_not_expected,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
     fn or_with_nulls_op() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("a", DataType::Boolean, true),
@@ -4007,5 +4138,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&casted, &dictionary);
+    }
+
+    #[test]
+    fn test_add_with_overflow() -> Result<()> {
+        // create test data
+        let l = Arc::new(Int32Array::from(vec![1, i32::MAX]));
+        let r = Arc::new(Int32Array::from(vec![2, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, false),
+            Field::new("r", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![l, r])?;
+
+        // create expression
+        let expr = BinaryExpr::new(
+            Arc::new(Column::new("l", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("r", 1)),
+        )
+        .with_fail_on_overflow(true);
+
+        // evaluate expression
+        let result = expr.evaluate(&batch);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Overflow happened on: 2147483647 + 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_subtract_with_overflow() -> Result<()> {
+        // create test data
+        let l = Arc::new(Int32Array::from(vec![1, i32::MIN]));
+        let r = Arc::new(Int32Array::from(vec![2, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, false),
+            Field::new("r", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![l, r])?;
+
+        // create expression
+        let expr = BinaryExpr::new(
+            Arc::new(Column::new("l", 0)),
+            Operator::Minus,
+            Arc::new(Column::new("r", 1)),
+        )
+        .with_fail_on_overflow(true);
+
+        // evaluate expression
+        let result = expr.evaluate(&batch);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Overflow happened on: -2147483648 - 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_mul_with_overflow() -> Result<()> {
+        // create test data
+        let l = Arc::new(Int32Array::from(vec![1, i32::MAX]));
+        let r = Arc::new(Int32Array::from(vec![2, 2]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, false),
+            Field::new("r", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![l, r])?;
+
+        // create expression
+        let expr = BinaryExpr::new(
+            Arc::new(Column::new("l", 0)),
+            Operator::Multiply,
+            Arc::new(Column::new("r", 1)),
+        )
+        .with_fail_on_overflow(true);
+
+        // evaluate expression
+        let result = expr.evaluate(&batch);
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Overflow happened on: 2147483647 * 2"));
+        Ok(())
     }
 }
