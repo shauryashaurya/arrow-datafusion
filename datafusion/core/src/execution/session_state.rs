@@ -259,36 +259,9 @@ impl SessionState {
     }
 
     /// Returns new [`SessionState`] using the provided
-    /// [`SessionConfig`] and [`RuntimeEnv`].
-    #[deprecated(since = "32.0.0", note = "Use SessionStateBuilder")]
-    pub fn with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
-        SessionStateBuilder::new()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .with_default_features()
-            .build()
-    }
-
-    /// Returns new [`SessionState`] using the provided
     /// [`SessionConfig`],  [`RuntimeEnv`], and [`CatalogProviderList`]
     #[deprecated(since = "40.0.0", note = "Use SessionStateBuilder")]
     pub fn new_with_config_rt_and_catalog_list(
-        config: SessionConfig,
-        runtime: Arc<RuntimeEnv>,
-        catalog_list: Arc<dyn CatalogProviderList>,
-    ) -> Self {
-        SessionStateBuilder::new()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .with_catalog_list(catalog_list)
-            .with_default_features()
-            .build()
-    }
-
-    /// Returns new [`SessionState`] using the provided
-    /// [`SessionConfig`] and [`RuntimeEnv`].
-    #[deprecated(since = "32.0.0", note = "Use SessionStateBuilder")]
-    pub fn with_config_rt_and_catalog_list(
         config: SessionConfig,
         runtime: Arc<RuntimeEnv>,
         catalog_list: Arc<dyn CatalogProviderList>,
@@ -801,6 +774,11 @@ impl SessionState {
         &mut self.config
     }
 
+    /// Return the logical optimizers
+    pub fn optimizers(&self) -> &[Arc<dyn OptimizerRule + Send + Sync>] {
+        &self.optimizer.rules
+    }
+
     /// Return the physical optimizers
     pub fn physical_optimizers(&self) -> &[Arc<dyn PhysicalOptimizerRule + Send + Sync>] {
         &self.physical_optimizers.rules
@@ -1212,6 +1190,18 @@ impl SessionStateBuilder {
     /// Set the [`ExecutionProps`]
     pub fn with_execution_props(mut self, execution_props: ExecutionProps) -> Self {
         self.execution_props = Some(execution_props);
+        self
+    }
+
+    /// Add a [`TableProviderFactory`] to the map of factories
+    pub fn with_table_factory(
+        mut self,
+        key: String,
+        table_factory: Arc<dyn TableProviderFactory>,
+    ) -> Self {
+        let mut table_factories = self.table_factories.unwrap_or_default();
+        table_factories.insert(key, table_factory);
+        self.table_factories = Some(table_factories);
         self
     }
 
@@ -1826,6 +1816,8 @@ mod tests {
     use datafusion_common::Result;
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
+    use datafusion_optimizer::optimizer::OptimizerRule;
+    use datafusion_optimizer::Optimizer;
     use datafusion_sql::planner::{PlannerContext, SqlToRel};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1920,6 +1912,51 @@ mod tests {
         let new_state =
             SessionStateBuilder::new_from_existing(without_default_state).build();
         assert!(new_state.catalog_list().catalog(&default_catalog).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_state_with_optimizer_rules() {
+        struct DummyRule {}
+
+        impl OptimizerRule for DummyRule {
+            fn name(&self) -> &str {
+                "dummy_rule"
+            }
+        }
+        // test building sessions with fresh set of rules
+        let state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![Arc::new(DummyRule {})])
+            .build();
+
+        assert_eq!(state.optimizers().len(), 1);
+
+        // test adding rules to default recommendations
+        let state = SessionStateBuilder::new()
+            .with_optimizer_rule(Arc::new(DummyRule {}))
+            .build();
+
+        assert_eq!(
+            state.optimizers().len(),
+            Optimizer::default().rules.len() + 1
+        );
+    }
+
+    #[test]
+    fn test_with_table_factories() -> Result<()> {
+        use crate::test_util::TestTableFactory;
+
+        let state = SessionStateBuilder::new().build();
+        let table_factories = state.table_factories();
+        assert!(table_factories.is_empty());
+
+        let table_factory = Arc::new(TestTableFactory {});
+        let state = SessionStateBuilder::new()
+            .with_table_factory("employee".to_string(), table_factory)
+            .build();
+        let table_factories = state.table_factories();
+        assert_eq!(table_factories.len(), 1);
+        assert!(table_factories.contains_key("employee"));
         Ok(())
     }
 }
