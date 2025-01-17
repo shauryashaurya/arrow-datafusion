@@ -18,15 +18,33 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, ArrowPrimitiveType, AsArray, PrimitiveArray};
-use arrow::datatypes::{ArrowNativeType, DataType, Int32Type, Int64Type};
-
-use crate::string::common::StringArrayType;
 use crate::utils::{make_scalar_function, utf8_to_int_type};
+use arrow::array::{
+    ArrayRef, ArrowPrimitiveType, AsArray, PrimitiveArray, StringArrayType,
+};
+use arrow::datatypes::{ArrowNativeType, DataType, Int32Type, Int64Type};
 use datafusion_common::{exec_err, Result};
-use datafusion_expr::TypeSignature::Exact;
-use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
+use datafusion_expr::{
+    ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+};
+use datafusion_macros::user_doc;
 
+#[user_doc(
+    doc_section(label = "String Functions"),
+    description = "Returns the starting position of a specified substring in a string. Positions begin at 1. If the substring does not exist in the string, the function returns 0.",
+    syntax_example = "strpos(str, substr)",
+    alternative_syntax = "position(substr in origstr)",
+    sql_example = r#"```sql
+> select strpos('datafusion', 'fus');
++----------------------------------------+
+| strpos(Utf8("datafusion"),Utf8("fus")) |
++----------------------------------------+
+| 5                                      |
++----------------------------------------+ 
+```"#,
+    standard_argument(name = "str", prefix = "String"),
+    argument(name = "substr", description = "Substring expression to search for.")
+)]
 #[derive(Debug)]
 pub struct StrposFunc {
     signature: Signature,
@@ -41,20 +59,8 @@ impl Default for StrposFunc {
 
 impl StrposFunc {
     pub fn new() -> Self {
-        use DataType::*;
         Self {
-            signature: Signature::one_of(
-                vec![
-                    Exact(vec![Utf8, Utf8]),
-                    Exact(vec![Utf8, LargeUtf8]),
-                    Exact(vec![LargeUtf8, Utf8]),
-                    Exact(vec![LargeUtf8, LargeUtf8]),
-                    Exact(vec![Utf8View, Utf8View]),
-                    Exact(vec![Utf8View, Utf8]),
-                    Exact(vec![Utf8View, LargeUtf8]),
-                ],
-                Volatility::Immutable,
-            ),
+            signature: Signature::string(2, Volatility::Immutable),
             aliases: vec![String::from("instr"), String::from("position")],
         }
     }
@@ -77,12 +83,20 @@ impl ScalarUDFImpl for StrposFunc {
         utf8_to_int_type(&arg_types[0], "strpos/instr/position")
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_batch(
+        &self,
+        args: &[ColumnarValue],
+        _number_rows: usize,
+    ) -> Result<ColumnarValue> {
         make_scalar_function(strpos, vec![])(args)
     }
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.doc()
     }
 }
 
@@ -153,13 +167,13 @@ where
                 // the sub vector in the main vector. This is faster than string.find() method.
                 if ascii_only {
                     // If the substring is empty, the result is 1.
-                    if substring.as_bytes().is_empty() {
+                    if substring.is_empty() {
                         T::Native::from_usize(1)
                     } else {
                         T::Native::from_usize(
                             string
                                 .as_bytes()
-                                .windows(substring.as_bytes().len())
+                                .windows(substring.len())
                                 .position(|w| w == substring.as_bytes())
                                 .map(|x| x + 1)
                                 .unwrap_or(0),
@@ -198,7 +212,7 @@ mod tests {
         ($lhs:literal, $rhs:literal -> $result:literal; $t1:ident $t2:ident $t3:ident $t4:ident $t5:ident) => {
             test_function!(
                 StrposFunc::new(),
-                &[
+                vec![
                     ColumnarValue::Scalar(ScalarValue::$t1(Some($lhs.to_owned()))),
                     ColumnarValue::Scalar(ScalarValue::$t2(Some($rhs.to_owned()))),
                 ],

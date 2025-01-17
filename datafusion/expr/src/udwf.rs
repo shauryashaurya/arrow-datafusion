@@ -28,16 +28,27 @@ use std::{
 
 use arrow::datatypes::{DataType, Field};
 
-use datafusion_common::{not_impl_err, Result};
-use datafusion_functions_window_common::field::WindowUDFFieldArgs;
-
 use crate::expr::WindowFunction;
 use crate::{
     function::WindowFunctionSimplification, Expr, PartitionEvaluator, Signature,
 };
+use datafusion_common::{not_impl_err, Result};
+use datafusion_doc::Documentation;
+use datafusion_functions_window_common::expr::ExpressionArgs;
+use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
-/// Logical representation of a user-defined window function (UDWF)
-/// A UDWF is different from a UDF in that it is stateful across batches.
+/// Logical representation of a user-defined window function (UDWF).
+///
+/// A Window Function is called via the SQL `OVER` clause:
+///
+/// ```sql
+/// SELECT first_value(col) OVER (PARTITION BY a, b ORDER BY c) FROM foo;
+/// ```
+///
+/// A UDWF is different from a user defined function (UDF) in that it is
+/// stateful across batches.
 ///
 /// See the documentation on [`PartitionEvaluator`] for more details
 ///
@@ -148,9 +159,18 @@ impl WindowUDF {
         self.inner.simplify()
     }
 
+    /// Expressions that are passed to the [`PartitionEvaluator`].
+    ///
+    /// See [`WindowUDFImpl::expressions`] for more details.
+    pub fn expressions(&self, expr_args: ExpressionArgs) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.inner.expressions(expr_args)
+    }
     /// Return a `PartitionEvaluator` for evaluating this window function
-    pub fn partition_evaluator_factory(&self) -> Result<Box<dyn PartitionEvaluator>> {
-        self.inner.partition_evaluator()
+    pub fn partition_evaluator_factory(
+        &self,
+        partition_evaluator_args: PartitionEvaluatorArgs,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
+        self.inner.partition_evaluator(partition_evaluator_args)
     }
 
     /// Returns the field of the final result of evaluating this window function.
@@ -171,6 +191,22 @@ impl WindowUDF {
     /// See [`WindowUDFImpl::coerce_types`] for more details.
     pub fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
+    }
+
+    /// Returns the reversed user-defined window function when the
+    /// order of evaluation is reversed.
+    ///
+    /// See [`WindowUDFImpl::reverse_expr`] for more details.
+    pub fn reverse_expr(&self) -> ReversedUDWF {
+        self.inner.reverse_expr()
+    }
+
+    /// Returns the documentation for this Window UDF.
+    ///
+    /// Documentation can be accessed programmatically as well as
+    /// generating publicly facing documentation.
+    pub fn documentation(&self) -> Option<&Documentation> {
+        self.inner.documentation()
     }
 }
 
@@ -196,37 +232,59 @@ where
 /// # Basic Example
 /// ```
 /// # use std::any::Any;
+/// # use std::sync::OnceLock;
 /// # use arrow::datatypes::{DataType, Field};
 /// # use datafusion_common::{DataFusionError, plan_err, Result};
-/// # use datafusion_expr::{col, Signature, Volatility, PartitionEvaluator, WindowFrame, ExprFunctionExt};
+/// # use datafusion_expr::{col, Signature, Volatility, PartitionEvaluator, WindowFrame, ExprFunctionExt, Documentation};
 /// # use datafusion_expr::{WindowUDFImpl, WindowUDF};
-/// use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+/// # use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+/// # use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+/// # use datafusion_expr::window_doc_sections::DOC_SECTION_ANALYTICAL;
+///
 /// #[derive(Debug, Clone)]
 /// struct SmoothIt {
-///   signature: Signature
+///   signature: Signature,
 /// }
 ///
 /// impl SmoothIt {
 ///   fn new() -> Self {
 ///     Self {
-///       signature: Signature::uniform(1, vec![DataType::Int32], Volatility::Immutable)
+///       signature: Signature::uniform(1, vec![DataType::Int32], Volatility::Immutable),
 ///      }
 ///   }
 /// }
 ///
-/// /// Implement the WindowUDFImpl trait for AddOne
+/// static DOCUMENTATION: OnceLock<Documentation> = OnceLock::new();
+///
+/// fn get_doc() -> &'static Documentation {
+///     DOCUMENTATION.get_or_init(|| {
+///         Documentation::builder(DOC_SECTION_ANALYTICAL, "smooths the windows", "smooth_it(2)")
+///             .with_argument("arg1", "The int32 number to smooth by")
+///             .build()
+///     })
+/// }
+///
+/// /// Implement the WindowUDFImpl trait for SmoothIt
 /// impl WindowUDFImpl for SmoothIt {
 ///    fn as_any(&self) -> &dyn Any { self }
 ///    fn name(&self) -> &str { "smooth_it" }
 ///    fn signature(&self) -> &Signature { &self.signature }
-///    // The actual implementation would add one to the argument
-///    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> { unimplemented!() }
+///    // The actual implementation would smooth the window
+///    fn partition_evaluator(
+///        &self,
+///        _partition_evaluator_args: PartitionEvaluatorArgs,
+///    ) -> Result<Box<dyn PartitionEvaluator>> {
+///        unimplemented!()
+///    }
 ///    fn field(&self, field_args: WindowUDFFieldArgs) -> Result<Field> {
 ///      if let Some(DataType::Int32) = field_args.get_input_type(0) {
 ///        Ok(Field::new(field_args.name(), DataType::Int32, false))
 ///      } else {
 ///        plan_err!("smooth_it only accepts Int32 arguments")
 ///      }
+///    }
+///    fn documentation(&self) -> Option<&Documentation> {
+///      Some(get_doc())
 ///    }
 /// }
 ///
@@ -256,8 +314,16 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     /// types are accepted and the function's Volatility.
     fn signature(&self) -> &Signature;
 
+    /// Returns the expressions that are passed to the [`PartitionEvaluator`].
+    fn expressions(&self, expr_args: ExpressionArgs) -> Vec<Arc<dyn PhysicalExpr>> {
+        expr_args.input_exprs().into()
+    }
+
     /// Invoke the function, returning the [`PartitionEvaluator`] instance
-    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>>;
+    fn partition_evaluator(
+        &self,
+        partition_evaluator_args: PartitionEvaluatorArgs,
+    ) -> Result<Box<dyn PartitionEvaluator>>;
 
     /// Returns any aliases (alternate names) for this function.
     ///
@@ -278,7 +344,7 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     /// optimizations manually for specific UDFs.
     ///
     /// Example:
-    /// [`simplify_udwf_expression.rs`]: <https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/simplify_udwf_expression.rs>
+    /// [`advanced_udwf.rs`]: <https://github.com/apache/arrow-datafusion/blob/main/datafusion-examples/examples/advanced_udwf.rs>
     ///
     /// # Returns
     /// [None] if simplify is not defined or,
@@ -318,6 +384,10 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     }
 
     /// The [`Field`] of the final result of evaluating this window function.
+    ///
+    /// Call `field_args.name()` to get the fully qualified name for defining
+    /// the [`Field`]. For a complete example see the implementation in the
+    /// [Basic Example](WindowUDFImpl#basic-example) section.
     fn field(&self, field_args: WindowUDFFieldArgs) -> Result<Field>;
 
     /// Allows the window UDF to define a custom result ordering.
@@ -351,6 +421,32 @@ pub trait WindowUDFImpl: Debug + Send + Sync {
     fn coerce_types(&self, _arg_types: &[DataType]) -> Result<Vec<DataType>> {
         not_impl_err!("Function {} does not implement coerce_types", self.name())
     }
+
+    /// Allows customizing the behavior of the user-defined window
+    /// function when it is evaluated in reverse order.
+    fn reverse_expr(&self) -> ReversedUDWF {
+        ReversedUDWF::NotSupported
+    }
+
+    /// Returns the documentation for this Window UDF.
+    ///
+    /// Documentation can be accessed programmatically as well as
+    /// generating publicly facing documentation.
+    fn documentation(&self) -> Option<&Documentation> {
+        None
+    }
+}
+
+pub enum ReversedUDWF {
+    /// The result of evaluating the user-defined window function
+    /// remains identical when reversed.
+    Identical,
+    /// A window function which does not support evaluating the result
+    /// in reverse order.
+    NotSupported,
+    /// Customize the user-defined window function for evaluating the
+    /// result in reverse order.
+    Reversed(Arc<WindowUDF>),
 }
 
 impl PartialEq for dyn WindowUDFImpl {
@@ -401,8 +497,18 @@ impl WindowUDFImpl for AliasedWindowUDFImpl {
         self.inner.signature()
     }
 
-    fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
-        self.inner.partition_evaluator()
+    fn expressions(&self, expr_args: ExpressionArgs) -> Vec<Arc<dyn PhysicalExpr>> {
+        expr_args
+            .input_exprs()
+            .first()
+            .map_or(vec![], |expr| vec![Arc::clone(expr)])
+    }
+
+    fn partition_evaluator(
+        &self,
+        partition_evaluator_args: PartitionEvaluatorArgs,
+    ) -> Result<Box<dyn PartitionEvaluator>> {
+        self.inner.partition_evaluator(partition_evaluator_args)
     }
 
     fn aliases(&self) -> &[String] {
@@ -439,6 +545,41 @@ impl WindowUDFImpl for AliasedWindowUDFImpl {
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
     }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.inner.documentation()
+    }
+}
+
+// Window UDF doc sections for use in public documentation
+pub mod window_doc_sections {
+    use datafusion_doc::DocSection;
+
+    pub fn doc_sections() -> Vec<DocSection> {
+        vec![
+            DOC_SECTION_AGGREGATE,
+            DOC_SECTION_RANKING,
+            DOC_SECTION_ANALYTICAL,
+        ]
+    }
+
+    pub const DOC_SECTION_AGGREGATE: DocSection = DocSection {
+        include: true,
+        label: "Aggregate Functions",
+        description: Some("All aggregate functions can be used as window functions."),
+    };
+
+    pub const DOC_SECTION_RANKING: DocSection = DocSection {
+        include: true,
+        label: "Ranking Functions",
+        description: None,
+    };
+
+    pub const DOC_SECTION_ANALYTICAL: DocSection = DocSection {
+        include: true,
+        label: "Analytical Functions",
+        description: None,
+    };
 }
 
 #[cfg(test)]
@@ -448,6 +589,7 @@ mod test {
     use datafusion_common::Result;
     use datafusion_expr_common::signature::{Signature, Volatility};
     use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+    use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
     use std::any::Any;
     use std::cmp::Ordering;
 
@@ -479,7 +621,10 @@ mod test {
         fn signature(&self) -> &Signature {
             &self.signature
         }
-        fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+        fn partition_evaluator(
+            &self,
+            _partition_evaluator_args: PartitionEvaluatorArgs,
+        ) -> Result<Box<dyn PartitionEvaluator>> {
             unimplemented!()
         }
         fn field(&self, _field_args: WindowUDFFieldArgs) -> Result<Field> {
@@ -515,7 +660,10 @@ mod test {
         fn signature(&self) -> &Signature {
             &self.signature
         }
-        fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+        fn partition_evaluator(
+            &self,
+            _partition_evaluator_args: PartitionEvaluatorArgs,
+        ) -> Result<Box<dyn PartitionEvaluator>> {
             unimplemented!()
         }
         fn field(&self, _field_args: WindowUDFFieldArgs) -> Result<Field> {

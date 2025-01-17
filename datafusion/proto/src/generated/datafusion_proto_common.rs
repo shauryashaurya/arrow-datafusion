@@ -572,9 +572,9 @@ pub struct CsvOptions {
     /// Compression type
     #[prost(enumeration = "CompressionTypeVariant", tag = "5")]
     pub compression: i32,
-    /// Max records for schema inference
-    #[prost(uint64, tag = "6")]
-    pub schema_infer_max_rec: u64,
+    /// Optional max records for schema inference
+    #[prost(uint64, optional, tag = "6")]
+    pub schema_infer_max_rec: ::core::option::Option<u64>,
     /// Optional date format
     #[prost(string, tag = "7")]
     pub date_format: ::prost::alloc::string::String,
@@ -593,17 +593,20 @@ pub struct CsvOptions {
     /// Optional representation of null value
     #[prost(string, tag = "12")]
     pub null_value: ::prost::alloc::string::String,
+    /// Optional representation of null loading regex
+    #[prost(string, tag = "13")]
+    pub null_regex: ::prost::alloc::string::String,
     /// Optional comment character as a byte
-    #[prost(bytes = "vec", tag = "13")]
+    #[prost(bytes = "vec", tag = "14")]
     pub comment: ::prost::alloc::vec::Vec<u8>,
     /// Indicates if quotes are doubled
-    #[prost(bytes = "vec", tag = "14")]
+    #[prost(bytes = "vec", tag = "15")]
     pub double_quote: ::prost::alloc::vec::Vec<u8>,
     /// Indicates if newlines are supported in values
-    #[prost(bytes = "vec", tag = "15")]
+    #[prost(bytes = "vec", tag = "16")]
     pub newlines_in_values: ::prost::alloc::vec::Vec<u8>,
     /// Optional terminator character as a byte
-    #[prost(bytes = "vec", tag = "16")]
+    #[prost(bytes = "vec", tag = "17")]
     pub terminator: ::prost::alloc::vec::Vec<u8>,
 }
 /// Options controlling CSV format
@@ -612,9 +615,9 @@ pub struct JsonOptions {
     /// Compression type
     #[prost(enumeration = "CompressionTypeVariant", tag = "1")]
     pub compression: i32,
-    /// Max records for schema inference
-    #[prost(uint64, tag = "2")]
-    pub schema_infer_max_rec: u64,
+    /// Optional max records for schema inference
+    #[prost(uint64, optional, tag = "2")]
+    pub schema_infer_max_rec: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableParquetOptions {
@@ -757,6 +760,12 @@ pub struct ParquetOptions {
     /// default = false
     #[prost(bool, tag = "28")]
     pub schema_force_view_types: bool,
+    /// default = false
+    #[prost(bool, tag = "29")]
+    pub binary_as_string: bool,
+    /// default = false
+    #[prost(bool, tag = "30")]
+    pub skip_arrow_metadata: bool,
     #[prost(uint64, tag = "12")]
     pub dictionary_page_size_limit: u64,
     #[prost(uint64, tag = "18")]
@@ -880,6 +889,7 @@ pub enum JoinType {
     Leftanti = 5,
     Rightsemi = 6,
     Rightanti = 7,
+    Leftmark = 8,
 }
 impl JoinType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -888,14 +898,15 @@ impl JoinType {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            JoinType::Inner => "INNER",
-            JoinType::Left => "LEFT",
-            JoinType::Right => "RIGHT",
-            JoinType::Full => "FULL",
-            JoinType::Leftsemi => "LEFTSEMI",
-            JoinType::Leftanti => "LEFTANTI",
-            JoinType::Rightsemi => "RIGHTSEMI",
-            JoinType::Rightanti => "RIGHTANTI",
+            Self::Inner => "INNER",
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+            Self::Full => "FULL",
+            Self::Leftsemi => "LEFTSEMI",
+            Self::Leftanti => "LEFTANTI",
+            Self::Rightsemi => "RIGHTSEMI",
+            Self::Rightanti => "RIGHTANTI",
+            Self::Leftmark => "LEFTMARK",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -909,6 +920,7 @@ impl JoinType {
             "LEFTANTI" => Some(Self::Leftanti),
             "RIGHTSEMI" => Some(Self::Rightsemi),
             "RIGHTANTI" => Some(Self::Rightanti),
+            "LEFTMARK" => Some(Self::Leftmark),
             _ => None,
         }
     }
@@ -926,8 +938,8 @@ impl JoinConstraint {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            JoinConstraint::On => "ON",
-            JoinConstraint::Using => "USING",
+            Self::On => "ON",
+            Self::Using => "USING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -954,10 +966,10 @@ impl TimeUnit {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            TimeUnit::Second => "Second",
-            TimeUnit::Millisecond => "Millisecond",
-            TimeUnit::Microsecond => "Microsecond",
-            TimeUnit::Nanosecond => "Nanosecond",
+            Self::Second => "Second",
+            Self::Millisecond => "Millisecond",
+            Self::Microsecond => "Microsecond",
+            Self::Nanosecond => "Nanosecond",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -985,9 +997,9 @@ impl IntervalUnit {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            IntervalUnit::YearMonth => "YearMonth",
-            IntervalUnit::DayTime => "DayTime",
-            IntervalUnit::MonthDayNano => "MonthDayNano",
+            Self::YearMonth => "YearMonth",
+            Self::DayTime => "DayTime",
+            Self::MonthDayNano => "MonthDayNano",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1013,8 +1025,8 @@ impl UnionMode {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            UnionMode::Sparse => "sparse",
-            UnionMode::Dense => "dense",
+            Self::Sparse => "sparse",
+            Self::Dense => "dense",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1042,11 +1054,11 @@ impl CompressionTypeVariant {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            CompressionTypeVariant::Gzip => "GZIP",
-            CompressionTypeVariant::Bzip2 => "BZIP2",
-            CompressionTypeVariant::Xz => "XZ",
-            CompressionTypeVariant::Zstd => "ZSTD",
-            CompressionTypeVariant::Uncompressed => "UNCOMPRESSED",
+            Self::Gzip => "GZIP",
+            Self::Bzip2 => "BZIP2",
+            Self::Xz => "XZ",
+            Self::Zstd => "ZSTD",
+            Self::Uncompressed => "UNCOMPRESSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1066,6 +1078,7 @@ impl CompressionTypeVariant {
 pub enum JoinSide {
     LeftSide = 0,
     RightSide = 1,
+    None = 2,
 }
 impl JoinSide {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1074,8 +1087,9 @@ impl JoinSide {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            JoinSide::LeftSide => "LEFT_SIDE",
-            JoinSide::RightSide => "RIGHT_SIDE",
+            Self::LeftSide => "LEFT_SIDE",
+            Self::RightSide => "RIGHT_SIDE",
+            Self::None => "NONE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1083,6 +1097,7 @@ impl JoinSide {
         match value {
             "LEFT_SIDE" => Some(Self::LeftSide),
             "RIGHT_SIDE" => Some(Self::RightSide),
+            "NONE" => Some(Self::None),
             _ => None,
         }
     }
@@ -1101,9 +1116,9 @@ impl PrecisionInfo {
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            PrecisionInfo::Exact => "EXACT",
-            PrecisionInfo::Inexact => "INEXACT",
-            PrecisionInfo::Absent => "ABSENT",
+            Self::Exact => "EXACT",
+            Self::Inexact => "INEXACT",
+            Self::Absent => "ABSENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.

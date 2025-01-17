@@ -60,6 +60,7 @@ create table test_source as values
   ('Andrew', 'X'),
   ('Xiangpeng', 'Xiangpeng'),
   ('Raphael', 'R'),
+  ('', 'Warsaw'),
   (NULL, 'R');
 
 # Table with the different combination of column types
@@ -80,6 +81,28 @@ statement ok
 drop table test_source
 
 ########
+## StringView Function test
+########
+
+query I
+select octet_length(column1_utf8view) from test;
+----
+6
+9
+7
+0
+NULL
+
+query T
+select btrim(column1_large_utf8) from test;
+----
+Andrew
+Xiangpeng
+Raphael
+(empty)
+NULL
+
+########
 ## StringView to Other Types column
 ########
 
@@ -96,6 +119,7 @@ from test;
 Andrew X false false true true
 Xiangpeng Xiangpeng true true false false
 Raphael R false false true true
+(empty) Warsaw false false true true
 NULL R NULL NULL NULL NULL
 
 # test StringViewArray with LargeUtf8 columns
@@ -111,6 +135,7 @@ from test;
 Andrew X false false true true
 Xiangpeng Xiangpeng true true false false
 Raphael R false false true true
+(empty) Warsaw false false true true
 NULL R NULL NULL NULL NULL
 
 ########
@@ -130,6 +155,7 @@ from test;
 Andrew X false false true true
 Xiangpeng Xiangpeng true true false false
 Raphael R false false true true
+(empty) Warsaw false false true true
 NULL R NULL NULL NULL NULL
 
 # StringView column to Dict scalar
@@ -145,6 +171,7 @@ from test;
 Andrew X true true false false
 Xiangpeng Xiangpeng false false true true
 Raphael R false false true true
+(empty) Warsaw false false true true
 NULL R NULL NULL NULL NULL
 
 # Dict column to StringView scalar
@@ -160,6 +187,7 @@ from test;
 Andrew X true true false false
 Xiangpeng Xiangpeng false false true true
 Raphael R false false true true
+(empty) Warsaw false false true true
 NULL R NULL NULL NULL NULL
 
 ########
@@ -273,6 +301,7 @@ FROM test;
 false false false
 true true true
 true true true
+false false false
 NULL NULL NULL
 
 # Test STARTS_WITH with utf8 against utf8view, utf8, and largeutf8
@@ -286,9 +315,8 @@ EXPLAIN SELECT
 FROM test;
 ----
 logical_plan
-01)Projection: starts_with(__common_expr_1, test.column2_utf8view) AS c1, starts_with(test.column1_utf8, test.column2_utf8) AS c3, starts_with(__common_expr_1, CAST(test.column2_large_utf8 AS Utf8View)) AS c4
-02)--Projection: CAST(test.column1_utf8 AS Utf8View) AS __common_expr_1, test.column1_utf8, test.column2_utf8, test.column2_large_utf8, test.column2_utf8view
-03)----TableScan: test projection=[column1_utf8, column2_utf8, column2_large_utf8, column2_utf8view]
+01)Projection: starts_with(CAST(test.column1_utf8 AS Utf8View), test.column2_utf8view) AS c1, starts_with(test.column1_utf8, test.column2_utf8) AS c3, starts_with(CAST(test.column1_utf8 AS LargeUtf8), test.column2_large_utf8) AS c4
+02)--TableScan: test projection=[column1_utf8, column2_utf8, column2_large_utf8, column2_utf8view]
 
 query BBB
  SELECT
@@ -300,6 +328,7 @@ FROM test;
 false false false
 true true true
 true true true
+false false false
 NULL NULL NULL
 
 
@@ -359,12 +388,12 @@ drop table test_lowercase
 ## Ensure no casts for LIKE/ILIKE
 query TT
 EXPLAIN SELECT
-  column1_utf8view like 'foo' as "like",
-  column1_utf8view ilike 'foo' as "ilike"
+  column1_utf8view like '%foo%' as "like",
+  column1_utf8view ilike '%foo%' as "ilike"
 FROM test;
 ----
 logical_plan
-01)Projection: test.column1_utf8view LIKE Utf8View("foo") AS like, test.column1_utf8view ILIKE Utf8View("foo") AS ilike
+01)Projection: test.column1_utf8view LIKE Utf8View("%foo%") AS like, test.column1_utf8view ILIKE Utf8View("%foo%") AS ilike
 02)--TableScan: test projection=[column1_utf8view]
 
 
@@ -578,7 +607,7 @@ EXPLAIN SELECT
 FROM test;
 ----
 logical_plan
-01)Projection: contains(test.column1_utf8view, Utf8("foo")) AS c1, contains(test.column1_utf8view, test.column2_utf8view) AS c2, contains(test.column1_utf8view, test.column2_large_utf8) AS c3, contains(test.column1_utf8, test.column2_utf8view) AS c4, contains(test.column1_utf8, test.column2_utf8) AS c5, contains(test.column1_utf8, test.column2_large_utf8) AS c6, contains(test.column1_large_utf8, test.column1_utf8view) AS c7, contains(test.column1_large_utf8, test.column2_utf8) AS c8, contains(test.column1_large_utf8, test.column2_large_utf8) AS c9
+01)Projection: contains(test.column1_utf8view, Utf8View("foo")) AS c1, contains(test.column1_utf8view, test.column2_utf8view) AS c2, contains(test.column1_utf8view, CAST(test.column2_large_utf8 AS Utf8View)) AS c3, contains(CAST(test.column1_utf8 AS Utf8View), test.column2_utf8view) AS c4, contains(test.column1_utf8, test.column2_utf8) AS c5, contains(CAST(test.column1_utf8 AS LargeUtf8), test.column2_large_utf8) AS c6, contains(CAST(test.column1_large_utf8 AS Utf8View), test.column1_utf8view) AS c7, contains(test.column1_large_utf8, CAST(test.column2_utf8 AS LargeUtf8)) AS c8, contains(test.column1_large_utf8, test.column2_large_utf8) AS c9
 02)--TableScan: test projection=[column1_utf8, column2_utf8, column1_large_utf8, column2_large_utf8, column1_utf8view, column2_utf8view]
 
 ## Ensure no casts for ENDS_WITH
@@ -680,6 +709,7 @@ FROM test;
 AndrewX
 XiangpengXiangpeng
 RaphaelR
+Warsaw
 R
 
 ## Should run CONCAT successfully with utf8 utf8view and largeutf8
@@ -691,6 +721,7 @@ FROM test;
 AndrewXX
 XiangpengXiangpengXiangpeng
 RaphaelRR
+WarsawWarsaw
 RR
 
 ## Ensure no casts for REGEXP_LIKE
@@ -700,7 +731,7 @@ EXPLAIN SELECT
 FROM test;
 ----
 logical_plan
-01)Projection: regexp_like(CAST(test.column1_utf8view AS Utf8), Utf8("^https?://(?:www\.)?([^/]+)/.*$")) AS k
+01)Projection: regexp_like(test.column1_utf8view, Utf8View("^https?://(?:www\.)?([^/]+)/.*$")) AS k
 02)--TableScan: test projection=[column1_utf8view]
 
 ## Ensure no casts for REGEXP_MATCH
@@ -822,7 +853,7 @@ EXPLAIN SELECT
 FROM test;
 ----
 logical_plan
-01)Projection: strpos(test.column1_utf8view, Utf8("f")) AS c, strpos(test.column1_utf8view, test.column2_utf8view) AS c2
+01)Projection: strpos(test.column1_utf8view, Utf8View("f")) AS c, strpos(test.column1_utf8view, test.column2_utf8view) AS c2
 02)--TableScan: test projection=[column1_utf8view, column2_utf8view]
 
 ## Ensure no casts for SUBSTR
@@ -878,6 +909,135 @@ FROM test;
 logical_plan
 01)Projection: find_in_set(test.column1_utf8view, Utf8View("a,b,c,d")) AS c
 02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for to_date
+query TT
+EXPLAIN SELECT
+  to_date(column1_utf8view, 'a,b,c,d') as c
+FROM test;
+----
+logical_plan
+01)Projection: to_date(test.column1_utf8view, Utf8("a,b,c,d")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for to_timestamp
+query TT
+EXPLAIN SELECT
+  to_timestamp(column1_utf8view, 'a,b,c,d') as c
+FROM test;
+----
+logical_plan
+01)Projection: to_timestamp(test.column1_utf8view, Utf8("a,b,c,d")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for NVL
+query TT
+EXPLAIN SELECT NVL(column1_utf8view, 'a') as c2 FROM test;
+----
+logical_plan
+01)Projection: nvl(test.column1_utf8view, Utf8View("a")) AS c2
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for nullif
+query TT
+EXPLAIN SELECT
+  nullif(column1_utf8view, 'a') as c
+FROM test;
+----
+logical_plan
+01)Projection: nullif(test.column1_utf8view, Utf8View("a")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for nullif
+query TT
+EXPLAIN SELECT
+  nullif(column1_utf8view, column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: nullif(test.column1_utf8view, test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for md5
+query TT
+EXPLAIN SELECT
+  md5(column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: md5(test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for sha224
+query TT
+EXPLAIN SELECT
+  sha224(column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: sha224(test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for sha256
+query TT
+EXPLAIN SELECT
+  sha256(column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: sha256(test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for sha384
+query TT
+EXPLAIN SELECT
+  sha384(column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: sha384(test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for sha512
+query TT
+EXPLAIN SELECT
+  sha512(column1_utf8view) as c
+FROM test;
+----
+logical_plan
+01)Projection: sha512(test.column1_utf8view) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no casts for digest
+query TT
+EXPLAIN SELECT
+  digest(column1_utf8view, 'md5') as c
+FROM test;
+----
+logical_plan
+01)Projection: digest(test.column1_utf8view, Utf8View("md5")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no unexpected casts for string_to_array
+query TT
+EXPLAIN SELECT
+  string_to_array(column1_utf8view, ',') AS c
+FROM test;
+----
+logical_plan
+01)Projection: string_to_array(test.column1_utf8view, Utf8View(",")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
+## Ensure no unexpected casts for array_to_string
+query TT
+EXPLAIN SELECT
+  array_to_string(string_to_array(column1_utf8view, NULL), ',') AS c
+FROM test;
+----
+logical_plan
+01)Projection: array_to_string(string_to_array(test.column1_utf8view, Utf8View(NULL)), Utf8(",")) AS c
+02)--TableScan: test projection=[column1_utf8view]
+
 
 ## Ensure no casts for binary operators
 # `~` operator (regex match)
@@ -968,35 +1128,6 @@ explain select column2||column3 from temp;
 logical_plan
 01)Projection: temp.column2 || temp.column3
 02)--TableScan: temp projection=[column2, column3]
-
-################################################
-# Test for Dictionary String concatenation
-################################################
-
-# || same type (column1 has null, so also tests NULL || NULL)
-# expect all results to be the same for each row as they all have the same values
-query T
-SELECT
-  column1_dict || column1_dict
-FROM test;
-----
-AndrewAndrew
-XiangpengXiangpeng
-RaphaelRaphael
-NULL
-
-# || constants
-# expect all results to be the same for each row as they all have the same values
-query TT
-SELECT
-  column1_dict || 'foo',
-  'foo' || column1_dict
-FROM test;
-----
-Andrewfoo fooAndrew
-Xiangpengfoo fooXiangpeng
-Raphaelfoo fooRaphael
-NULL NULL
 
 statement ok
 drop table test

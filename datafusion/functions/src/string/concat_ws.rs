@@ -21,16 +21,43 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
-use crate::string::common::*;
 use crate::string::concat::simplify_concat;
 use crate::string::concat_ws;
+use crate::strings::{ColumnarValueRef, StringArrayBuilder};
 use datafusion_common::cast::{as_string_array, as_string_view_array};
 use datafusion_common::{exec_err, internal_err, plan_err, Result, ScalarValue};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
-use datafusion_expr::{lit, ColumnarValue, Expr, Volatility};
+use datafusion_expr::{lit, ColumnarValue, Documentation, Expr, Volatility};
 use datafusion_expr::{ScalarUDFImpl, Signature};
+use datafusion_macros::user_doc;
 
+#[user_doc(
+    doc_section(label = "String Functions"),
+    description = "Concatenates multiple strings together with a specified separator.",
+    syntax_example = "concat_ws(separator, str[, ..., str_n])",
+    sql_example = r#"```sql
+> select concat_ws('_', 'data', 'fusion');
++--------------------------------------------------+
+| concat_ws(Utf8("_"),Utf8("data"),Utf8("fusion")) |
++--------------------------------------------------+
+| data_fusion                                      |
++--------------------------------------------------+
+```"#,
+    argument(
+        name = "separator",
+        description = "Separator to insert between concatenated strings."
+    ),
+    argument(
+        name = "str",
+        description = "String expression to operate on. Can be a constant, column, or function, and any combination of operators."
+    ),
+    argument(
+        name = "str_n",
+        description = "Subsequent string expressions to concatenate."
+    ),
+    related_udf(name = "concat")
+)]
 #[derive(Debug)]
 pub struct ConcatWsFunc {
     signature: Signature,
@@ -74,7 +101,11 @@ impl ScalarUDFImpl for ConcatWsFunc {
 
     /// Concatenates all but the first argument, with separators. The first argument is used as the separator string, and should not be NULL. Other NULL arguments are ignored.
     /// concat_ws(',', 'abcde', 2, NULL, 22) = 'abcde,2,22'
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_batch(
+        &self,
+        args: &[ColumnarValue],
+        _number_rows: usize,
+    ) -> Result<ColumnarValue> {
         // do not accept 0 arguments.
         if args.len() < 2 {
             return exec_err!(
@@ -163,7 +194,7 @@ impl ScalarUDFImpl for ConcatWsFunc {
                     ColumnarValueRef::NonNullableArray(string_array)
                 }
             }
-            _ => unreachable!(),
+            _ => unreachable!("concat ws"),
         };
 
         let mut columns = Vec::with_capacity(args.len() - 1);
@@ -263,6 +294,10 @@ impl ScalarUDFImpl for ConcatWsFunc {
             [delimiter, vals @ ..] => simplify_concat_ws(delimiter, vals),
             _ => Ok(ExprSimplifyResult::Original(args)),
         }
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.doc()
     }
 }
 
@@ -365,7 +400,7 @@ mod tests {
     fn test_functions() -> Result<()> {
         test_function!(
             ConcatWsFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("|")),
                 ColumnarValue::Scalar(ScalarValue::from("aa")),
                 ColumnarValue::Scalar(ScalarValue::from("bb")),
@@ -378,7 +413,7 @@ mod tests {
         );
         test_function!(
             ConcatWsFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("|")),
                 ColumnarValue::Scalar(ScalarValue::Utf8(None)),
             ],
@@ -389,7 +424,7 @@ mod tests {
         );
         test_function!(
             ConcatWsFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::Utf8(None)),
                 ColumnarValue::Scalar(ScalarValue::from("aa")),
                 ColumnarValue::Scalar(ScalarValue::from("bb")),
@@ -402,7 +437,7 @@ mod tests {
         );
         test_function!(
             ConcatWsFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("|")),
                 ColumnarValue::Scalar(ScalarValue::from("aa")),
                 ColumnarValue::Scalar(ScalarValue::Utf8(None)),
@@ -430,7 +465,8 @@ mod tests {
         ])));
         let args = &[c0, c1, c2];
 
-        let result = ConcatWsFunc::new().invoke(args)?;
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+        let result = ConcatWsFunc::new().invoke_batch(args, 3)?;
         let expected =
             Arc::new(StringArray::from(vec!["foo,x", "bar", "baz,z"])) as ArrayRef;
         match &result {
@@ -455,7 +491,8 @@ mod tests {
         ])));
         let args = &[c0, c1, c2];
 
-        let result = ConcatWsFunc::new().invoke(args)?;
+        #[allow(deprecated)] // TODO migrate UDF invoke to invoke_batch
+        let result = ConcatWsFunc::new().invoke_batch(args, 3)?;
         let expected =
             Arc::new(StringArray::from(vec![Some("foo,x"), None, Some("baz+z")]))
                 as ArrayRef;
