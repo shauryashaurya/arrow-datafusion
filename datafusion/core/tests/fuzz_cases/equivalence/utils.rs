@@ -22,14 +22,16 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Float32Array, Float64Array, RecordBatch, UInt32Array};
+use arrow::compute::SortOptions;
 use arrow::compute::{lexsort_to_indices, take_record_batch, SortColumn};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow_array::{ArrayRef, Float32Array, Float64Array, RecordBatch, UInt32Array};
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::utils::{compare_rows, get_row_at_idx};
 use datafusion_common::{exec_err, plan_datafusion_err, DataFusionError, Result};
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
+use datafusion_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion_physical_expr::equivalence::{EquivalenceClass, ProjectionMapping};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -444,7 +446,7 @@ pub fn generate_table_for_orderings(
 
     assert!(!orderings.is_empty());
     // Sort the inner vectors by their lengths (longest first)
-    orderings.sort_by_key(|v| std::cmp::Reverse(v.inner.len()));
+    orderings.sort_by_key(|v| std::cmp::Reverse(v.len()));
 
     let arrays = schema
         .fields
@@ -581,12 +583,8 @@ impl ScalarUDFImpl for TestScalarUDF {
         Ok(input[0].sort_properties)
     }
 
-    fn invoke_batch(
-        &self,
-        args: &[ColumnarValue],
-        _number_rows: usize,
-    ) -> Result<ColumnarValue> {
-        let args = ColumnarValue::values_to_arrays(args)?;
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let args = ColumnarValue::values_to_arrays(&args.args)?;
 
         let arr: ArrayRef = match args[0].data_type() {
             DataType::Float64 => Arc::new({
