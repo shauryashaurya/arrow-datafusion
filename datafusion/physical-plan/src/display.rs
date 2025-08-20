@@ -19,13 +19,12 @@
 //! [`crate::displayable`] for examples of how to format
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fmt::Formatter;
-use std::{fmt, str::FromStr};
 
 use arrow::datatypes::SchemaRef;
 
 use datafusion_common::display::{GraphvizBuilder, PlanType, StringifiedPlan};
-use datafusion_common::DataFusionError;
 use datafusion_expr::display_schema;
 use datafusion_physical_expr::LexOrdering;
 
@@ -34,12 +33,12 @@ use crate::render_tree::RenderTree;
 use super::{accept, ExecutionPlan, ExecutionPlanVisitor};
 
 /// Options for controlling how each [`ExecutionPlan`] should format itself
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayFormatType {
     /// Default, compact format. Example: `FilterExec: c12 < 10.0`
     ///
     /// This format is designed to provide a detailed textual description
-    /// of all rele
+    /// of all parts of the plan.
     Default,
     /// Verbose, showing all available details.
     ///
@@ -52,14 +51,18 @@ pub enum DisplayFormatType {
     /// information for understanding a plan. It should NOT contain the same level
     /// of detail information as the  [`Self::Default`] format.
     ///
-    /// In this mode, each line contains a key=value pair.
-    /// Everything before the first `=` is treated as the key, and everything after the
-    /// first `=` is treated as the value.
+    /// In this mode, each line has one of two formats:
+    ///
+    /// 1. A string without a `=`, which is printed in its own line
+    ///
+    /// 2. A string with a `=` that is treated as a `key=value pair`. Everything
+    ///    before the first `=` is treated as the key, and everything after the
+    ///    first `=` is treated as the value.
     ///
     /// For example, if the output of `TreeRender` is this:
     /// ```text
+    /// Parquet
     /// partition_sizes=[1]
-    /// partitions=1
     /// ```
     ///
     /// It is rendered in the center of a box in the following way:
@@ -69,25 +72,10 @@ pub enum DisplayFormatType {
     /// │       DataSourceExec      │
     /// │    --------------------   │
     /// │    partition_sizes: [1]   │
-    /// │       partitions: 1       │
+    /// │          Parquet          │
     /// └───────────────────────────┘
     ///  ```
     TreeRender,
-}
-
-impl FromStr for DisplayFormatType {
-    type Err = DataFusionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "indent" => Ok(Self::Default),
-            "tree" => Ok(Self::TreeRender),
-            _ => Err(DataFusionError::Configuration(format!(
-                "Invalid explain format: {}",
-                s
-            ))),
-        }
-    }
 }
 
 /// Wraps an `ExecutionPlan` with various methods for formatting
@@ -132,6 +120,8 @@ pub struct DisplayableExecutionPlan<'a> {
     show_statistics: bool,
     /// If schema should be displayed. See [`Self::set_show_schema`]
     show_schema: bool,
+    // (TreeRender) Maximum total width of the rendered tree
+    tree_maximum_render_width: usize,
 }
 
 impl<'a> DisplayableExecutionPlan<'a> {
@@ -143,6 +133,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics::None,
             show_statistics: false,
             show_schema: false,
+            tree_maximum_render_width: 240,
         }
     }
 
@@ -155,6 +146,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics::Aggregated,
             show_statistics: false,
             show_schema: false,
+            tree_maximum_render_width: 240,
         }
     }
 
@@ -167,6 +159,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             show_metrics: ShowMetrics::Full,
             show_statistics: false,
             show_schema: false,
+            tree_maximum_render_width: 240,
         }
     }
 
@@ -182,6 +175,12 @@ impl<'a> DisplayableExecutionPlan<'a> {
     /// Enable display of statistics
     pub fn set_show_statistics(mut self, show_statistics: bool) -> Self {
         self.show_statistics = show_statistics;
+        self
+    }
+
+    /// Set the maximum render width for the tree format
+    pub fn set_tree_maximum_render_width(mut self, width: usize) -> Self {
+        self.tree_maximum_render_width = width;
         self
     }
 
@@ -276,17 +275,27 @@ impl<'a> DisplayableExecutionPlan<'a> {
         }
     }
 
+    /// Formats the plan using a ASCII art like tree
+    ///
+    /// See [`DisplayFormatType::TreeRender`] for more details.
     pub fn tree_render(&self) -> impl fmt::Display + 'a {
         struct Wrapper<'a> {
             plan: &'a dyn ExecutionPlan,
+            maximum_render_width: usize,
         }
         impl fmt::Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-                let mut visitor = TreeRenderVisitor { f };
+                let mut visitor = TreeRenderVisitor {
+                    f,
+                    maximum_render_width: self.maximum_render_width,
+                };
                 visitor.visit(self.plan)
             }
         }
-        Wrapper { plan: self.inner }
+        Wrapper {
+            plan: self.inner,
+            maximum_render_width: self.tree_maximum_render_width,
+        }
     }
 
     /// Return a single-line summary of the root of the plan
@@ -322,7 +331,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
         }
     }
 
-    /// format as a `StringifiedPlan`
+    #[deprecated(since = "47.0.0", note = "indent() or tree_render() instead")]
     pub fn to_stringified(
         &self,
         verbose: bool,
@@ -403,8 +412,8 @@ impl ExecutionPlanVisitor for IndentVisitor<'_, '_> {
             }
         }
         if self.show_statistics {
-            let stats = plan.statistics().map_err(|_e| fmt::Error)?;
-            write!(self.f, ", statistics=[{}]", stats)?;
+            let stats = plan.partition_statistics(None).map_err(|_e| fmt::Error)?;
+            write!(self.f, ", statistics=[{stats}]")?;
         }
         if self.show_schema {
             write!(
@@ -488,8 +497,8 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
         };
 
         let statistics = if self.show_statistics {
-            let stats = plan.statistics().map_err(|_e| fmt::Error)?;
-            format!("statistics=[{}]", stats)
+            let stats = plan.partition_statistics(None).map_err(|_e| fmt::Error)?;
+            format!("statistics=[{stats}]")
         } else {
             "".to_string()
         };
@@ -504,7 +513,7 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
             self.f,
             id,
             &label,
-            Some(&format!("{}{}{}", metrics, delimiter, statistics)),
+            Some(&format!("{metrics}{delimiter}{statistics}")),
         )?;
 
         if let Some(parent_node_id) = self.parents.last() {
@@ -549,6 +558,8 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
 struct TreeRenderVisitor<'a, 'b> {
     /// Write to this formatter
     f: &'a mut Formatter<'b>,
+    /// Maximum total width of the rendered tree
+    maximum_render_width: usize,
 }
 
 impl TreeRenderVisitor<'_, '_> {
@@ -566,7 +577,6 @@ impl TreeRenderVisitor<'_, '_> {
     const HORIZONTAL: &'static str = "─"; // Horizontal line
 
     // TODO: Make these variables configurable.
-    const MAXIMUM_RENDER_WIDTH: usize = 240; // Maximum total width of the rendered tree
     const NODE_RENDER_WIDTH: usize = 29; // Width of each node's box
     const MAX_EXTRA_LINES: usize = 30; // Maximum number of extra info lines per node
 
@@ -601,6 +611,12 @@ impl TreeRenderVisitor<'_, '_> {
         y: usize,
     ) -> Result<(), fmt::Error> {
         for x in 0..root.width {
+            if self.maximum_render_width > 0
+                && x * Self::NODE_RENDER_WIDTH >= self.maximum_render_width
+            {
+                break;
+            }
+
             if root.has_node(x, y) {
                 write!(self.f, "{}", Self::LTCORNER)?;
                 write!(
@@ -666,12 +682,14 @@ impl TreeRenderVisitor<'_, '_> {
             }
         }
 
-        let halfway_point = (extra_height + 1) / 2;
+        let halfway_point = extra_height.div_ceil(2);
 
         // Render the actual node.
         for render_y in 0..=extra_height {
             for (x, _) in root.nodes.iter().enumerate().take(root.width) {
-                if x * Self::NODE_RENDER_WIDTH >= Self::MAXIMUM_RENDER_WIDTH {
+                if self.maximum_render_width > 0
+                    && x * Self::NODE_RENDER_WIDTH >= self.maximum_render_width
+                {
                     break;
                 }
 
@@ -695,7 +713,7 @@ impl TreeRenderVisitor<'_, '_> {
                         &render_text,
                         Self::NODE_RENDER_WIDTH - 2,
                     );
-                    write!(self.f, "{}", render_text)?;
+                    write!(self.f, "{render_text}")?;
 
                     if render_y == halfway_point && node.child_positions.len() > 1 {
                         write!(self.f, "{}", Self::LMIDDLE)?;
@@ -789,7 +807,9 @@ impl TreeRenderVisitor<'_, '_> {
         y: usize,
     ) -> Result<(), fmt::Error> {
         for x in 0..=root.width {
-            if x * Self::NODE_RENDER_WIDTH >= Self::MAXIMUM_RENDER_WIDTH {
+            if self.maximum_render_width > 0
+                && x * Self::NODE_RENDER_WIDTH >= self.maximum_render_width
+            {
                 break;
             }
             let mut has_adjacent_nodes = false;
@@ -857,22 +877,24 @@ impl TreeRenderVisitor<'_, '_> {
         let sorted_extra_info: BTreeMap<_, _> = extra_info.iter().collect();
         for (key, value) in sorted_extra_info {
             let mut str = Self::remove_padding(value);
-            if str.is_empty() {
-                continue;
-            }
             let mut is_inlined = false;
             let available_width = Self::NODE_RENDER_WIDTH - 7;
             let total_size = key.len() + str.len() + 2;
             let is_multiline = str.contains('\n');
-            if !is_multiline && total_size < available_width {
-                str = format!("{}: {}", key, str);
+
+            if str.is_empty() {
+                str = key.to_string();
+            } else if !is_multiline && total_size < available_width {
+                str = format!("{key}: {str}");
                 is_inlined = true;
             } else {
-                str = format!("{}:\n{}", key, str);
+                str = format!("{key}:\n{str}");
             }
+
             if is_inlined && was_inlined {
                 requires_padding = false;
             }
+
             if requires_padding {
                 result.push(String::new());
             }
@@ -909,7 +931,7 @@ impl TreeRenderVisitor<'_, '_> {
         let render_width = source.chars().count();
         if render_width > max_render_width {
             let truncated = &source[..max_render_width - 3];
-            format!("{}...", truncated)
+            format!("{truncated}...")
         } else {
             let total_spaces = max_render_width - render_width;
             let half_spaces = total_spaces / 2;
@@ -1041,27 +1063,22 @@ impl fmt::Display for ProjectSchemaDisplay<'_> {
 }
 
 pub fn display_orderings(f: &mut Formatter, orderings: &[LexOrdering]) -> fmt::Result {
-    if let Some(ordering) = orderings.first() {
-        if !ordering.is_empty() {
-            let start = if orderings.len() == 1 {
-                ", output_ordering="
-            } else {
-                ", output_orderings=["
-            };
-            write!(f, "{}", start)?;
-            for (idx, ordering) in
-                orderings.iter().enumerate().filter(|(_, o)| !o.is_empty())
-            {
-                match idx {
-                    0 => write!(f, "[{}]", ordering)?,
-                    _ => write!(f, ", [{}]", ordering)?,
-                }
+    if !orderings.is_empty() {
+        let start = if orderings.len() == 1 {
+            ", output_ordering="
+        } else {
+            ", output_orderings=["
+        };
+        write!(f, "{start}")?;
+        for (idx, ordering) in orderings.iter().enumerate() {
+            match idx {
+                0 => write!(f, "[{ordering}]")?,
+                _ => write!(f, ", [{ordering}]")?,
             }
-            let end = if orderings.len() == 1 { "" } else { "]" };
-            write!(f, "{}", end)?;
         }
+        let end = if orderings.len() == 1 { "" } else { "]" };
+        write!(f, "{end}")?;
     }
-
     Ok(())
 }
 
@@ -1127,6 +1144,13 @@ mod tests {
         }
 
         fn statistics(&self) -> Result<Statistics> {
+            self.partition_statistics(None)
+        }
+
+        fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+            if partition.is_some() {
+                return Ok(Statistics::new_unknown(self.schema().as_ref()));
+            }
             match self {
                 Self::Panic => panic!("expected panic"),
                 Self::Error => {

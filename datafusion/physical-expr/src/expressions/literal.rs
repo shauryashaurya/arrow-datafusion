@@ -23,26 +23,59 @@ use std::sync::Arc;
 
 use crate::physical_expr::PhysicalExpr;
 
+use arrow::datatypes::{Field, FieldRef};
 use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
 use datafusion_common::{Result, ScalarValue};
+use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::Expr;
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 
 /// Represents a literal value
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Literal {
     value: ScalarValue,
+    field: FieldRef,
+}
+
+impl Hash for Literal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        let metadata = self.field.metadata();
+        let mut keys = metadata.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            key.hash(state);
+            metadata.get(key).unwrap().hash(state);
+        }
+    }
 }
 
 impl Literal {
     /// Create a literal value expression
     pub fn new(value: ScalarValue) -> Self {
-        Self { value }
+        Self::new_with_metadata(value, None)
+    }
+
+    /// Create a literal value expression
+    pub fn new_with_metadata(
+        value: ScalarValue,
+        metadata: Option<FieldMetadata>,
+    ) -> Self {
+        let mut field = Field::new("lit".to_string(), value.data_type(), value.is_null());
+
+        if let Some(metadata) = metadata {
+            field = metadata.add_to_field(field);
+        }
+
+        Self {
+            value,
+            field: field.into(),
+        }
     }
 
     /// Get the scalar value
@@ -71,6 +104,10 @@ impl PhysicalExpr for Literal {
         Ok(self.value.is_null())
     }
 
+    fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
+        Ok(Arc::clone(&self.field))
+    }
+
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(self.value.clone()))
     }
@@ -93,12 +130,16 @@ impl PhysicalExpr for Literal {
             preserves_lex_ordering: true,
         })
     }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 /// Create a literal expression
 pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
     match value.lit() {
-        Expr::Literal(v) => Arc::new(Literal::new(v)),
+        Expr::Literal(v, _) => Arc::new(Literal::new(v)),
         _ => unreachable!(),
     }
 }
@@ -108,8 +149,9 @@ mod tests {
     use super::*;
 
     use arrow::array::Int32Array;
-    use arrow::datatypes::*;
+    use arrow::datatypes::Field;
     use datafusion_common::cast::as_int32_array;
+    use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     #[test]
     fn literal_i32() -> Result<()> {
@@ -133,6 +175,18 @@ mod tests {
         for i in 0..literal_array.len() {
             assert_eq!(literal_array.value(i), 42);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fmt_sql() -> Result<()> {
+        // create and evaluate a literal expression
+        let expr = lit(42i32);
+        let display_string = expr.to_string();
+        assert_eq!(display_string, "42");
+        let sql_string = fmt_sql(expr.as_ref()).to_string();
+        assert_eq!(sql_string, "42");
 
         Ok(())
     }

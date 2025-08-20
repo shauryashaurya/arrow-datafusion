@@ -25,7 +25,6 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::Result;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -56,7 +55,11 @@ impl TopKAggregation {
         }
         let group_key = aggr.group_expr().expr().iter().exactly_one().ok()?;
         let kt = group_key.0.data_type(&aggr.input().schema()).ok()?;
-        if !kt.is_primitive() && kt != DataType::Utf8 {
+        if !kt.is_primitive()
+            && kt != DataType::Utf8
+            && kt != DataType::Utf8View
+            && kt != DataType::LargeUtf8
+        {
             return None;
         }
         if aggr.filter_expr().iter().any(|e| e.is_some()) {
@@ -127,7 +130,7 @@ impl TopKAggregation {
             Ok(Transformed::no(plan))
         };
         let child = Arc::clone(child).transform_down(closure).data().ok()?;
-        let sort = SortExec::new(LexOrdering::new(sort.expr().to_vec()), child)
+        let sort = SortExec::new(sort.expr().clone(), child)
             .with_fetch(sort.fetch())
             .with_preserve_partitioning(sort.preserve_partitioning());
         Some(Arc::new(sort))

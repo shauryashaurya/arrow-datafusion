@@ -22,12 +22,12 @@ use datafusion_expr::planner::{
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastFormat, CastKind, DataType as SQLDataType,
     DictionaryField, Expr as SQLExpr, ExprWithAlias as SQLExprWithAlias, MapEntry,
-    StructField, Subscript, TrimWhereField, Value,
+    StructField, Subscript, TrimWhereField, Value, ValueWithSpan,
 };
 
 use datafusion_common::{
-    internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, DFSchema,
-    Result, ScalarValue,
+    internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, Result,
+    ScalarValue,
 };
 
 use datafusion_expr::expr::ScalarFunction;
@@ -211,11 +211,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         //       more context.
         match sql {
             SQLExpr::Value(value) => {
-                self.parse_value(value, planner_context.prepare_param_data_types())
+                self.parse_value(value.into(), planner_context.prepare_param_data_types())
             }
             SQLExpr::Extract { field, expr, .. } => {
                 let mut extract_args = vec![
-                    Expr::Literal(ScalarValue::from(format!("{field}"))),
+                    Expr::Literal(ScalarValue::from(format!("{field}")), None),
                     self.sql_expr_to_logical_expr(*expr, schema, planner_context)?,
                 ];
 
@@ -253,12 +253,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             SQLExpr::Case {
                 operand,
                 conditions,
-                results,
                 else_result,
+                case_token: _,
+                end_token: _,
             } => self.sql_case_identifier_to_expr(
                 operand,
                 conditions,
-                results,
                 else_result,
                 schema,
                 planner_context,
@@ -292,7 +292,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
 
             SQLExpr::TypedString { data_type, value } => Ok(Expr::Cast(Cast::new(
-                Box::new(lit(value)),
+                Box::new(lit(value.into_string().unwrap())),
                 self.convert_data_type(&data_type)?,
             ))),
 
@@ -448,6 +448,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 substring_from,
                 substring_for,
                 special: _,
+                shorthand: _,
             } => self.sql_substring_to_expr(
                 expr,
                 substring_from,
@@ -544,9 +545,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     planner_context,
                 )?),
                 match *time_zone {
-                    SQLExpr::Value(Value::SingleQuotedString(s)) => {
-                        DataType::Timestamp(TimeUnit::Nanosecond, Some(s.into()))
-                    }
+                    SQLExpr::Value(ValueWithSpan {
+                        value: Value::SingleQuotedString(s),
+                        span: _,
+                    }) => DataType::Timestamp(TimeUnit::Nanosecond, Some(s.into())),
                     _ => {
                         return not_impl_err!(
                             "Unsupported ast node in sqltorel: {time_zone:?}"
@@ -645,7 +647,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         values: Vec<SQLExpr>,
     ) -> Result<Expr> {
         match values.first() {
-            Some(SQLExpr::Identifier(_)) | Some(SQLExpr::Value(_)) => {
+            Some(SQLExpr::Identifier(_))
+            | Some(SQLExpr::Value(_))
+            | Some(SQLExpr::CompoundIdentifier(_)) => {
                 self.parse_struct(schema, planner_context, values, vec![])
             }
             None => not_impl_err!("Empty tuple not supported yet"),
@@ -812,7 +816,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<String>,
+        escape_char: Option<Value>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
         case_insensitive: bool,
@@ -822,13 +826,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return not_impl_err!("ANY in LIKE expression");
         }
         let pattern = self.sql_expr_to_logical_expr(pattern, schema, planner_context)?;
-        let escape_char = if let Some(char) = escape_char {
-            if char.len() != 1 {
-                return plan_err!("Invalid escape character in LIKE expression");
+        let escape_char = match escape_char {
+            Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
+                Some(char.chars().next().unwrap())
             }
-            Some(char.chars().next().unwrap())
-        } else {
-            None
+            Some(value) => return plan_err!("Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"),
+            None => None,
         };
         Ok(Expr::Like(Like::new(
             negated,
@@ -844,7 +847,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<String>,
+        escape_char: Option<Value>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
@@ -853,13 +856,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if pattern_type != DataType::Utf8 && pattern_type != DataType::Null {
             return plan_err!("Invalid pattern in SIMILAR TO expression");
         }
-        let escape_char = if let Some(char) = escape_char {
-            if char.len() != 1 {
-                return plan_err!("Invalid escape character in SIMILAR TO expression");
+        let escape_char = match escape_char {
+            Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
+                Some(char.chars().next().unwrap())
             }
-            Some(char.chars().next().unwrap())
-        } else {
-            None
+            Some(value) => return plan_err!("Invalid escape character in SIMILAR TO expression. Expected a single character wrapped with single quotes, got {value}"),
+            None => None,
         };
         Ok(Expr::SimilarTo(Like::new(
             negated,
@@ -983,6 +985,64 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         Ok(Expr::Cast(Cast::new(Box::new(expr), dt)))
     }
 
+    /// Extracts the root expression and access chain from a compound expression.
+    ///
+    /// This function attempts to identify if a compound expression (like `a.b.c`) should be treated
+    /// as a column reference with a qualifier (like `table.column`) or as a field access expression.
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - The root SQL expression (e.g., the first part of `a.b.c`)
+    /// * `access_chain` - Vector of access expressions (e.g., `.b` and `.c` parts)
+    /// * `schema` - The schema to resolve column references against
+    /// * `planner_context` - Context for planning expressions
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * The resolved root expression
+    /// * The remaining access chain that should be processed as field accesses
+    fn extract_root_and_access_chain(
+        &self,
+        root: SQLExpr,
+        mut access_chain: Vec<AccessExpr>,
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<(Expr, Vec<AccessExpr>)> {
+        let SQLExpr::Identifier(root_ident) = root else {
+            let root = self.sql_expr_to_logical_expr(root, schema, planner_context)?;
+            return Ok((root, access_chain));
+        };
+
+        let mut compound_idents = vec![root_ident];
+        let first_non_ident = access_chain
+            .iter()
+            .position(|access| !matches!(access, AccessExpr::Dot(SQLExpr::Identifier(_))))
+            .unwrap_or(access_chain.len());
+        for access in access_chain.drain(0..first_non_ident) {
+            if let AccessExpr::Dot(SQLExpr::Identifier(ident)) = access {
+                compound_idents.push(ident);
+            } else {
+                return internal_err!("Expected identifier in access chain");
+            }
+        }
+
+        let root = if compound_idents.len() == 1 {
+            self.sql_identifier_to_expr(
+                compound_idents.pop().unwrap(),
+                schema,
+                planner_context,
+            )?
+        } else {
+            self.sql_compound_identifier_to_expr(
+                compound_idents,
+                schema,
+                planner_context,
+            )?
+        };
+        Ok((root, access_chain))
+    }
+
     fn sql_compound_field_access_to_expr(
         &self,
         root: SQLExpr,
@@ -990,7 +1050,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        let mut root = self.sql_expr_to_logical_expr(root, schema, planner_context)?;
+        let (root, access_chain) = self.extract_root_and_access_chain(
+            root,
+            access_chain,
+            schema,
+            planner_context,
+        )?;
         let fields = access_chain
             .into_iter()
             .map(|field| match field {
@@ -999,10 +1064,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         Subscript::Index { index } => {
                             // index can be a name, in which case it is a named field access
                             match index {
-                                SQLExpr::Value(
-                                    Value::SingleQuotedString(s)
-                                    | Value::DoubleQuotedString(s),
-                                ) => Ok(Some(GetFieldAccess::NamedStructField {
+                                SQLExpr::Value(ValueWithSpan {
+                                    value:
+                                        Value::SingleQuotedString(s)
+                                        | Value::DoubleQuotedString(s),
+                                    span: _,
+                                }) => Ok(Some(GetFieldAccess::NamedStructField {
                                     name: ScalarValue::from(s),
                                 })),
                                 SQLExpr::JsonAccess { .. } => {
@@ -1064,45 +1131,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         }
                     }
                 }
-                AccessExpr::Dot(expr) => {
-                    let expr =
-                        self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
-                    match expr {
-                        Expr::Column(Column {
-                            name,
-                            relation,
-                            spans,
-                        }) => {
-                            if let Some(relation) = &relation {
-                                // If the first part of the dot access is a column reference, we should
-                                // check if the column is from the same table as the root expression.
-                                // If it is, we should replace the root expression with the column reference.
-                                // Otherwise, we should treat the dot access as a named field access.
-                                if relation.table() == root.schema_name().to_string() {
-                                    root = Expr::Column(Column {
-                                        name,
-                                        relation: Some(relation.clone()),
-                                        spans,
-                                    });
-                                    Ok(None)
-                                } else {
-                                    plan_err!(
-                                        "table name mismatch: {} != {}",
-                                        relation.table(),
-                                        root.schema_name()
-                                    )
-                                }
-                            } else {
-                                Ok(Some(GetFieldAccess::NamedStructField {
-                                    name: ScalarValue::from(name),
-                                }))
-                            }
-                        }
-                        _ => not_impl_err!(
-                            "Dot access not supported for non-column expr: {expr:?}"
-                        ),
+                AccessExpr::Dot(expr) => match expr {
+                    SQLExpr::Value(ValueWithSpan {
+                        value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                        span    : _
+                    }) => Ok(Some(GetFieldAccess::NamedStructField {
+                        name: ScalarValue::from(s),
+                    })),
+                    _ => {
+                        not_impl_err!(
+                            "Dot access not supported for non-string expr: {expr:?}"
+                        )
                     }
-                }
+                },
             })
             .collect::<Result<Vec<_>>>()?;
 

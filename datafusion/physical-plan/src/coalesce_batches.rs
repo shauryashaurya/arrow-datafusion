@@ -32,9 +32,15 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::PhysicalExpr;
 
 use crate::coalesce::{BatchCoalescer, CoalescerState};
 use crate::execution_plan::CardinalityEffect;
+use crate::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation,
+};
+use datafusion_common::config::ConfigOptions;
 use futures::ready;
 use futures::stream::{Stream, StreamExt};
 
@@ -123,8 +129,11 @@ impl DisplayAs for CoalesceBatchesExec {
                 Ok(())
             }
             DisplayFormatType::TreeRender => {
-                // TODO: collect info
-                write!(f, "")
+                writeln!(f, "target_batch_size={}", self.target_batch_size)?;
+                if let Some(fetch) = self.fetch {
+                    write!(f, "limit={fetch}")?;
+                };
+                Ok(())
             }
         }
     }
@@ -189,7 +198,16 @@ impl ExecutionPlan for CoalesceBatchesExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        Statistics::with_fetch(self.input.statistics()?, self.schema(), self.fetch, 0, 1)
+        self.partition_statistics(None)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.input.partition_statistics(partition)?.with_fetch(
+            self.schema(),
+            self.fetch,
+            0,
+            1,
+        )
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -208,6 +226,24 @@ impl ExecutionPlan for CoalesceBatchesExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 }
 
@@ -318,6 +354,7 @@ impl CoalesceBatchesStream {
                     }
                 }
                 CoalesceBatchesStreamState::ReturnBuffer => {
+                    let _timer = cloned_time.timer();
                     // Combine buffered batches into one batch and return it.
                     let batch = self.coalescer.finish_batch()?;
                     // Set to pull state for the next iteration.
@@ -330,6 +367,7 @@ impl CoalesceBatchesStream {
                         // If buffer is empty, return None indicating the stream is fully consumed.
                         Poll::Ready(None)
                     } else {
+                        let _timer = cloned_time.timer();
                         // If the buffer still contains batches, prepare to return them.
                         let batch = self.coalescer.finish_batch()?;
                         Poll::Ready(Some(Ok(batch)))

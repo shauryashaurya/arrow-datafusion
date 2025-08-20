@@ -22,12 +22,12 @@ use std::sync::Arc;
 
 use crate::PhysicalExpr;
 use arrow::compute;
-use arrow::compute::{cast_with_options, CastOptions};
-use arrow::datatypes::{DataType, Schema};
+use arrow::compute::CastOptions;
+use arrow::datatypes::{DataType, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use compute::can_cast_types;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
-use datafusion_common::{not_impl_err, Result, ScalarValue};
+use datafusion_common::{not_impl_err, Result};
 use datafusion_expr::ColumnarValue;
 
 /// TRY_CAST expression casts an expression to a specific data type and returns NULL on invalid cast
@@ -96,18 +96,14 @@ impl PhysicalExpr for TryCastExpr {
             safe: true,
             format_options: DEFAULT_FORMAT_OPTIONS,
         };
-        match value {
-            ColumnarValue::Array(array) => {
-                let cast = cast_with_options(&array, &self.cast_type, &options)?;
-                Ok(ColumnarValue::Array(cast))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let array = scalar.to_array()?;
-                let cast_array = cast_with_options(&array, &self.cast_type, &options)?;
-                let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
-                Ok(ColumnarValue::Scalar(cast_scalar))
-            }
-        }
+        value.cast_to(&self.cast_type, Some(&options))
+    }
+
+    fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {
+        self.expr
+            .return_field(input_schema)
+            .map(|f| f.as_ref().clone().with_data_type(self.cast_type.clone()))
+            .map(Arc::new)
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
@@ -122,6 +118,12 @@ impl PhysicalExpr for TryCastExpr {
             Arc::clone(&children[0]),
             self.cast_type.clone(),
         )))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TRY_CAST(")?;
+        self.expr.fmt_sql(f)?;
+        write!(f, " AS {:?})", self.cast_type)
     }
 }
 
@@ -158,6 +160,7 @@ mod tests {
         },
         datatypes::*,
     };
+    use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     // runs an end-to-end test of physical type cast
     // 1. construct a record batch with a column "a" of type A
@@ -572,5 +575,27 @@ mod tests {
             .finish()
             .with_precision_and_scale(precision, scale)
             .unwrap()
+    }
+
+    #[test]
+    fn test_fmt_sql() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+
+        // Test numeric casting
+        let expr = try_cast(col("a", &schema)?, &schema, DataType::Int64)?;
+        let display_string = expr.to_string();
+        assert_eq!(display_string, "TRY_CAST(a@0 AS Int64)");
+        let sql_string = fmt_sql(expr.as_ref()).to_string();
+        assert_eq!(sql_string, "TRY_CAST(a AS Int64)");
+
+        // Test string casting
+        let schema = Schema::new(vec![Field::new("b", DataType::Utf8, true)]);
+        let expr = try_cast(col("b", &schema)?, &schema, DataType::Int32)?;
+        let display_string = expr.to_string();
+        assert_eq!(display_string, "TRY_CAST(b@0 AS Int32)");
+        let sql_string = fmt_sql(expr.as_ref()).to_string();
+        assert_eq!(sql_string, "TRY_CAST(b AS Int32)");
+
+        Ok(())
     }
 }

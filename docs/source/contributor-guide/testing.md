@@ -58,21 +58,34 @@ Like similar systems such as [DuckDB](https://duckdb.org/dev/testing), DataFusio
 
 DataFusion has integrated [sqlite's test suite](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) as a supplemental test suite that is run whenever a PR is merged into DataFusion. To run it manually please refer to the [README](https://github.com/apache/datafusion/blob/main/datafusion/sqllogictest/README.md#running-tests-sqlite) file for instructions.
 
+## Snapshot testing
+
+[Insta](https://github.com/mitsuhiko/insta) is used for snapshot testing. Snapshots are generated
+and compared on each test run. If the output changes, tests will fail.
+
+To review the changes, you can use Insta CLI:
+
+```shell
+cargo install cargo-insta
+cargo insta review
+```
+
 ## Extended Tests
 
 In addition to the standard CI test suite that is run on all PRs prior to merge,
 DataFusion has "extended" tests (defined in [extended.yml]) that are run on each
 commit to `main`. These tests rarely fail but take significantly longer to run
-than the standard test suite and add important test coverage such as that the
-code works when there are hash collisions as well as running the relevant
-portions of the entire [sqlite test suite].
+than the standard test suite and add important test coverage such as ensuring
+correctness when there are hash collisions and running the relevant portions of
+the entire [sqlite test suite]. You can run the extended tests
+locally by following the [instructions in the documentation].
 
-[extended.yml]: https://github.com/apache/datafusion/blob/main/.github/workflows/extended.yml
 [sqlite test suite]: https://www.sqlite.org/sqllogictest/dir?ci=tip
+[instructions in the documentation]: https://github.com/apache/datafusion/tree/main/datafusion/sqllogictest#running-tests-sqlite
 
 ## Rust Integration Tests
 
-There are several tests of the public interface of the DataFusion library in the [tests](https://github.com/apache/datafusion/tree/main/datafusion/core/tests) directory.
+There are several public interface tests for the DataFusion library in the [tests](https://github.com/apache/datafusion/tree/main/datafusion/core/tests) directory.
 
 You can run these tests individually using `cargo` as normal command such as
 

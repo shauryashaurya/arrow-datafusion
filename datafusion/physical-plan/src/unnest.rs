@@ -21,7 +21,10 @@ use std::cmp::{self, Ordering};
 use std::task::{ready, Poll};
 use std::{any::Any, sync::Arc};
 
-use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use super::metrics::{
+    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    RecordOutput,
+};
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, RecordBatchStream,
@@ -38,13 +41,12 @@ use arrow::compute::{cast, is_not_null, kernels, sum};
 use arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::cmp::lt;
+use async_trait::async_trait;
 use datafusion_common::{
     exec_datafusion_err, exec_err, internal_err, HashMap, HashSet, Result, UnnestOptions,
 };
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
-
-use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use log::trace;
 
@@ -203,22 +205,18 @@ impl ExecutionPlan for UnnestExec {
 
 #[derive(Clone, Debug)]
 struct UnnestMetrics {
-    /// Total time for column unnesting
-    elapsed_compute: metrics::Time,
+    /// Execution metrics
+    baseline_metrics: BaselineMetrics,
     /// Number of batches consumed
     input_batches: metrics::Count,
     /// Number of rows consumed
     input_rows: metrics::Count,
     /// Number of batches produced
     output_batches: metrics::Count,
-    /// Number of rows produced by this operator
-    output_rows: metrics::Count,
 }
 
 impl UnnestMetrics {
     fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
-        let elapsed_compute = MetricBuilder::new(metrics).elapsed_compute(partition);
-
         let input_batches =
             MetricBuilder::new(metrics).counter("input_batches", partition);
 
@@ -227,14 +225,11 @@ impl UnnestMetrics {
         let output_batches =
             MetricBuilder::new(metrics).counter("output_batches", partition);
 
-        let output_rows = MetricBuilder::new(metrics).output_rows(partition);
-
         Self {
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
             input_batches,
             input_rows,
             output_batches,
-            output_rows,
-            elapsed_compute,
         }
     }
 }
@@ -284,7 +279,9 @@ impl UnnestStream {
         loop {
             return Poll::Ready(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
-                    let timer = self.metrics.elapsed_compute.timer();
+                    let elapsed_compute =
+                        self.metrics.baseline_metrics.elapsed_compute().clone();
+                    let timer = elapsed_compute.timer();
                     self.metrics.input_batches.add(1);
                     self.metrics.input_rows.add(batch.num_rows());
                     let result = build_batch(
@@ -299,7 +296,7 @@ impl UnnestStream {
                         continue;
                     };
                     self.metrics.output_batches.add(1);
-                    self.metrics.output_rows.add(result_batch.num_rows());
+                    (&result_batch).record_output(&self.metrics.baseline_metrics);
 
                     // Empty record batches should not be emitted.
                     // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
@@ -313,8 +310,8 @@ impl UnnestStream {
                         self.metrics.input_batches,
                         self.metrics.input_rows,
                         self.metrics.output_batches,
-                        self.metrics.output_rows,
-                        self.metrics.elapsed_compute,
+                        self.metrics.baseline_metrics.output_rows(),
+                        self.metrics.baseline_metrics.elapsed_compute(),
                     );
                     other
                 }
@@ -958,7 +955,8 @@ mod tests {
     };
     use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::{Field, Int32Type};
-    use datafusion_common::assert_batches_eq;
+    use datafusion_common::test_util::batches_to_string;
+    use insta::assert_snapshot;
 
     // Create a GenericListArray with the following list values:
     //  [A, B, C], [], NULL, [D], NULL, [NULL, F]
@@ -1145,33 +1143,33 @@ mod tests {
         )?
         .unwrap();
 
-        let expected = &[
-"+---------------------------------+---------------------------------+---------------------------------+",
-"| col1_unnest_placeholder_depth_1 | col1_unnest_placeholder_depth_2 | col2_unnest_placeholder_depth_1 |",
-"+---------------------------------+---------------------------------+---------------------------------+",
-"| [1, 2, 3]                       | 1                               | a                               |",
-"|                                 | 2                               | b                               |",
-"| [4, 5]                          | 3                               |                                 |",
-"| [1, 2, 3]                       |                                 | a                               |",
-"|                                 |                                 | b                               |",
-"| [4, 5]                          |                                 |                                 |",
-"| [1, 2, 3]                       | 4                               | a                               |",
-"|                                 | 5                               | b                               |",
-"| [4, 5]                          |                                 |                                 |",
-"| [7, 8, 9, 10]                   | 7                               | c                               |",
-"|                                 | 8                               | d                               |",
-"| [11, 12, 13]                    | 9                               |                                 |",
-"|                                 | 10                              |                                 |",
-"| [7, 8, 9, 10]                   |                                 | c                               |",
-"|                                 |                                 | d                               |",
-"| [11, 12, 13]                    |                                 |                                 |",
-"| [7, 8, 9, 10]                   | 11                              | c                               |",
-"|                                 | 12                              | d                               |",
-"| [11, 12, 13]                    | 13                              |                                 |",
-"|                                 |                                 | e                               |",
-"+---------------------------------+---------------------------------+---------------------------------+",
-        ];
-        assert_batches_eq!(expected, &[ret]);
+        assert_snapshot!(batches_to_string(&[ret]),
+        @r###"
++---------------------------------+---------------------------------+---------------------------------+
+| col1_unnest_placeholder_depth_1 | col1_unnest_placeholder_depth_2 | col2_unnest_placeholder_depth_1 |
++---------------------------------+---------------------------------+---------------------------------+
+| [1, 2, 3]                       | 1                               | a                               |
+|                                 | 2                               | b                               |
+| [4, 5]                          | 3                               |                                 |
+| [1, 2, 3]                       |                                 | a                               |
+|                                 |                                 | b                               |
+| [4, 5]                          |                                 |                                 |
+| [1, 2, 3]                       | 4                               | a                               |
+|                                 | 5                               | b                               |
+| [4, 5]                          |                                 |                                 |
+| [7, 8, 9, 10]                   | 7                               | c                               |
+|                                 | 8                               | d                               |
+| [11, 12, 13]                    | 9                               |                                 |
+|                                 | 10                              |                                 |
+| [7, 8, 9, 10]                   |                                 | c                               |
+|                                 |                                 | d                               |
+| [11, 12, 13]                    |                                 |                                 |
+| [7, 8, 9, 10]                   | 11                              | c                               |
+|                                 | 12                              | d                               |
+| [11, 12, 13]                    | 13                              |                                 |
+|                                 |                                 | e                               |
++---------------------------------+---------------------------------+---------------------------------+
+        "###);
         Ok(())
     }
 

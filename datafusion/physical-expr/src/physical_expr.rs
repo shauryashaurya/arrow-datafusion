@@ -17,10 +17,39 @@
 
 use std::sync::Arc;
 
-use datafusion_common::HashMap;
-pub(crate) use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
-pub use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
+use crate::expressions::{self, Column};
+use crate::{create_physical_expr, LexOrdering, PhysicalSortExpr};
+
+use arrow::compute::SortOptions;
+use arrow::datatypes::Schema;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::{plan_err, Result};
+use datafusion_common::{DFSchema, HashMap};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::{Expr, SortExpr};
+
 use itertools::izip;
+
+// Exports:
+pub(crate) use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+
+/// Adds the `offset` value to `Column` indices inside `expr`. This function is
+/// generally used during the update of the right table schema in join operations.
+pub fn add_offset_to_expr(
+    expr: Arc<dyn PhysicalExpr>,
+    offset: isize,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    expr.transform_down(|e| match e.as_any().downcast_ref::<Column>() {
+        Some(col) => {
+            let Some(idx) = col.index().checked_add_signed(offset) else {
+                return plan_err!("Column index overflow");
+            };
+            Ok(Transformed::yes(Arc::new(Column::new(col.name(), idx))))
+        }
+        None => Ok(Transformed::no(e)),
+    })
+    .data()
+}
 
 /// This function is similar to the `contains` method of `Vec`. It finds
 /// whether `expr` is among `physical_exprs`.
@@ -56,6 +85,119 @@ pub fn physical_exprs_bag_equal(
         *multi_set_rhs.entry(expr).or_insert(0) += 1;
     }
     multi_set_lhs == multi_set_rhs
+}
+
+/// Converts logical sort expressions to physical sort expressions.
+///
+/// This function transforms a collection of logical sort expressions into their
+/// physical representation that can be used during query execution.
+///
+/// # Arguments
+///
+/// * `schema` - The schema containing column definitions.
+/// * `sort_order` - A collection of logical sort expressions grouped into
+///   lexicographic orderings.
+///
+/// # Returns
+///
+/// A vector of lexicographic orderings for physical execution, or an error if
+/// the transformation fails.
+///
+/// # Examples
+///
+/// ```
+/// // Create orderings from columns "id" and "name"
+/// # use arrow::datatypes::{Schema, Field, DataType};
+/// # use datafusion_physical_expr::create_ordering;
+/// # use datafusion_common::Column;
+/// # use datafusion_expr::{Expr, SortExpr};
+/// #
+/// // Create a schema with two fields
+/// let schema = Schema::new(vec![
+///     Field::new("id", DataType::Int32, false),
+///     Field::new("name", DataType::Utf8, false),
+/// ]);
+///
+/// let sort_exprs = vec![
+///     vec![
+///         SortExpr { expr: Expr::Column(Column::new(Some("t"), "id")), asc: true, nulls_first: false }
+///     ],
+///     vec![
+///         SortExpr { expr: Expr::Column(Column::new(Some("t"), "name")), asc: false, nulls_first: true }
+///     ]
+/// ];
+/// let result = create_ordering(&schema, &sort_exprs).unwrap();
+/// ```
+pub fn create_ordering(
+    schema: &Schema,
+    sort_order: &[Vec<SortExpr>],
+) -> Result<Vec<LexOrdering>> {
+    let mut all_sort_orders = vec![];
+
+    for (group_idx, exprs) in sort_order.iter().enumerate() {
+        // Construct PhysicalSortExpr objects from Expr objects:
+        let mut sort_exprs = vec![];
+        for (expr_idx, sort) in exprs.iter().enumerate() {
+            match &sort.expr {
+                Expr::Column(col) => match expressions::col(&col.name, schema) {
+                    Ok(expr) => {
+                        let opts = SortOptions::new(!sort.asc, sort.nulls_first);
+                        sort_exprs.push(PhysicalSortExpr::new(expr, opts));
+                    }
+                    // Cannot find expression in the projected_schema, stop iterating
+                    // since rest of the orderings are violated
+                    Err(_) => break,
+                },
+                expr => {
+                    return plan_err!(
+                        "Expected single column reference in sort_order[{}][{}], got {}",
+                        group_idx,
+                        expr_idx,
+                        expr
+                    );
+                }
+            }
+        }
+        all_sort_orders.extend(LexOrdering::new(sort_exprs));
+    }
+    Ok(all_sort_orders)
+}
+
+/// Create a physical sort expression from a logical expression
+pub fn create_physical_sort_expr(
+    e: &SortExpr,
+    input_dfschema: &DFSchema,
+    execution_props: &ExecutionProps,
+) -> Result<PhysicalSortExpr> {
+    create_physical_expr(&e.expr, input_dfschema, execution_props).map(|expr| {
+        let options = SortOptions::new(!e.asc, e.nulls_first);
+        PhysicalSortExpr::new(expr, options)
+    })
+}
+
+/// Create vector of physical sort expression from a vector of logical expression
+pub fn create_physical_sort_exprs(
+    exprs: &[SortExpr],
+    input_dfschema: &DFSchema,
+    execution_props: &ExecutionProps,
+) -> Result<Vec<PhysicalSortExpr>> {
+    exprs
+        .iter()
+        .map(|e| create_physical_sort_expr(e, input_dfschema, execution_props))
+        .collect()
+}
+
+pub fn add_offset_to_physical_sort_exprs(
+    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+    offset: isize,
+) -> Result<Vec<PhysicalSortExpr>> {
+    sort_exprs
+        .into_iter()
+        .map(|mut sort_expr| {
+            sort_expr.expr = add_offset_to_expr(sort_expr.expr, offset)?;
+            Ok(sort_expr)
+        })
+        .collect()
 }
 
 #[cfg(test)]

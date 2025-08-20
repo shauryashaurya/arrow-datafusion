@@ -18,12 +18,12 @@
 //! Defines physical expressions that can evaluated at runtime during query execution
 
 use crate::hyperloglog::HyperLogLog;
-use arrow::array::BinaryArray;
+use arrow::array::{BinaryArray, StringViewArray};
 use arrow::array::{
     GenericBinaryArray, GenericStringArray, OffsetSizeTrait, PrimitiveArray,
 };
 use arrow::datatypes::{
-    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+    ArrowPrimitiveType, FieldRef, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
     UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow::{array::ArrayRef, datatypes::DataType, datatypes::Field};
@@ -127,6 +127,27 @@ where
 }
 
 #[derive(Debug)]
+struct StringViewHLLAccumulator<T>
+where
+    T: OffsetSizeTrait,
+{
+    hll: HyperLogLog<String>,
+    phantom_data: PhantomData<T>,
+}
+
+impl<T> StringViewHLLAccumulator<T>
+where
+    T: OffsetSizeTrait,
+{
+    pub fn new() -> Self {
+        Self {
+            hll: HyperLogLog::new(),
+            phantom_data: PhantomData,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct BinaryHLLAccumulator<T>
 where
     T: OffsetSizeTrait,
@@ -197,6 +218,21 @@ where
     default_accumulator_impl!();
 }
 
+impl<T> Accumulator for StringViewHLLAccumulator<T>
+where
+    T: OffsetSizeTrait,
+{
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let array: &StringViewArray = downcast_value!(values[0], StringViewArray);
+        // flatten because we would skip nulls
+        self.hll
+            .extend(array.iter().flatten().map(|s| s.to_string()));
+        Ok(())
+    }
+
+    default_accumulator_impl!();
+}
+
 impl<T> Accumulator for StringHLLAccumulator<T>
 where
     T: OffsetSizeTrait,
@@ -257,6 +293,7 @@ impl Default for ApproxDistinct {
 ```"#,
     standard_argument(name = "expression",)
 )]
+#[derive(PartialEq, Eq, Hash)]
 pub struct ApproxDistinct {
     signature: Signature,
 }
@@ -286,12 +323,13 @@ impl AggregateUDFImpl for ApproxDistinct {
         Ok(DataType::UInt64)
     }
 
-    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<Field>> {
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![Field::new(
             format_state_name(args.name, "hll_registers"),
             DataType::Binary,
             false,
-        )])
+        )
+        .into()])
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
@@ -311,6 +349,7 @@ impl AggregateUDFImpl for ApproxDistinct {
             DataType::Int64 => Box::new(NumericHLLAccumulator::<Int64Type>::new()),
             DataType::Utf8 => Box::new(StringHLLAccumulator::<i32>::new()),
             DataType::LargeUtf8 => Box::new(StringHLLAccumulator::<i64>::new()),
+            DataType::Utf8View => Box::new(StringViewHLLAccumulator::<i32>::new()),
             DataType::Binary => Box::new(BinaryHLLAccumulator::<i32>::new()),
             DataType::LargeBinary => Box::new(BinaryHLLAccumulator::<i64>::new()),
             other => {
