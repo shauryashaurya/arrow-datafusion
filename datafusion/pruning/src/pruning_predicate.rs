@@ -34,14 +34,14 @@ use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_plan::metrics::Count;
 use log::{debug, trace};
 
-use datafusion_common::error::{DataFusionError, Result};
+use datafusion_common::error::Result;
 use datafusion_common::tree_node::TransformedResult;
+use datafusion_common::{assert_eq_or_internal_err, Column, DFSchema};
 use datafusion_common::{
-    internal_err, plan_datafusion_err, plan_err,
+    internal_datafusion_err, plan_datafusion_err, plan_err,
     tree_node::{Transformed, TreeNode},
     ScalarValue,
 };
-use datafusion_common::{Column, DFSchema};
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::utils::{collect_columns, Guarantee, LiteralGuarantee};
 use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
@@ -86,7 +86,7 @@ use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 /// example of how to use `PruningPredicate` to prune files based on min/max
 /// values.
 ///
-/// [`pruning.rs` example in the `datafusion-examples`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/pruning.rs
+/// [`pruning.rs` example in the `datafusion-examples`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/query_planning/pruning.rs
 ///
 /// Given an expression like `x = 5` and statistics for 3 containers (Row
 /// Groups, files, etc) `A`, `B`, and `C`:
@@ -238,7 +238,7 @@ use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 /// Original Predicate | Rewritten Predicate
 /// ------------------ | --------------------
 /// `x = 5` | `x_null_count != x_row_count AND (x_min <= 5 AND 5 <= x_max)`
-/// `x < 5` | `x_null_count != x_row_count THEN false (x_max < 5)`
+/// `x < 5` | `x_null_count != x_row_count AND (x_min < 5)`
 /// `x = 5 AND y = 10` | `x_null_count != x_row_count AND (x_min <= 5 AND 5 <= x_max) AND y_null_count != y_row_count (y_min <= 10 AND 10 <= y_max)`
 /// `x IS NULL`  | `x_null_count > 0`
 /// `x IS NOT NULL`  | `x_null_count != row_count`
@@ -457,7 +457,7 @@ impl PruningPredicate {
     /// details.
     pub fn try_new(expr: Arc<dyn PhysicalExpr>, schema: SchemaRef) -> Result<Self> {
         // Get a (simpler) snapshot of the physical expr here to use with `PruningPredicate`
-        // which does not handle dynamic exprs  in general
+        // which does not handle dynamic exprs in general
         let expr = snapshot_physical_expr(expr)?;
         let unhandled_hook = Arc::new(ConstantUnhandledPredicateHook::default()) as _;
 
@@ -465,7 +465,7 @@ impl PruningPredicate {
         let mut required_columns = RequiredColumns::new();
         let predicate_expr = build_predicate_expression(
             &expr,
-            schema.as_ref(),
+            &schema,
             &mut required_columns,
             &unhandled_hook,
         );
@@ -520,9 +520,9 @@ impl PruningPredicate {
                     // If `contained` returns false, that means the column is
                     // not any of the values so we can prune the container
                     Guarantee::In => builder.combine_array(&results),
-                    // `NotIn` means the values in the column must must not be
+                    // `NotIn` means the values in the column must not be
                     // any of the values in the set for the predicate to
-                    // evaluate to true. If contained returns true, it means the
+                    // evaluate to true. If `contained` returns true, it means the
                     // column is only in the set of values so we can prune the
                     // container
                     Guarantee::NotIn => {
@@ -876,13 +876,13 @@ impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
 
 /// Build a RecordBatch from a list of statistics, creating arrays,
 /// with one row for each PruningStatistics and columns specified in
-/// in the required_columns parameter.
+/// the required_columns parameter.
 ///
 /// For example, if the requested columns are
 /// ```text
 /// ("s1", Min, Field:s1_min)
 /// ("s2", Max, field:s2_max)
-///```
+/// ```
 ///
 /// And the input statistics had
 /// ```text
@@ -919,13 +919,13 @@ fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
         };
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
 
-        if num_containers != array.len() {
-            return internal_err!(
-                "mismatched statistics length. Expected {}, got {}",
-                num_containers,
-                array.len()
-            );
-        }
+        assert_eq_or_internal_err!(
+            num_containers,
+            array.len(),
+            "mismatched statistics length. Expected {}, got {}",
+            num_containers,
+            array.len()
+        );
 
         // cast statistics array to required data type (e.g. parquet
         // provides timestamp statistics as "Int64")
@@ -960,7 +960,7 @@ impl<'a> PruningExpressionBuilder<'a> {
         left: &'a Arc<dyn PhysicalExpr>,
         right: &'a Arc<dyn PhysicalExpr>,
         op: Operator,
-        schema: &'a Schema,
+        schema: &'a SchemaRef,
         required_columns: &'a mut RequiredColumns,
     ) -> Result<Self> {
         // find column name; input could be a more complicated expression
@@ -978,8 +978,7 @@ impl<'a> PruningExpressionBuilder<'a> {
                 }
             };
 
-        // TODO pass in SchemaRef so we don't need to clone the schema
-        let df_schema = DFSchema::try_from(schema.clone())?;
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
         let (column_expr, correct_operator, scalar_expr) = rewrite_expr_to_prunable(
             column_expr,
             correct_operator,
@@ -1095,8 +1094,8 @@ fn rewrite_expr_to_prunable(
         Ok((Arc::clone(column_expr), op, Arc::clone(scalar_expr)))
     } else if let Some(cast) = column_expr_any.downcast_ref::<phys_expr::CastExpr>() {
         // `cast(col) op lit()`
-        let arrow_schema: SchemaRef = schema.clone().into();
-        let from_type = cast.expr().data_type(&arrow_schema)?;
+        let arrow_schema = schema.as_arrow();
+        let from_type = cast.expr().data_type(arrow_schema)?;
         verify_support_type_for_prune(&from_type, cast.cast_type())?;
         let (left, op, right) =
             rewrite_expr_to_prunable(cast.expr(), op, scalar_expr, schema)?;
@@ -1110,8 +1109,8 @@ fn rewrite_expr_to_prunable(
         column_expr_any.downcast_ref::<phys_expr::TryCastExpr>()
     {
         // `try_cast(col) op lit()`
-        let arrow_schema: SchemaRef = schema.clone().into();
-        let from_type = try_cast.expr().data_type(&arrow_schema)?;
+        let arrow_schema = schema.as_arrow();
+        let from_type = try_cast.expr().data_type(arrow_schema)?;
         verify_support_type_for_prune(&from_type, try_cast.cast_type())?;
         let (left, op, right) =
             rewrite_expr_to_prunable(try_cast.expr(), op, scalar_expr, schema)?;
@@ -1219,9 +1218,9 @@ fn rewrite_column_expr(
 
 fn reverse_operator(op: Operator) -> Result<Operator> {
     op.swap().ok_or_else(|| {
-        DataFusionError::Internal(format!(
+        internal_datafusion_err!(
             "Could not reverse operator {op} while building pruning predicate"
-        ))
+        )
     })
 }
 
@@ -1369,7 +1368,7 @@ impl PredicateRewriter {
         let mut required_columns = RequiredColumns::new();
         build_predicate_expression(
             expr,
-            schema,
+            &Arc::new(schema.clone()),
             &mut required_columns,
             &self.unhandled_hook,
         )
@@ -1387,7 +1386,7 @@ impl PredicateRewriter {
 /// Notice: Does not handle [`phys_expr::InListExpr`] greater than 20, which will fall back to calling `unhandled_hook`
 fn build_predicate_expression(
     expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
+    schema: &SchemaRef,
     required_columns: &mut RequiredColumns,
     unhandled_hook: &Arc<dyn UnhandledPredicateHook>,
 ) -> Arc<dyn PhysicalExpr> {
@@ -4424,7 +4423,7 @@ mod tests {
             // s1 ["AB", "A\u{10ffff}\u{10ffff}\u{10ffff}"]  ==> some rows could pass (must keep)
             true,
             // s1 ["A\u{10ffff}\u{10ffff}", "A\u{10ffff}\u{10ffff}"]  ==> no row match. (min, max) maybe truncate 
-            // orignal (min, max) maybe ("A\u{10ffff}\u{10ffff}\u{10ffff}", "A\u{10ffff}\u{10ffff}\u{10ffff}\u{10ffff}")
+            // original (min, max) maybe ("A\u{10ffff}\u{10ffff}\u{10ffff}", "A\u{10ffff}\u{10ffff}\u{10ffff}\u{10ffff}")
             true,
         ];
         prune_with_expr(expr, &schema, &statistics, expected_ret);
@@ -5109,7 +5108,6 @@ mod tests {
     ///
     /// `expected` is a vector of bools, where true means the row group should
     /// be kept, and false means it should be pruned.
-    ///
     // TODO refactor other tests to use this to reduce boiler plate
     fn prune_with_expr(
         expr: Expr,
@@ -5131,7 +5129,12 @@ mod tests {
     ) -> Arc<dyn PhysicalExpr> {
         let expr = logical2physical(expr, schema);
         let unhandled_hook = Arc::new(ConstantUnhandledPredicateHook::default()) as _;
-        build_predicate_expression(&expr, schema, required_columns, &unhandled_hook)
+        build_predicate_expression(
+            &expr,
+            &Arc::new(schema.clone()),
+            required_columns,
+            &unhandled_hook,
+        )
     }
 
     #[test]

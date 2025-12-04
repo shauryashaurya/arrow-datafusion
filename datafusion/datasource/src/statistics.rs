@@ -50,13 +50,13 @@ pub(crate) struct MinMaxStatistics {
 
 impl MinMaxStatistics {
     /// Sort order used to sort the statistics
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn sort_order(&self) -> &LexOrdering {
         &self.sort_order
     }
 
     /// Min value at index
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn min(&'_ self, idx: usize) -> Row<'_> {
         self.min_by_sort_order.row(idx)
     }
@@ -152,28 +152,25 @@ impl MinMaxStatistics {
             .into_iter()
             .unzip();
 
-        Self::new(
-            &min_max_sort_order,
-            &min_max_schema,
-            RecordBatch::try_new(Arc::clone(&min_max_schema), min_values).map_err(
-                |e| {
-                    DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some("\ncreate min batch".to_string()),
-                    )
-                },
-            )?,
-            RecordBatch::try_new(Arc::clone(&min_max_schema), max_values).map_err(
-                |e| {
-                    DataFusionError::ArrowError(
-                        Box::new(e),
-                        Some("\ncreate max batch".to_string()),
-                    )
-                },
-            )?,
-        )
+        let min_batch = RecordBatch::try_new(Arc::clone(&min_max_schema), min_values)
+            .map_err(|e| {
+                DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("\ncreate min batch".to_string()),
+                )
+            })?;
+        let max_batch = RecordBatch::try_new(Arc::clone(&min_max_schema), max_values)
+            .map_err(|e| {
+                DataFusionError::ArrowError(
+                    Box::new(e),
+                    Some("\ncreate max batch".to_string()),
+                )
+            })?;
+
+        Self::new(&min_max_sort_order, &min_max_schema, min_batch, max_batch)
     }
 
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(
         sort_order: &LexOrdering,
         schema: &SchemaRef,
@@ -295,7 +292,7 @@ fn sort_columns_from_physical_sort_exprs(
     since = "47.0.0",
     note = "Please use `get_files_with_limit` and  `compute_all_files_statistics` instead"
 )]
-#[allow(unused)]
+#[expect(unused)]
 pub async fn get_statistics_with_limit(
     all_files: impl Stream<Item = Result<(PartitionedFile, Arc<Statistics>)>>,
     file_schema: SchemaRef,
@@ -421,6 +418,7 @@ pub async fn get_statistics_with_limit(
 ///
 /// # Returns
 /// A new file group with summary statistics attached
+#[expect(clippy::needless_pass_by_value)]
 pub fn compute_file_group_statistics(
     file_group: FileGroup,
     file_schema: SchemaRef,
@@ -456,6 +454,7 @@ pub fn compute_file_group_statistics(
 /// A tuple containing:
 /// * The processed file groups with their individual statistics attached
 /// * The summary statistics across all file groups, aka all files summary statistics
+#[expect(clippy::needless_pass_by_value)]
 pub fn compute_all_files_statistics(
     file_groups: Vec<FileGroup>,
     table_schema: SchemaRef,
